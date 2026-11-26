@@ -38,9 +38,8 @@ struct lzr_cctx {
     int have_stats;
     int threads;           /* match-finder threads (levels 7-9)           */
     size_t bt_maxdist;     /* farthest tree node followed (see opt_init)   */
-    int adaptive;          /* emit block type 3 (adaptive range coding)    */
-    arc_model *am;         /* [0] = live model, [1] = copy for rollback     */
-    uint8_t *arctmp;       /* adaptive literal streams before assembly     */
+    int adaptive;          /* emit block type 4 (token range coding)        */
+    tok_model *tm;         /* [0] = live model, [1] = copy for rollback     */
     lzr_x86 x86;           /* x86 filter state (if x86tmp)                 */
     uint8_t *x86tmp;       /* x86 filter work buffer, NULL = no filter     */
 
@@ -51,12 +50,8 @@ struct lzr_cctx {
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define LZR_MAX_THREADS 16
-/* Adaptive literal stream worst cases: 8 decisions per literal, each
- * <= 7.05 bits (probabilities stay in [31, 4065] / 4096). */
-#define ARC_CAP_MATCHED (8 * (size_t)(MAX_SEQ + 1) + 16)
-#define ARC_CAP_LANE (8 * (size_t)(LZR_BLOCK_SIZE / ARC_LANES + 1) + 16)
 #ifndef LZR_ADAPTIVE_LEVEL
-#define LZR_ADAPTIVE_LEVEL 6   /* levels >= this use adaptive blocks */
+#define LZR_ADAPTIVE_LEVEL 6   /* levels >= this use block type 4 */
 #endif
 #ifndef LZR_HAVE_THREADS
 #if defined(_WIN32)

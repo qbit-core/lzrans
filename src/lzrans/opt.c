@@ -47,6 +47,7 @@ typedef struct {
     int32_t price;
     uint32_t from, ml, off, litlen;
     uint32_t reps[LZR_NUM_REPS];
+    uint32_t state;        /* token model state (block type 4) on this path */
 } onode;
 
 typedef struct {
@@ -54,7 +55,7 @@ typedef struct {
 } prices_t;
 
 #ifndef LZR_OPT_FULL
-#define LZR_OPT_FULL 32
+#define LZR_OPT_FULL 273
 #endif
 #ifndef LZR_REP_MIN
 #define LZR_REP_MIN 2        /* repeat-offset matches may be this short */
@@ -85,11 +86,29 @@ typedef struct {
     prices_t pr;
     int32_t ml_p[ML_TABLE];   /* match-length price incl. extra bits, per pass */
     int32_t ll_p[LL_TABLE];   /* literal-run price incl. extra bits           */
-    /* adaptive literals (block type 3): prices from the model state at the
-     * start of the block */
+    /* block type 4: prices from a shadow copy of the token model, advanced
+     * over the tokens chosen so far and re-tabulated after each segment */
     uint16_t bitc[ARC_ONE >> 4];   /* price of a 0 bit by probability / 16 */
-    uint32_t litc[256];            /* plain literal                          */
+    tok_model pm;                  /* shadow model                          */
+    uint32_t dreps[LZR_NUM_REPS];  /* repeat offsets at dpos                 */
+    size_t dpos, dseq;             /* shadow position / next sequence        */
+    int32_t litp[8][256];          /* plain literal, per context             */
+    int32_t lenp[2][TOK_POS][TOK_MAXLEN + 1];   /* [0] new dist, [1] repeat  */
+    int32_t slotp[4][TOK_DIST_SLOTS];
+    int32_t distp[4][128];         /* slot + footer, dist0 < 128             */
+    int32_t alignp[16];
+    /* short new-distance matches (2-3 bytes, block type 4): last position
+     * (+1) of each 2-byte value / 3-byte hash, and per block position the
+     * nearest earlier one (0 = none) */
+    uint32_t *last2, *last3, *sh2, *sh3;
 } opt_state;
+#define SH3_LOG 16
+#ifndef SH2_MAXD
+#define SH2_MAXD 256
+#endif
+#ifndef SH3_MAXD
+#define SH3_MAXD 65536
+#endif
 
 int opt_init(lzr_cctx *c)
 {
@@ -114,36 +133,92 @@ int opt_init(lzr_cctx *c)
     st->nodes = (onode *)malloc((OPT_NUM + NODE_EXTRA) * sizeof(onode));
     st->path = malloc((OPT_NUM + NODE_EXTRA) * sizeof(*st->path));
     if (!st->nodes || !st->path) return LZR_ERR_NOMEM;
+    st->last2 = (uint32_t *)calloc(65536, sizeof(uint32_t));
+    st->last3 = (uint32_t *)calloc((size_t)1 << SH3_LOG, sizeof(uint32_t));
+    st->sh2 = (uint32_t *)malloc(LZR_BLOCK_SIZE * sizeof(uint32_t));
+    st->sh3 = (uint32_t *)malloc(LZR_BLOCK_SIZE * sizeof(uint32_t));
+    if (!st->last2 || !st->last3 || !st->sh2 || !st->sh3) return LZR_ERR_NOMEM;
     for (unsigned i = 0; i < (ARC_ONE >> 4); i++)
         st->bitc[i] = (uint16_t)(-log2((i * 16 + 8) / (double)ARC_ONE) * BITCOST + 0.5);
     return LZR_OK;
 }
 
-static inline uint32_t arc_bit_price(const opt_state *st, arc_p p, unsigned bit)
+static inline int32_t arc_bit_price(const opt_state *st, arc_p p, unsigned bit)
 {
     return st->bitc[(bit ? ARC_ONE - p : p) >> 4];
 }
 
-/* Plain literal prices from the live model (lane 0 stands in for all). */
-static void adaptive_lit_prices(lzr_cctx *c, opt_state *st)
+/* out[sym] = price of sym in an nbits bit tree (reverse: low bit first). */
+static void tree_prices(const opt_state *st, const arc_p *probs, unsigned nbits, int rev, int32_t *out)
 {
-    const arc_p *pr = c->am->plain[0];
-    uint32_t node[256];   /* price of reaching tree node m */
-    node[1] = 0;
-    for (unsigned m = 1; m < 128; m++) {
-        node[2 * m] = node[m] + arc_bit_price(st, pr[m], 0);
-        node[2 * m + 1] = node[m] + arc_bit_price(st, pr[m], 1);
-    }
-    for (unsigned b = 0; b < 256; b++) {
-        unsigned m = 128 + (b >> 1);
-        st->litc[b] = node[m] + arc_bit_price(st, pr[m], b & 1);
+    for (unsigned sym = 0; sym < (1u << nbits); sym++) {
+        int32_t pr = 0;
+        unsigned m = 1;
+        for (unsigned i = 0; i < nbits; i++) {
+            unsigned b = rev ? (sym >> i) & 1 : (sym >> (nbits - 1 - i)) & 1;
+            pr += arc_bit_price(st, probs[m], b);
+            m = (m << 1) | b;
+        }
+        out[sym] = pr;
     }
 }
 
-/* First literal after a match (coded against the match byte, see arc.h). */
-static uint32_t adaptive_matched_price(const opt_state *st, const arc_p *pr, unsigned byte, unsigned mbyte)
+static void len_prices(const opt_state *st, const tok_len *l, int32_t (*out)[TOK_MAXLEN + 1])
 {
-    uint32_t price = 0;
+    int32_t lo[8], mi[8], hi[256];
+    int32_t c0 = arc_bit_price(st, l->choice, 0), c1 = arc_bit_price(st, l->choice, 1);
+    int32_t d0 = arc_bit_price(st, l->choice2, 0), d1 = arc_bit_price(st, l->choice2, 1);
+    tree_prices(st, l->high, 8, 0, hi);
+    for (unsigned ps = 0; ps < TOK_POS; ps++) {
+        tree_prices(st, l->low[ps], 3, 0, lo);
+        tree_prices(st, l->mid[ps], 3, 0, mi);
+        out[ps][0] = out[ps][1] = 0;
+        for (unsigned L = 2; L <= TOK_MAXLEN; L++) {
+            unsigned v = L - 2;
+            out[ps][L] = v < 8 ? c0 + lo[v] : v < 16 ? c1 + d0 + mi[v - 8] : c1 + d1 + hi[v - 16];
+        }
+    }
+}
+
+/* Re-tabulate the prices from the shadow model. */
+static void tok_prices(opt_state *st)
+{
+    const tok_model *m = &st->pm;
+    for (unsigned c = 0; c < 8; c++) {
+        int32_t node[256];
+        const arc_p *pr = m->lit[c];
+        node[1] = 0;
+        for (unsigned k = 1; k < 128; k++) {
+            node[2 * k] = node[k] + arc_bit_price(st, pr[k], 0);
+            node[2 * k + 1] = node[k] + arc_bit_price(st, pr[k], 1);
+        }
+        for (unsigned b = 0; b < 256; b++) st->litp[c][b] = node[128 + (b >> 1)] + arc_bit_price(st, pr[128 + (b >> 1)], b & 1);
+    }
+    len_prices(st, &m->mlen, st->lenp[0]);
+    len_prices(st, &m->rlen, st->lenp[1]);
+    for (unsigned c = 0; c < 4; c++) tree_prices(st, m->slot[c], 6, 0, st->slotp[c]);
+    tree_prices(st, m->align, 4, 1, st->alignp);
+    int32_t spec[32];
+    for (unsigned slot = 0; slot < TOK_END_SPEC; slot++) {
+        unsigned nb = slot < 4 ? 0 : (slot >> 1) - 1;
+        uint32_t base = slot < 4 ? slot : (2u | (slot & 1)) << nb;
+        if (nb) tree_prices(st, m->spec[slot], nb, 1, spec);
+        else spec[0] = 0;
+        for (uint32_t r = 0; r < (1u << nb); r++)
+            for (unsigned c = 0; c < 4; c++) st->distp[c][base + r] = st->slotp[c][slot] + spec[r];
+    }
+}
+
+static inline int32_t dist_price(const opt_state *st, uint32_t dist0, unsigned lctx)
+{
+    if (dist0 < 128) return st->distp[lctx][dist0];
+    unsigned slot = tok_slot(dist0), nb = (slot >> 1) - 1;
+    return st->slotp[lctx][slot] + (int32_t)(nb - 4) * BITCOST + st->alignp[dist0 & 15];
+}
+
+static int32_t matched_price(const opt_state *st, const arc_p *pr, unsigned byte, unsigned mbyte)
+{
+    int32_t price = 0;
     unsigned m = 1, same = 1;
     for (int i = 7; i >= 0; i--) {
         unsigned b = (byte >> i) & 1, mb = (mbyte >> i) & 1;
@@ -152,6 +227,35 @@ static uint32_t adaptive_matched_price(const opt_state *st, const arc_p *pr, uns
         same &= (b == mb);
     }
     return price;
+}
+
+/* Advance the shadow model over the sequences emitted so far and the
+ * literals up to buffer position upto (as encode_tokens() will code them). */
+static void shadow_advance(lzr_cctx *c, opt_state *st, size_t bs, size_t ns, size_t upto)
+{
+    arc_enc e;
+    arce_init(&e, NULL);
+    e.dry = 1;
+    tok_model *m = &st->pm;
+    const uint8_t *buf = c->buf;
+    size_t p = st->dpos;
+    for (; st->dseq < ns; st->dseq++) {
+        size_t i = st->dseq;
+        for (size_t t = 0; t < c->seq_ll[i]; t++, p++)
+            tok_enc_lit(&e, m, buf + p, p ? buf[p - 1] : 0, st->dreps[0], (unsigned)(p - bs) & 3);
+        uint32_t off = c->seq_dist[i];
+        commit_offset(st->dreps, off);
+        size_t ml = c->seq_ml[i];
+        while (ml) {
+            unsigned len = tok_piece(ml);
+            tok_enc_match(&e, m, off, len, (unsigned)(p - bs) & 3);
+            off = 0;
+            p += len;
+            ml -= len;
+        }
+    }
+    for (; p < upto; p++) tok_enc_lit(&e, m, buf + p, p ? buf[p - 1] : 0, st->dreps[0], (unsigned)(p - bs) & 3);
+    st->dpos = p;
 }
 
 void opt_free(lzr_cctx *c)
@@ -164,7 +268,9 @@ void opt_free(lzr_cctx *c)
             free(st->mc[k].mstart);
             free(st->mc[k].pairs);
         }
-        free(st->nodes); free(st->path); free(st);
+        free(st->nodes); free(st->path);
+        free(st->last2); free(st->last3); free(st->sh2); free(st->sh3);
+        free(st);
     }
     free(c->son);
     c->opt = NULL;
@@ -177,6 +283,8 @@ void opt_slide(lzr_cctx *c, uint32_t d)
     opt_sync(c);                     /* the background gather reads buf/tree */
     if (st->pending) { st->pend_bs -= d; st->pend_be -= d; st->pend_lim -= d; }
     for (size_t i = 0; i < 2 * c->wsize; i++) c->son[i] = c->son[i] > d ? c->son[i] - d : 0;
+    for (size_t i = 0; i < 65536; i++) st->last2[i] = st->last2[i] > d ? st->last2[i] - d : 0;
+    for (size_t i = 0; i < ((size_t)1 << SH3_LOG); i++) st->last3[i] = st->last3[i] > d ? st->last3[i] - d : 0;
 }
 
 /* ---------------- binary tree ---------------- */
@@ -390,7 +498,7 @@ static void prices_from_parse(lzr_cctx *c, prices_t *pr, size_t ns, size_t nlit)
     for (size_t i = 0; i < nlit; i++) lit[c->lits[i]]++;
     for (size_t i = 0; i < ns; i++) {
         llc[val_code(c->seq_ll[i], &nb, &ex)]++;
-        mlc[val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex)]++;
+        if (c->seq_ml[i] >= LZR_ML_BASE) mlc[val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex)]++;   /* type 4: may be 1 */
         uint32_t off = c->seq_dist[i];
         ofc[off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &nb, &ex)]++;
     }
@@ -430,6 +538,29 @@ static inline int32_t llp(const opt_state *st, uint32_t ll)
     return ll < LL_TABLE ? st->ll_p[ll] : ll_price(&st->pr, ll);
 }
 
+/* Nearest earlier 2- and 3-byte matches for every position of [bs, be). */
+static void short_matches(lzr_cctx *c, opt_state *st, size_t bs, size_t be)
+{
+    const uint8_t *buf = c->buf;
+    const size_t maxd = c->wsize;
+    for (size_t p = bs; p < be; p++) {
+        uint32_t d2 = 0, d3 = 0;
+        if (p + 3 <= c->end) {
+            unsigned v2 = buf[p] | (unsigned)buf[p + 1] << 8;
+            uint32_t h3 = ((v2 | (uint32_t)buf[p + 2] << 16) * 2654435761u) >> (32 - SH3_LOG);
+            uint32_t q = st->last2[v2];
+            if (q && p - (q - 1) <= maxd) d2 = (uint32_t)(p - (q - 1));
+            q = st->last3[h3];
+            if (q && p - (q - 1) <= maxd && buf[q - 1] == buf[p] && buf[q] == buf[p + 1] && buf[q + 1] == buf[p + 2])
+                d3 = (uint32_t)(p - (q - 1));
+            st->last2[v2] = (uint32_t)(p + 1);
+            st->last3[h3] = (uint32_t)(p + 1);
+        }
+        st->sh2[p - bs] = d2;
+        st->sh3[p - bs] = d3;
+    }
+}
+
 /* ---------------- dynamic programming ---------------- */
 
 static inline void emit_seq(lzr_cctx *c, size_t *ns, size_t *nlit, size_t *lit_start, size_t mpos,
@@ -458,7 +589,14 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
         size_t seg = be - LZR_MIN_MATCH + 1 - p;
         if (seg > OPT_NUM) seg = OPT_NUM;
         uint32_t ll0 = (uint32_t)(p - lit_start);
-        N[0].price = llp(st, ll0);
+        const int adaptive = c->adaptive;
+        if (adaptive) {
+            shadow_advance(c, st, bs, ns, p);
+            tok_prices(st);
+            N[0].state = st->pm.state;
+        }
+        const tok_model *pm = &st->pm;
+        N[0].price = adaptive ? 0 : llp(st, ll0);
         N[0].litlen = ll0;
         N[0].ml = 0;
         memcpy(N[0].reps, c->reps, sizeof(c->reps));
@@ -475,24 +613,40 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 const onode *f = &N[n->from];
                 memcpy(n->reps, f->reps, sizeof(n->reps));
                 if (n->ml) commit_offset(n->reps, n->off);
+                n->state = !n->ml ? tok_after_lit(f->state)
+                           : n->ml == 1 ? tok_after_short(f->state)
+                           : n->off < LZR_NUM_REPS ? tok_after_rep(f->state) : tok_after_match(f->state);
             }
             const size_t cur = p + i;
             const uint8_t *cp = buf + cur;
 
             /* literal transition (charges the change in literal-run cost) */
             if (last < i + 1) { N[i + 1].price = PRICE_INF; last = i + 1; }
-            uint32_t lit_price;
-            if (!c->adaptive) lit_price = pr->lit[*cp];
-            else if (n->ml) lit_price = adaptive_matched_price(st, c->am->matched[cp[-1] >> 5], *cp, cp[-(ptrdiff_t)n->reps[0]]);
-            else lit_price = st->litc[*cp];
-            int32_t lp = n->price + (int32_t)lit_price + llp(st, n->litlen + 1) - llp(st, n->litlen);
+            const unsigned ps = (unsigned)(cur - bs) & (TOK_POS - 1), s = n->state;
+            int32_t lp;
+            if (adaptive) {
+                unsigned ctx = (cur ? cp[-1] : 0) >> 5;
+                lp = n->price + arc_bit_price(st, pm->is_match[s][ps], 0) +
+                     (s >= 7 ? matched_price(st, pm->lit[ctx], *cp, cp[-(ptrdiff_t)n->reps[0]]) : st->litp[ctx][*cp]);
+            } else {
+                lp = n->price + (int32_t)pr->lit[*cp] + llp(st, n->litlen + 1) - llp(st, n->litlen);
+            }
             if (lp < N[i + 1].price) {
                 onode *t = &N[i + 1];
                 t->price = lp; t->from = (uint32_t)i; t->ml = 0; t->off = 0; t->litlen = n->litlen + 1;
             }
+            /* short rep: the byte at rep0, as a 1-byte match */
+            if (adaptive && n->reps[0] <= cur && cp[-(ptrdiff_t)n->reps[0]] == cp[0]) {
+                int32_t sp = n->price + arc_bit_price(st, pm->is_match[s][ps], 1) + arc_bit_price(st, pm->is_rep[s], 1) +
+                             arc_bit_price(st, pm->is_rep0[s], 0) + arc_bit_price(st, pm->is_rep0_long[s][ps], 0);
+                if (sp < N[i + 1].price) {
+                    onode *t = &N[i + 1];
+                    t->price = sp; t->from = (uint32_t)i; t->ml = 1; t->off = 0; t->litlen = 0;
+                }
+            }
 
             /* candidate matches: repeat offsets of this path, then the tree */
-            uint32_t cl[LZR_NUM_REPS + MAX_CAND], co[LZR_NUM_REPS + MAX_CAND], cmin[LZR_NUM_REPS + MAX_CAND];
+            uint32_t cl[LZR_NUM_REPS + 2 + MAX_CAND], co[LZR_NUM_REPS + 2 + MAX_CAND], cmin[LZR_NUM_REPS + 2 + MAX_CAND];
             unsigned nc = 0;
             const uint32_t maxlen = (uint32_t)(be - cur);
             uint32_t best_len = 0, best_off = 0;
@@ -505,6 +659,22 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 if (len > best_len) { best_len = len; best_off = r; }
             }
             uint32_t prevlen = LZR_MIN_MATCH - 1;
+            if (adaptive) {        /* 2- and 3-byte matches (tree finds >= 4) */
+                uint32_t d2 = st->sh2[cur - bs], d3 = st->sh3[cur - bs];
+                for (unsigned t = 0; t < 2; t++) {
+                    uint32_t d = t ? d3 : d2;
+                    if (!d || (t && d == d2) || cp[-(ptrdiff_t)d] != cp[0] || cp[1 - (ptrdiff_t)d] != cp[1]) continue;
+                    uint32_t off = d + 2;
+                    for (uint32_t r = 0; r < LZR_NUM_REPS; r++) if (n->reps[r] == d) { off = r; break; }
+                    if (off < LZR_NUM_REPS) continue;   /* covered by the repeat probes */
+                    /* short lengths only at short distances: a far 2-byte
+                     * match rarely pays and evicts a repeat offset */
+                    uint32_t len = (uint32_t)match_len(cp - d, cp, maxlen), lmin = d <= SH2_MAXD ? 2 : d <= SH3_MAXD ? 3 : 4;
+                    if (len < lmin) continue;
+                    cl[nc] = len; co[nc] = off; cmin[nc] = lmin; nc++;
+                    if (len > best_len) { best_len = len; best_off = off; }
+                }
+            }
             for (uint32_t k = mc->mstart[cur - bs]; k < mc->mstart[cur - bs + 1]; k++) {
                 uint32_t len = mc->pairs[k].len, d = mc->pairs[k].dist, off = d + 2;
                 for (uint32_t r = 0; r < LZR_NUM_REPS; r++) if (n->reps[r] == d) { off = r; break; }
@@ -516,15 +686,41 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 forced = 1; f_i = i; f_len = best_len; f_off = best_off;
                 break;
             }
-            int32_t base = n->price + st->ll_p[0];
+            int32_t base, rep_b[LZR_NUM_REPS], new_b = 0;
+            if (adaptive) {
+                base = n->price + arc_bit_price(st, pm->is_match[s][ps], 1);
+                int32_t r1 = base + arc_bit_price(st, pm->is_rep[s], 1);
+                new_b = base + arc_bit_price(st, pm->is_rep[s], 0);
+                rep_b[0] = r1 + arc_bit_price(st, pm->is_rep0[s], 0) + arc_bit_price(st, pm->is_rep0_long[s][ps], 1);
+                r1 += arc_bit_price(st, pm->is_rep0[s], 1);
+                rep_b[1] = r1 + arc_bit_price(st, pm->is_rep1[s], 0);
+                rep_b[2] = r1 + arc_bit_price(st, pm->is_rep1[s], 1);
+            } else {
+                base = n->price + st->ll_p[0];
+            }
             for (unsigned k = 0; k < nc; k++) {
-                int32_t bo = base + of_price(pr, co[k]);
+                int32_t bo;
+                const int32_t *lenp = NULL;
+                int32_t dpr[4] = {0, 0, 0, 0};
+                if (!adaptive) {
+                    bo = base + of_price(pr, co[k]);
+                } else if (co[k] < LZR_NUM_REPS) {
+                    bo = rep_b[co[k]];
+                    lenp = st->lenp[1][ps];
+                } else {
+                    bo = new_b;
+                    lenp = st->lenp[0][ps];
+                    for (unsigned lc = 0; lc < 4; lc++) dpr[lc] = dist_price(st, co[k] - 3, lc);
+                }
                 /* Lengths past LZR_OPT_FULL are only tried at full length:
                  * cutting a long match short almost never pays, and this
                  * bounds the work per position. */
                 uint32_t Lmax = cl[k], Lcut = cl[k] > LZR_OPT_FULL ? LZR_OPT_FULL : cl[k];
                 for (uint32_t L = cmin[k]; L <= Lmax; L = (L < Lcut || L == Lmax) ? L + 1 : Lmax) {
-                    int32_t price = bo + st->ml_p[L];
+                    int32_t price;
+                    if (!adaptive) price = bo + st->ml_p[L];
+                    else if (L <= TOK_MAXLEN) price = bo + lenp[L] + dpr[L - 2 < 3 ? L - 2 : 3];
+                    else price = bo + lenp[TOK_MAXLEN] + dpr[3] + st->lenp[1][0][L - TOK_MAXLEN < 2 ? 2 : (L - TOK_MAXLEN > TOK_MAXLEN ? TOK_MAXLEN : L - TOK_MAXLEN)];
                     size_t t = i + L;
                     while (last < t) N[++last].price = PRICE_INF;
                     if (price < N[t].price) {
@@ -624,6 +820,7 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
         if (pthread_create(&st->pend_tid, NULL, gather_async, st) == 0) st->pending = 1;
     }
 #endif
+    if (c->adaptive) short_matches(c, st, bs, be);
     TACC(lzr_t_gather);
     if (!c->have_stats) default_prices(&st->pr);
 
@@ -636,7 +833,12 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
             memcpy(c->reps, saved, sizeof(saved));
         }
         build_tables(st);
-        if (c->adaptive) adaptive_lit_prices(c, st);
+        if (c->adaptive) {
+            st->pm = *c->tm;
+            memcpy(st->dreps, c->reps, sizeof(st->dreps));
+            st->dpos = bs;
+            st->dseq = 0;
+        }
         ns = parse_pass(c, st, bs, be, nlit_out);
     }
     TACC(lzr_t_parse);
