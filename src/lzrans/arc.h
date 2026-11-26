@@ -1,30 +1,31 @@
 /*
- * arc.h - adaptive binary range coder for the literals of compressed
- * block type 3.
+ * arc.h - adaptive binary range coder and the token model of compressed
+ * block type 4 (levels 6-9).
  *
  * Coder: LZMA-style range coder, 32-bit range, 12-bit probabilities of a
  * zero bit, updated with shift ARC_SHIFT after every decision. The encoder
  * flushes 5 bytes; the decoder reads 5 bytes up front and must end with
- * its input pointer exactly at the end of the stream.
+ * its input pointer exactly at the end of the block payload.
  *
- * The literals of a block are split by role:
- *   matched  the first literal after a match. Coded with the byte at
- *            distance rep0 (the "match byte") as extra context while their
- *            bits agree, as in LZMA (it is known to differ from that byte),
- *            plus context = previous byte >> 5. One stream, decoded inside
- *            the sequence loop because both contexts need the output.
- *   plain    all other literals, in order. Dealt round-robin to ARC_LANES
- *            streams with their own order-0 bit-tree models, so the decoder
- *            decodes them up front with the lanes' dependency chains
- *            interleaved. A single adaptive coder is latency bound at
- *            ~15-20 cycles per bit, slower than xz on literal-heavy data.
- * Splitting costs ~0.5% of literal size against one coder with full
- * contexts. The models persist across the blocks of a frame; stored and
- * type 1 blocks leave them untouched.
- *
- * Why only literals: adaptive coding of the ll/ml/of code streams gained
- * another 1-2.5% but costs ~12 serial binary decisions per sequence, which
- * made decoding no faster than xz on text. Those stay static rANS.
+ * Token model (the coding layer of LZMA, on our sequences):
+ *   every position is a literal or a match, chosen by is_match[state][pos&3].
+ *   state (12 values) remembers the last few token kinds: literals are
+ *   coded against the "match byte" at rep0 right after a match, and the
+ *   rep / new-distance choice depends on what came before.
+ *   literal       8-bit tree, context = previous byte >> 5
+ *   match         is_rep[state]: 0 = new distance, 1 = repeat offset
+ *     rep         is_rep0[state], then is_rep1[state]: which of 3 offsets;
+ *                 for rep0, is_rep0_long[state][pos&3] = 0 means a 1-byte
+ *                 match ("short rep") with no length
+ *     new dist    slot (6-bit tree, context = min(len - 2, 3)); slots >= 4
+ *                 carry nb = slot/2 - 1 footer bits: reverse trees for
+ *                 slots < 14, else direct bits + 4 adaptive "align" bits
+ *   length        2..273: choice bits select 3-bit low / 3-bit mid trees
+ *                 (context pos&3) or an 8-bit high tree; separate coders
+ *                 for new-distance and repeat matches
+ * Longer matches are emitted as a match followed by rep0 matches.
+ * The model, the state and the repeat offsets persist across the blocks of
+ * a frame; stored and type 1 blocks leave the model untouched.
  */
 #ifndef LZRANS_ARC_H
 #define LZRANS_ARC_H
@@ -36,22 +37,56 @@
 #define ARC_SHIFT 5
 #endif
 #define ARC_TOP (1u << 24)
-#define ARC_LANES 4
-#define ARC_PLAIN_SLACK 16   /* readable bytes required after each plain lane */
+/* The parser prices from a shadow model updated with a slower rate: a
+ * smoother estimate than the coder's own (+0.1-0.3% ratio). */
+#ifndef ARC_DSHIFT
+#define ARC_DSHIFT (ARC_SHIFT + 1)
+#endif
+
+#define TOK_STATES 12
+#define TOK_PB 2                     /* position bits for contexts */
+#define TOK_POS (1 << TOK_PB)
+#define TOK_MAXLEN 273               /* longest single match token */
+#define TOK_DIST_SLOTS 64
+#define TOK_END_SPEC 14              /* slots below this use reverse trees */
 
 typedef uint16_t arc_p;
 
 typedef struct {
-    arc_p matched[8][768];         /* [1..255] tree, [256..767] while matching */
-    arc_p plain[ARC_LANES][256];
-} arc_model;
+    arc_p choice, choice2;
+    arc_p low[TOK_POS][8], mid[TOK_POS][8], high[256];
+} tok_len;
 
-static inline void arc_model_init(arc_model *m)
+typedef struct {
+    arc_p is_match[TOK_STATES][TOK_POS];
+    arc_p is_rep[TOK_STATES], is_rep0[TOK_STATES], is_rep1[TOK_STATES];
+    arc_p is_rep0_long[TOK_STATES][TOK_POS];   /* 0 = "short rep": 1 byte at rep0 */
+    arc_p lit[8][0x300];             /* [1..255] tree, [256..767] matched mode */
+    arc_p slot[4][TOK_DIST_SLOTS];
+    arc_p spec[TOK_END_SPEC][32];    /* reverse footer trees, per slot */
+    arc_p align[16];
+    tok_len mlen, rlen;
+    uint8_t state;
+} tok_model;
+
+static inline void tok_model_init(tok_model *m)
 {
-    for (int c = 0; c < 8; c++)
-        for (int i = 0; i < 768; i++) m->matched[c][i] = ARC_ONE / 2;
-    for (int l = 0; l < ARC_LANES; l++)
-        for (int i = 0; i < 256; i++) m->plain[l][i] = ARC_ONE / 2;
+    arc_p *p = (arc_p *)m;
+    for (size_t i = 0; i < offsetof(tok_model, state) / sizeof(arc_p); i++) p[i] = ARC_ONE / 2;
+    m->state = 0;
+}
+
+static inline unsigned tok_after_lit(unsigned s) { return s < 4 ? 0 : (s < 10 ? s - 3 : s - 6); }
+static inline unsigned tok_after_match(unsigned s) { return s < 7 ? 7 : 10; }
+static inline unsigned tok_after_rep(unsigned s) { return s < 7 ? 8 : 11; }
+static inline unsigned tok_after_short(unsigned s) { return s < 7 ? 9 : 11; }
+
+/* dist0 = distance - 1 -> slot (2 per power of two, 0..3 direct). */
+static inline unsigned tok_slot(uint32_t dist0)
+{
+    if (dist0 < 4) return dist0;
+    unsigned nb = highbit32(dist0);
+    return 2 * nb + ((dist0 >> (nb - 1)) & 1);
 }
 
 /* ---------------- encoder ---------------- */
@@ -61,11 +96,12 @@ typedef struct {
     uint8_t cache;
     uint64_t cache_size;
     uint8_t *p;
+    int dry;          /* only update the model (parser price tracking) */
 } arc_enc;
 
 static inline void arce_init(arc_enc *e, uint8_t *out)
 {
-    e->low = 0; e->range = 0xFFFFFFFFu; e->cache = 0; e->cache_size = 1; e->p = out;
+    e->low = 0; e->range = 0xFFFFFFFFu; e->cache = 0; e->cache_size = 1; e->p = out; e->dry = 0;
 }
 
 static inline void arce_shift_low(arc_enc *e)
@@ -80,10 +116,15 @@ static inline void arce_shift_low(arc_enc *e)
     e->low = (e->low & 0x00FFFFFFu) << 8;
 }
 
-/* Probabilities stay in [31, ARC_ONE - 31], so a decision costs at most
- * ~7.05 bits and one byte of renormalisation always suffices. */
+/* Probabilities stay in [31, ARC_ONE - 31]: a decision costs at most
+ * ~7.05 bits, and one byte of renormalisation always suffices. */
 static inline void arce_bit(arc_enc *e, arc_p *pr, unsigned bit)
 {
+    if (e->dry) {
+        if (!bit) *pr = (arc_p)(*pr + ((ARC_ONE - *pr) >> ARC_DSHIFT));
+        else *pr = (arc_p)(*pr - (*pr >> ARC_DSHIFT));
+        return;
+    }
     uint32_t bound = (e->range >> ARC_PBITS) * *pr;
     if (!bit) {
         e->range = bound;
@@ -96,18 +137,37 @@ static inline void arce_bit(arc_enc *e, arc_p *pr, unsigned bit)
     while (e->range < ARC_TOP) { e->range <<= 8; arce_shift_low(e); }
 }
 
-/* Returns the number of bytes written since arce_init. */
+static inline void arce_direct(arc_enc *e, uint32_t v, unsigned nb)
+{
+    if (e->dry) return;
+    while (nb--) {
+        e->range >>= 1;
+        if ((v >> nb) & 1) e->low += e->range;
+        while (e->range < ARC_TOP) { e->range <<= 8; arce_shift_low(e); }
+    }
+}
+
 static inline size_t arce_finish(arc_enc *e, uint8_t *start)
 {
     for (int i = 0; i < 5; i++) arce_shift_low(e);
     return (size_t)(e->p - start);
 }
 
-static inline void arce_literal(arc_enc *e, arc_p *probs, unsigned byte)
+static inline void arce_tree(arc_enc *e, arc_p *probs, unsigned nbits, unsigned sym)
 {
     unsigned m = 1;
-    for (int i = 7; i >= 0; i--) {
-        unsigned b = (byte >> i) & 1;
+    for (int i = (int)nbits - 1; i >= 0; i--) {
+        unsigned b = (sym >> i) & 1;
+        arce_bit(e, &probs[m], b);
+        m = (m << 1) | b;
+    }
+}
+
+static inline void arce_rtree(arc_enc *e, arc_p *probs, unsigned nbits, unsigned sym)
+{
+    unsigned m = 1;
+    for (unsigned i = 0; i < nbits; i++) {
+        unsigned b = (sym >> i) & 1;
         arce_bit(e, &probs[m], b);
         m = (m << 1) | b;
     }
@@ -124,119 +184,97 @@ static inline void arce_literal_matched(arc_enc *e, arc_p *probs, unsigned byte,
     }
 }
 
-/* ---------------- decoder ---------------- */
+static inline void arce_len(arc_enc *e, tok_len *l, unsigned len, unsigned ps)
+{
+    len -= 2;
+    if (len < 8) { arce_bit(e, &l->choice, 0); arce_tree(e, l->low[ps], 3, len); return; }
+    arce_bit(e, &l->choice, 1);
+    if (len < 16) { arce_bit(e, &l->choice2, 0); arce_tree(e, l->mid[ps], 3, len - 8); return; }
+    arce_bit(e, &l->choice2, 1);
+    arce_tree(e, l->high, 8, len - 16);
+}
+
+static inline void arce_dist(arc_enc *e, tok_model *m, uint32_t dist0, unsigned len)
+{
+    unsigned slot = tok_slot(dist0), lctx = len - 2 < 3 ? len - 2 : 3;
+    arce_tree(e, m->slot[lctx], 6, slot);
+    if (slot < 4) return;
+    unsigned nb = (slot >> 1) - 1;
+    uint32_t base = (2u | (slot & 1)) << nb, rest = dist0 - base;
+    if (slot < TOK_END_SPEC) { arce_rtree(e, m->spec[slot], nb, rest); return; }
+    arce_direct(e, rest >> 4, nb - 4);
+    arce_rtree(e, m->align, 4, rest & 15);
+}
+
+/* One literal at cp (prev = the byte before it, 0 at the stream start). */
+static inline void tok_enc_lit(arc_enc *e, tok_model *m, const uint8_t *cp, unsigned prev, uint32_t rep0, unsigned ps)
+{
+    unsigned s = m->state;
+    arce_bit(e, &m->is_match[s][ps], 0);
+    arc_p *probs = m->lit[prev >> 5];
+    if (s >= 7) arce_literal_matched(e, probs, cp[0], cp[-(ptrdiff_t)rep0]);
+    else arce_tree(e, probs, 8, cp[0]);
+    m->state = (uint8_t)tok_after_lit(s);
+}
+
+/* One match token, len 2..TOK_MAXLEN (or 1 with off 0); off: 0..2 = repeat index, else
+ * distance + 2 (the convention of commit_offset). */
+static inline void tok_enc_match(arc_enc *e, tok_model *m, uint32_t off, unsigned len, unsigned ps)
+{
+    unsigned s = m->state;
+    arce_bit(e, &m->is_match[s][ps], 1);
+    if (off >= 3) {
+        arce_bit(e, &m->is_rep[s], 0);
+        arce_len(e, &m->mlen, len, ps);
+        arce_dist(e, m, off - 3, len);
+        m->state = (uint8_t)tok_after_match(s);
+    } else {
+        arce_bit(e, &m->is_rep[s], 1);
+        arce_bit(e, &m->is_rep0[s], off != 0);
+        if (off) {
+            arce_bit(e, &m->is_rep1[s], off - 1);
+        } else {
+            arce_bit(e, &m->is_rep0_long[s][ps], len > 1);
+            if (len == 1) { m->state = (uint8_t)tok_after_short(s); return; }
+        }
+        arce_len(e, &m->rlen, len, ps);
+        m->state = (uint8_t)tok_after_rep(s);
+    }
+}
+
+/* Length of the first token of a match of length ml (the rest follows as
+ * rep0 tokens); every token is >= 2. */
+static inline unsigned tok_piece(size_t ml)
+{
+    if (ml <= TOK_MAXLEN) return (unsigned)ml;
+    return ml - TOK_MAXLEN < 2 ? TOK_MAXLEN - 2 : TOK_MAXLEN;
+}
+
+/* ---------------- decoder ----------------
+ * Reads are not bounds-checked per byte: one token reads at most
+ * ARC_TOKEN_MAX bytes, so the caller checks p <= end after every token and
+ * keeps ARC_SLACK readable bytes after the payload. */
+#define ARC_TOKEN_MAX 64
+#define ARC_SLACK (2 * ARC_TOKEN_MAX)
+
 typedef struct {
     uint32_t range, code;
     const uint8_t *p, *end;   /* a valid stream ends with p == end */
-    int err;
 } arc_dec;
 
-static inline uint8_t arcd_byte(arc_dec *d)
+static inline uint8_t arcd_byte(arc_dec *d) { return *d->p++; }
+
+/* Returns 0, or -1 if the payload cannot be a stream. */
+static inline int arcd_init(arc_dec *d, const uint8_t *in, size_t n)
 {
-    if (d->p < d->end) return *d->p++;
-    d->err = 1;
+    d->p = in; d->end = in + n;
+    d->range = 0xFFFFFFFFu; d->code = 0;
+    if (n < 5 || arcd_byte(d) != 0) return -1;
+    for (int i = 0; i < 4; i++) d->code = (d->code << 8) | arcd_byte(d);
     return 0;
 }
 
-static inline void arcd_init(arc_dec *d, const uint8_t *in, size_t n)
-{
-    d->p = in; d->end = in + n; d->err = 0;
-    d->range = 0xFFFFFFFFu; d->code = 0;
-    if (arcd_byte(d) != 0) d->err = 1;
-    for (int i = 0; i < 4; i++) d->code = (d->code << 8) | arcd_byte(d);
-}
-
-/* Branchy on purpose: branchless variants measured slower here (the bit is
- * predicted often enough, and they need about twice the instructions). */
-static inline unsigned arcd_bit(arc_dec *d, arc_p *pr)
-{
-    uint32_t p = *pr;
-    uint32_t bound = (d->range >> ARC_PBITS) * p;
-    unsigned bit;
-    if (d->code < bound) {
-        d->range = bound;
-        *pr = (arc_p)(p + ((ARC_ONE - p) >> ARC_SHIFT));
-        bit = 0;
-    } else {
-        d->code -= bound;
-        d->range -= bound;
-        *pr = (arc_p)(p - (p >> ARC_SHIFT));
-        bit = 1;
-    }
-    if (d->range < ARC_TOP) { d->range <<= 8; d->code = (d->code << 8) | arcd_byte(d); }
-    return bit;
-}
-
-static inline unsigned arcd_literal_matched(arc_dec *d, arc_p *probs, unsigned mbyte)
-{
-    unsigned m = 1;
-    for (int i = 7; i >= 0; i--) {
-        unsigned mb = (mbyte >> i) & 1;
-        unsigned b = arcd_bit(d, &probs[256 + (mb << 8) + m]);
-        m = (m << 1) | b;
-        if (b != mb) {
-            while (m < 256) m = (m << 1) | arcd_bit(d, &probs[m]);
-            break;
-        }
-    }
-    return m & 0xFF;
-}
-
-/* Decode n plain literals; literal j uses lane j % ARC_LANES. The lanes
- * are independent, so groups of ARC_LANES are decoded bit-interleaved and
- * the CPU overlaps their chains. Coder state is kept in locals: through a
- * pointer, every output byte store (char may alias anything) would force
- * it back to memory. Returns nonzero if a lane ran past its end. */
-static inline int arcd_plain(arc_dec *ln, arc_model *m, uint8_t *out, size_t n)
-{
-    uint32_t r0 = ln[0].range, r1 = ln[1].range, r2 = ln[2].range, r3 = ln[3].range;
-    uint32_t c0 = ln[0].code, c1 = ln[1].code, c2 = ln[2].code, c3 = ln[3].code;
-    const uint8_t *q0 = ln[0].p, *q1 = ln[1].p, *q2 = ln[2].p, *q3 = ln[3].p;
-    const uint8_t *e0 = ln[0].end, *e1 = ln[1].end, *e2 = ln[2].end, *e3 = ln[3].end;
-    arc_p *p0 = m->plain[0], *p1 = m->plain[1], *p2 = m->plain[2], *p3 = m->plain[3];
-    int err = 0;
-/* Branchless: plain literals are close to random, so a branch on the bit
- * mispredicts about half the time, and mispredictions also defeat the
- * interleaving. Renormalisation reads *Q unconditionally: the caller
- * guarantees ARC_PLAIN_SLACK readable bytes after every lane, and the
- * overrun check after each group of four literals stops a corrupt stream
- * before it gets further. */
-#define ARCD_BIT(R, C, Q, E, PR, SYM)                                              \
-    do {                                                                           \
-        arc_p *pr_ = (PR);                                                         \
-        uint32_t pv_ = *pr_, bound_ = ((R) >> ARC_PBITS) * pv_;                    \
-        uint32_t b_ = (C) >= bound_, m_ = 0u - b_;                                 \
-        (C) -= bound_ & m_;                                                        \
-        (R) = bound_ + (((R) - 2 * bound_) & m_);                                  \
-        uint32_t p0_ = pv_ + ((ARC_ONE - pv_) >> ARC_SHIFT), p1_ = pv_ - (pv_ >> ARC_SHIFT); \
-        *pr_ = (arc_p)(p0_ ^ ((p0_ ^ p1_) & m_));                                  \
-        (SYM) = ((SYM) << 1) | b_;                                                 \
-        uint32_t n_ = (R) < ARC_TOP, sh_ = n_ << 3;                                \
-        (R) <<= sh_;                                                               \
-        (C) = ((C) << sh_) | (*(Q) & (0u - n_));                                   \
-        (Q) += n_;                                                                 \
-    } while (0)
-    size_t j = 0;
-    for (; j + 4 <= n; j += 4) {
-        unsigned s0 = 1, s1 = 1, s2 = 1, s3 = 1;
-        for (int b = 0; b < 8; b++) {
-            ARCD_BIT(r0, c0, q0, e0, &p0[s0], s0);
-            ARCD_BIT(r1, c1, q1, e1, &p1[s1], s1);
-            ARCD_BIT(r2, c2, q2, e2, &p2[s2], s2);
-            ARCD_BIT(r3, c3, q3, e3, &p3[s3], s3);
-        }
-        out[j] = (uint8_t)s0; out[j + 1] = (uint8_t)s1; out[j + 2] = (uint8_t)s2; out[j + 3] = (uint8_t)s3;
-        if ((q0 > e0) | (q1 > e1) | (q2 > e2) | (q3 > e3)) { err = 1; break; }
-    }
-    /* tail: lanes 0, 1, 2 in order */
-    if (!err && j < n) { unsigned s = 1; for (int b = 0; b < 8; b++) ARCD_BIT(r0, c0, q0, e0, &p0[s], s); out[j++] = (uint8_t)s; }
-    if (j < n) { unsigned s = 1; for (int b = 0; b < 8; b++) ARCD_BIT(r1, c1, q1, e1, &p1[s], s); out[j++] = (uint8_t)s; }
-    if (j < n) { unsigned s = 1; for (int b = 0; b < 8; b++) ARCD_BIT(r2, c2, q2, e2, &p2[s], s); out[j++] = (uint8_t)s; }
-#undef ARCD_BIT
-    ln[0].range = r0; ln[1].range = r1; ln[2].range = r2; ln[3].range = r3;
-    ln[0].code = c0; ln[1].code = c1; ln[2].code = c2; ln[3].code = c3;
-    ln[0].p = q0; ln[1].p = q1; ln[2].p = q2; ln[3].p = q3;
-    return err | (q0 > e0) | (q1 > e1) | (q2 > e2) | (q3 > e3);
-}
+/* The token decoder itself is in dec.c (decode_tokens), with the coder
+ * state in locals. */
 
 #endif

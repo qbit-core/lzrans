@@ -273,8 +273,9 @@ def test_threads_validated():
 
 @pytest.mark.parametrize("level", [6, 9])
 def test_adaptive_model_survives_stored_blocks(level):
-    # Levels 6-9 carry an adaptive literal model across blocks; incompressible
-    # blocks are stored and must leave it untouched on both sides.
+    # Levels 6-9 carry an adaptive token model (and its state) across
+    # blocks; incompressible blocks are stored and must leave it untouched
+    # on both sides.
     rnd = random.Random(7)
     parts = []
     for i in range(6):
@@ -286,6 +287,31 @@ def test_adaptive_model_survives_stored_blocks(level):
     d = lzrans.Decompressor()
     out = b"".join(d.decompress(blob[i:i + 1000]) for i in range(0, len(blob), 1000))
     assert out == data and d.eof
+
+
+def _block_types(blob):
+    pos = 16 if blob[5] & 0x02 else 8
+    types = []
+    while True:
+        t, comp = blob[pos], int.from_bytes(blob[pos + 5:pos + 9], "little")
+        types.append(t)
+        pos += 9 + comp
+        if t == 2:
+            return types
+
+
+@pytest.mark.parametrize("level,btype", [(1, 1), (5, 1), (6, 4), (9, 4)])
+def test_block_type_by_level(level, btype):
+    blob = lzrans.compress(_text(3 * BS), level=level)
+    assert blob[4] == 4                              # format version
+    assert set(_block_types(blob)) == {btype, 2}
+
+
+def test_long_matches_split_into_tokens():
+    # Matches longer than one token (273 bytes) and runs at block edges.
+    data = (b"x" * 5000 + _text(2000) + b"ab" * 40000) * 3
+    for level in (6, 9):
+        assert lzrans.decompress(lzrans.compress(data, level=level)) == data
 
 
 def _x86_like(n, seed=3):
