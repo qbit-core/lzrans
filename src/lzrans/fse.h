@@ -71,6 +71,17 @@ static inline void fse_put(fbw *w, const fse_table *t, uint32_t *x, unsigned s)
     *x = t->st[t->first[s] + (X >> nb) - f];
 }
 
+/* fse_put without the write: returns the bits (count in *nb). */
+static inline uint32_t fse_step(const fse_table *t, uint32_t *x, unsigned s, unsigned *nbp)
+{
+    uint32_t X = *x, f = t->norm[s];
+    unsigned nb = (unsigned)(31 - __builtin_clz(X)) - t->hbf[s];
+    if ((X >> nb) < f) nb--;
+    *nbp = nb;
+    *x = t->st[t->first[s] + (X >> nb) - f];
+    return X & ((1u << nb) - 1);
+}
+
 /* ---- backward bit reader ---- */
 typedef struct {
     uint64_t c;
