@@ -22,7 +22,7 @@
 #include "common.h"
 
 #define LZR_MAGIC          "LZRN"
-#define LZR_VERSION        2
+#define LZR_VERSION        3
 #define LZR_FLAG_ENCRYPTED 0x01u   /* reserved: future AEAD envelope       */
 #define LZR_FLAG_SIZE      0x02u   /* header carries the content size       */
 #define LZR_KNOWN_FLAGS    LZR_FLAG_SIZE

@@ -23,7 +23,8 @@ static inline unsigned highbit32(uint32_t v) { return 31u - (unsigned)__builtin_
 #define LZR_BLOCK_SIZE  (1u << LZR_BLOCK_LOG)  /* 256 KB of input per block      */
 #define LZR_WLOG_MIN    18                     /* window >= block size           */
 #define LZR_WLOG_MAX    26                     /* 64 MB                          */
-#define LZR_MIN_MATCH   4
+#define LZR_MIN_MATCH   4                      /* new-offset matches */
+#define LZR_ML_BASE     2                      /* smallest codable match (repeat offsets) */
 #define LZR_NUM_REPS    3
 #define LZR_SLACK       32                     /* over-allocation for wildcopy   */
 

@@ -56,6 +56,9 @@ typedef struct {
 #ifndef LZR_OPT_FULL
 #define LZR_OPT_FULL 32
 #endif
+#ifndef LZR_REP_MIN
+#define LZR_REP_MIN 2        /* repeat-offset matches may be this short */
+#endif
 #define ML_TABLE 512                     /* > max nice length */
 #define LL_TABLE 4096
 
@@ -346,7 +349,7 @@ static void prices_from_parse(lzr_cctx *c, prices_t *pr, size_t ns, size_t nlit)
     for (size_t i = 0; i < nlit; i++) lit[c->lits[i]]++;
     for (size_t i = 0; i < ns; i++) {
         llc[val_code(c->seq_ll[i], &nb, &ex)]++;
-        mlc[val_code(c->seq_ml[i] - LZR_MIN_MATCH, &nb, &ex)]++;
+        mlc[val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex)]++;
         uint32_t off = c->seq_dist[i];
         ofc[off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &nb, &ex)]++;
     }
@@ -373,9 +376,9 @@ static inline int32_t of_price(const prices_t *pr, uint32_t off)
 
 static void build_tables(opt_state *st)
 {
-    for (uint32_t L = LZR_MIN_MATCH; L < ML_TABLE; L++) {
+    for (uint32_t L = LZR_ML_BASE; L < ML_TABLE; L++) {
         unsigned nb; uint32_t ex;
-        unsigned mc = val_code(L - LZR_MIN_MATCH, &nb, &ex);
+        unsigned mc = val_code(L - LZR_ML_BASE, &nb, &ex);
         st->ml_p[L] = (int32_t)(st->pr.mlc[mc] + nb * BITCOST);
     }
     for (uint32_t L = 0; L < LL_TABLE; L++) st->ll_p[L] = ll_price(&st->pr, L);
@@ -450,10 +453,10 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             uint32_t best_len = 0, best_off = 0;
             for (uint32_t r = 0; r < LZR_NUM_REPS; r++) {
                 uint32_t d = n->reps[r];
-                if (d > cur || d > c->wsize || rd32(cp - d) != rd32(cp)) continue;
+                if (d > cur || d > c->wsize || cp[-(ptrdiff_t)d] != cp[0] || cp[1 - (ptrdiff_t)d] != cp[1]) continue;
                 uint32_t len = (uint32_t)match_len(cp - d, cp, maxlen);
-                if (len < LZR_MIN_MATCH) continue;
-                cl[nc] = len; co[nc] = r; cmin[nc] = LZR_MIN_MATCH; nc++;
+                if (len < LZR_REP_MIN) continue;
+                cl[nc] = len; co[nc] = r; cmin[nc] = LZR_REP_MIN; nc++;
                 if (len > best_len) { best_len = len; best_off = r; }
             }
             uint32_t prevlen = LZR_MIN_MATCH - 1;

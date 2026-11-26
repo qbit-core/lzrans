@@ -15,7 +15,7 @@
 #include "codes.h"
 #include "crc32.h"
 
-#define MAX_SEQ (LZR_BLOCK_SIZE / LZR_MIN_MATCH + 1)
+#define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define MAX_COMP (2 * LZR_BLOCK_SIZE + 65536)   /* sanity cap on comp_len */
 
 enum { ST_HEADER, ST_BLOCKS, ST_DONE };
@@ -104,7 +104,7 @@ static int decode_block(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *d
 {
     if (avail < 8) return LZR_ERR_CORRUPT;
     size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8, c;
-    if (nlit > raw || ns > MAX_SEQ || ns * LZR_MIN_MATCH + nlit > raw) return LZR_ERR_CORRUPT;
+    if (nlit > raw || ns > MAX_SEQ || ns * LZR_ML_BASE + nlit > raw) return LZR_ERR_CORRUPT;
 
     c = stream_decode(in + k, avail - k, d->lits, nlit, ALPHA_LIT, d->tbl);
     if (nlit && !c) return LZR_ERR_CORRUPT;
@@ -130,7 +130,7 @@ static int decode_block(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *d
         unsigned lc = d->llc[i], mc = d->mlc[i], oc = d->ofc[i];
         if (lc >= VAL_CODES || mc >= VAL_CODES || oc >= OF_CODES) return LZR_ERR_CORRUPT;
         size_t ll = ct[lc].base + br_get(&br, ct[lc].bits);
-        size_t ml = ct[mc].base + br_get(&br, ct[mc].bits) + LZR_MIN_MATCH;
+        size_t ml = ct[mc].base + br_get(&br, ct[mc].bits) + LZR_ML_BASE;
         uint32_t dist;
         if (oc >= LZR_NUM_REPS) {
             const code_info *e = &ct[oc - LZR_NUM_REPS];

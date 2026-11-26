@@ -15,6 +15,10 @@
 #include "crc32.h"
 
 #include "enc_internal.h"
+#ifdef LZR_TUNE
+#include <stdio.h>
+size_t lzr_sz[5];
+#endif
 
 /* Levels 1-6: hash chains + lazy parsing (window, hash bits, lazy depth,
  * chain steps, nice length). Levels 7-9: binary tree + optimal parsing
@@ -235,7 +239,7 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
         uint32_t ex;
         c->llc[i] = (uint8_t)val_code(c->seq_ll[i], &nb, &ex);
         bw_put(&bw, ex, nb);
-        c->mlc[i] = (uint8_t)val_code(c->seq_ml[i] - LZR_MIN_MATCH, &nb, &ex);
+        c->mlc[i] = (uint8_t)val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
         bw_put(&bw, ex, nb);
         uint32_t off = c->seq_dist[i];
         if (off < LZR_NUM_REPS) {
@@ -252,10 +256,31 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
     size_t k = LZR_BLOCK_HDR;
     wr32le(b + k, (uint32_t)ns); k += 4;
     wr32le(b + k, (uint32_t)nlit); k += 4;
-    k += stream_encode(b + k, c->lits, nlit, ALPHA_LIT, c->scratch);
-    k += stream_encode(b + k, c->llc, ns, ALPHA_CODE, c->scratch);
-    k += stream_encode(b + k, c->mlc, ns, ALPHA_CODE, c->scratch);
-    k += stream_encode(b + k, c->ofc, ns, ALPHA_CODE, c->scratch);
+#ifdef LZR_TUNE
+    size_t k0 = k;
+    extern size_t lzr_sz[5];
+#define TS(i) do { lzr_sz[i] += k - k0; k0 = k; } while (0)
+    {
+        static FILE *df;
+        if (!df && getenv("LZR_DUMP")) df = fopen(getenv("LZR_DUMP"), "wb");
+        if (df) {
+            uint64_t abs_bs = c->total_in - (c->end - bs);   /* stream offset of block */
+            uint32_t h[3] = {(uint32_t)ns, (uint32_t)nlit, (uint32_t)(be - bs)};
+            fwrite(&abs_bs, 8, 1, df); fwrite(h, 4, 3, df);
+            fwrite(c->seq_ll, 4, ns, df); fwrite(c->seq_ml, 4, ns, df); fwrite(c->seq_dist, 4, ns, df);
+            fflush(df);
+        }
+    }
+#else
+#define TS(i)
+#endif
+    k += stream_encode(b + k, c->lits, nlit, ALPHA_LIT, c->scratch); TS(0);
+    k += stream_encode(b + k, c->llc, ns, ALPHA_CODE, c->scratch); TS(1);
+    k += stream_encode(b + k, c->mlc, ns, ALPHA_CODE, c->scratch); TS(2);
+    k += stream_encode(b + k, c->ofc, ns, ALPHA_CODE, c->scratch); TS(3);
+#ifdef LZR_TUNE
+    lzr_sz[4] += extra_len;
+#endif
     wr32le(b + k, (uint32_t)extra_len); k += 4;
     memcpy(b + k, c->extra, extra_len); k += extra_len;
 

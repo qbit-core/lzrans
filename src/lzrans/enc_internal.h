@@ -42,7 +42,7 @@ struct lzr_cctx {
     uint8_t *lits, *llc, *mlc, *ofc, *extra, *scratch, *blk;
 };
 
-#define MAX_SEQ (LZR_BLOCK_SIZE / LZR_MIN_MATCH + 1)
+#define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define LZR_MAX_THREADS 16
 #ifndef LZR_HAVE_THREADS
 #if defined(_WIN32)
