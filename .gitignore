@@ -6,3 +6,4 @@ __pycache__/
 .pytest_cache/
 tests/c/fuzz_roundtrip
 *.whl
+tests/c/fuzz_tsan

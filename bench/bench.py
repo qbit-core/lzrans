@@ -39,6 +39,8 @@ def run(name, data):
     mb = len(data) / 1e6
     rows = []
     codecs = [(f"lzrans -{lv}", lambda d, lv=lv: lzrans.compress(d, lv), lzrans.decompress) for lv in (1, 6, 7, 9)]
+    codecs += [(f"lzrans -{lv} (4 thr)", lambda d, lv=lv: lzrans.compress(d, lv, threads=4), lzrans.decompress)
+               for lv in (7, 9)]
     codecs += [("zlib -9", lambda d: zlib.compress(d, 9), zlib.decompress)]
     codecs += [(f"xz -{lv}", lambda d, lv=lv: lzma.compress(d, preset=lv), lzma.decompress) for lv in (6, 9)]
     try:
@@ -57,7 +59,7 @@ def run(name, data):
     print("| codec | ratio | compress MB/s | decompress MB/s |")
     print("|---|---:|---:|---:|")
     for r in rows:
-        print(f"| {r[0]} | {r[1]:.3f} | {r[2]:.0f} | {r[3]:.0f} |")
+        print(f"| {r[0]} | {r[1]:.3f} | {r[2]:.1f} | {r[3]:.0f} |")
 
 
 if __name__ == "__main__":

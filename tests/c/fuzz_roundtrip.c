@@ -31,6 +31,7 @@ static int compress_chunked(const uint8_t *src, size_t n, int level, lzr_buf *ou
 {
     lzr_cctx *c = lzr_cctx_new(level, 0, (rnd() & 1) ? (int64_t)n : -1);
     if (!c) return -1;
+    lzr_cctx_set_threads(c, 1 + (int)(rnd() % 4));
     size_t i = 0;
     int r = 0;
     while (!r && i < n) {

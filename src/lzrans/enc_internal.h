@@ -34,6 +34,8 @@ struct lzr_cctx {
     uint32_t *son;
     void *opt;
     int have_stats;
+    int threads;           /* match-finder threads (levels 7-9)           */
+    size_t bt_maxdist;     /* farthest tree node followed (see opt_init)   */
 
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
@@ -41,6 +43,14 @@ struct lzr_cctx {
 };
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_MIN_MATCH + 1)
+#define LZR_MAX_THREADS 16
+#ifndef LZR_HAVE_THREADS
+#if defined(_WIN32)
+#define LZR_HAVE_THREADS 0
+#else
+#define LZR_HAVE_THREADS 1
+#endif
+#endif
 #define LZR_LOOKAHEAD 512   /* > max nice length; see opt.c gather() */
 
 #ifndef LZR_HASH_LEN
@@ -88,5 +98,6 @@ int opt_init(lzr_cctx *c);
 void opt_free(lzr_cctx *c);
 size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out);
 void opt_slide(lzr_cctx *c, uint32_t delta);
+void opt_sync(lzr_cctx *c);
 
 #endif

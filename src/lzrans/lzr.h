@@ -36,6 +36,9 @@ typedef struct lzr_cctx lzr_cctx;
 /* window_log 0 = level default. content_size < 0 = unknown. */
 lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size);
 void lzr_cctx_free(lzr_cctx *c);
+/* Worker threads for the level 7-9 match finder (1 = none). The output is
+ * identical for any thread count. Call before the first write. */
+void lzr_cctx_set_threads(lzr_cctx *c, int threads);
 /* Feed input; complete blocks are appended to out. */
 int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out);
 /* Compress buffered input and write the end block. The context is then done. */
