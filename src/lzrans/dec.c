@@ -110,15 +110,27 @@ static int decode_block(lzr_dctx *d, int type, const uint8_t *in, size_t avail, 
     size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8, c;
     if (nlit > raw || ns > MAX_SEQ || ns * LZR_ML_BASE + nlit > raw) return LZR_ERR_CORRUPT;
 
-    arc_dec ra = {0, 0, NULL, NULL, 0};   /* type 3 literals, decoded in the sequence loop */
+    arc_dec ra = {0, 0, NULL, NULL, 0};   /* type 3 matched literals, decoded in the loop */
     arc_model *am = &d->am;
+    size_t nplain = nlit, matched = 0;
     if (type == 3) {
+        arc_dec ln[ARC_LANES];
         if (avail - k < 4) return LZR_ERR_CORRUPT;
-        size_t la = rd32le(in + k);
+        nplain = rd32le(in + k);
         k += 4;
-        if (la > avail - k) return LZR_ERR_CORRUPT;
-        arcd_init(&ra, in + k, la);
-        k += la;
+        if (nplain > nlit || nlit - nplain > ns) return LZR_ERR_CORRUPT;
+        for (int s = 0; s <= ARC_LANES; s++) {
+            if (avail - k < 4) return LZR_ERR_CORRUPT;
+            size_t la = rd32le(in + k);
+            k += 4;
+            if (la > avail - k) return LZR_ERR_CORRUPT;
+            arcd_init(s ? &ln[s - 1] : &ra, in + k, la);
+            k += la;
+        }
+        if (arcd_plain(ln, am, d->lits, nplain)) return LZR_ERR_CORRUPT;
+
+        for (int s = 0; s < ARC_LANES; s++)
+            if (ln[s].err || ln[s].p != ln[s].end) return LZR_ERR_CORRUPT;
     } else {
         c = stream_decode(in + k, avail - k, d->lits, nlit, ALPHA_LIT, d->tbl);
         if (nlit && !c) return LZR_ERR_CORRUPT;
@@ -137,7 +149,7 @@ static int decode_block(lzr_dctx *d, int type, const uint8_t *in, size_t avail, 
     bitr br = {0, 0, in + k, in + k + xlen, 0};
 
     const code_info *ct = d->ct;
-    const uint8_t *lp = d->lits, *lend = d->lits + nlit;   /* type 3: only counts */
+    const uint8_t *lp = d->lits, *lend = d->lits + nplain;   /* type 3: plain literals only */
     uint8_t *o = dst, *const oend = dst + raw;
     uint32_t *reps = d->reps;
 
@@ -150,34 +162,24 @@ static int decode_block(lzr_dctx *d, int type, const uint8_t *in, size_t avail, 
             if (lc >= VAL_CODES || mc >= VAL_CODES || oc >= OF_CODES) return LZR_ERR_CORRUPT;
             ll = ct[lc].base + br_get(&br, ct[lc].bits);
             ml = ct[mc].base + br_get(&br, ct[mc].bits) + LZR_ML_BASE;
-            if (ll > (size_t)(lend - lp) || ll + ml > (size_t)(oend - o)) return LZR_ERR_CORRUPT;
         } else {
-            ll = (size_t)(lend - lp);
-            if (ll != (size_t)(oend - o)) return LZR_ERR_CORRUPT;
+            ll = (size_t)(oend - o);   /* trailing literals */
         }
+        /* type 3: the first literal after a match is in its own stream */
+        size_t first = (type == 3 && i && ll) ? 1 : 0, plain = ll - first;
+        if (plain > (size_t)(lend - lp) || ll + ml > (size_t)(oend - o)) return LZR_ERR_CORRUPT;
+        if (i == ns && plain != (size_t)(lend - lp)) return LZR_ERR_CORRUPT;
 
-        /* literal run (lits buffer and history both have slack) */
-        if (type == 3) {
-            if (ll) {
-                uint8_t *le = o + ll;
-                unsigned prev = o > d->hist ? o[-1] : 0;
-                if (i) {   /* first literal after a match: match byte at rep0 */
-                    prev = arcd_literal_matched(&ra, am->lit[prev >> 5], o[-(ptrdiff_t)reps[0]]);
-                    *o++ = (uint8_t)prev;
-                }
-                while (o < le) {
-                    prev = arcd_tree(&ra, am->lit[prev >> 5], 8);
-                    *o++ = (uint8_t)prev;
-                }
-                o -= ll;
-            }
-        } else if (ll <= 16) {
-            memcpy(o, lp, 16);
-        } else {
-            memcpy(o, lp, ll);
+        if (first) {
+            uint8_t lit = (uint8_t)arcd_literal_matched(&ra, am->matched[o[-1] >> 5], o[-(ptrdiff_t)reps[0]]);
+            *o++ = lit;
+            matched++;
         }
-        o += ll;
-        lp += ll;
+        /* plain literal run (lits buffer and history both have slack) */
+        if (plain <= 16) memcpy(o, lp, 16);
+        else memcpy(o, lp, plain);
+        o += plain;
+        lp += plain;
         if (i == ns) break;
 
         uint32_t dist;
@@ -194,7 +196,7 @@ static int decode_block(lzr_dctx *d, int type, const uint8_t *in, size_t avail, 
         copy_match(o, dist, ml);
         o += ml;
     }
-    if (type == 3 && (ra.err || ra.p != ra.end)) return LZR_ERR_CORRUPT;
+    if (type == 3 && (ra.err || ra.p != ra.end || matched != nlit - nplain)) return LZR_ERR_CORRUPT;
     if (br.err || br.p != br.end) return LZR_ERR_CORRUPT;
     return LZR_OK;
 }
@@ -267,7 +269,10 @@ int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size
 {
     if (consumed) *consumed = 0;
     if (d->state == ST_DONE) return 1;
-    if (n && buf_append(&d->in, src, n)) return LZR_ERR_NOMEM;
+    /* Keep ARC_PLAIN_SLACK zeroed bytes after the input: the branchless
+     * literal decoder may read that far past a (corrupt) lane. */
+    if (n && (buf_reserve(&d->in, n + ARC_PLAIN_SLACK) || buf_append(&d->in, src, n))) return LZR_ERR_NOMEM;
+    if (n) memset(d->in.p + d->in.len, 0, ARC_PLAIN_SLACK);
 
     int r;
     while ((r = step(d, out)) == 1) {}

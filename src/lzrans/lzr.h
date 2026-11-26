@@ -13,7 +13,8 @@
  *                          (rANS streams, see rans.h) | extra_len u32 | extra bits
  *     type 2  end:         raw_len = 0, payload = CRC32 of all content (u32)
  *     type 3  compressed, adaptive literals: as type 1, but the literals are
- *                          lit_len u32 | range-coded stream (see arc.h)
+ *                          nplain u32 | 5 x (len u32 | range-coded stream):
+ *                          matched literals, then 4 lanes of plain ones (arc.h)
  *   Match lengths are >= LZR_ML_BASE (2); the ml code holds length - 2.
  *
  * Matches may reach back up to 2^window_log bytes, across block borders.

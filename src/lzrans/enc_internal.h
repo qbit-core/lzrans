@@ -39,6 +39,7 @@ struct lzr_cctx {
     size_t bt_maxdist;     /* farthest tree node followed (see opt_init)   */
     int adaptive;          /* emit block type 3 (adaptive range coding)    */
     arc_model *am;         /* [0] = live model, [1] = copy for rollback     */
+    uint8_t *arctmp;       /* adaptive literal streams before assembly     */
 
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
@@ -47,9 +48,10 @@ struct lzr_cctx {
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define LZR_MAX_THREADS 16
-/* Adaptive literal stream worst case: 8 decisions per literal, each
+/* Adaptive literal stream worst cases: 8 decisions per literal, each
  * <= 7.05 bits (probabilities stay in [31, 4065] / 4096). */
-#define ARC_CAP_LIT (8 * (size_t)LZR_BLOCK_SIZE + 16)
+#define ARC_CAP_MATCHED (8 * (size_t)(MAX_SEQ + 1) + 16)
+#define ARC_CAP_LANE (8 * (size_t)(LZR_BLOCK_SIZE / ARC_LANES + 1) + 16)
 #ifndef LZR_ADAPTIVE_LEVEL
 #define LZR_ADAPTIVE_LEVEL 6   /* levels >= this use adaptive blocks */
 #endif

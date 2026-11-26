@@ -88,7 +88,7 @@ typedef struct {
     /* adaptive literals (block type 3): prices from the model state at the
      * start of the block */
     uint16_t bitc[ARC_ONE >> 4];   /* price of a 0 bit by probability / 16 */
-    uint32_t litc[8][256];         /* plain literal, by context              */
+    uint32_t litc[256];            /* plain literal                          */
 } opt_state;
 
 int opt_init(lzr_cctx *c)
@@ -124,21 +124,19 @@ static inline uint32_t arc_bit_price(const opt_state *st, arc_p p, unsigned bit)
     return st->bitc[(bit ? ARC_ONE - p : p) >> 4];
 }
 
-/* Plain literal prices for every context from the live model. */
+/* Plain literal prices from the live model (lane 0 stands in for all). */
 static void adaptive_lit_prices(lzr_cctx *c, opt_state *st)
 {
-    for (unsigned ctx = 0; ctx < 8; ctx++) {
-        const arc_p *pr = c->am->lit[ctx];
-        uint32_t node[256];   /* price of reaching tree node m */
-        node[1] = 0;
-        for (unsigned m = 1; m < 128; m++) {
-            node[2 * m] = node[m] + arc_bit_price(st, pr[m], 0);
-            node[2 * m + 1] = node[m] + arc_bit_price(st, pr[m], 1);
-        }
-        for (unsigned b = 0; b < 256; b++) {
-            unsigned m = 128 + (b >> 1);
-            st->litc[ctx][b] = node[m] + arc_bit_price(st, pr[m], b & 1);
-        }
+    const arc_p *pr = c->am->plain[0];
+    uint32_t node[256];   /* price of reaching tree node m */
+    node[1] = 0;
+    for (unsigned m = 1; m < 128; m++) {
+        node[2 * m] = node[m] + arc_bit_price(st, pr[m], 0);
+        node[2 * m + 1] = node[m] + arc_bit_price(st, pr[m], 1);
+    }
+    for (unsigned b = 0; b < 256; b++) {
+        unsigned m = 128 + (b >> 1);
+        st->litc[b] = node[m] + arc_bit_price(st, pr[m], b & 1);
     }
 }
 
@@ -485,8 +483,8 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             if (last < i + 1) { N[i + 1].price = PRICE_INF; last = i + 1; }
             uint32_t lit_price;
             if (!c->adaptive) lit_price = pr->lit[*cp];
-            else if (n->ml) lit_price = adaptive_matched_price(st, c->am->lit[cp[-1] >> 5], *cp, cp[-(ptrdiff_t)n->reps[0]]);
-            else lit_price = st->litc[(cur ? cp[-1] : 0) >> 5][*cp];
+            else if (n->ml) lit_price = adaptive_matched_price(st, c->am->matched[cp[-1] >> 5], *cp, cp[-(ptrdiff_t)n->reps[0]]);
+            else lit_price = st->litc[*cp];
             int32_t lp = n->price + (int32_t)lit_price + llp(st, n->litlen + 1) - llp(st, n->litlen);
             if (lp < N[i + 1].price) {
                 onode *t = &N[i + 1];
