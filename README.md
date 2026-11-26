@@ -4,7 +4,7 @@ Streaming LZ77 + rANS compressor. The core is C; Python uses it through a
 CPython native extension.
 
 **Goal:** a better ratio than xz/LZMA with faster compression *and*
-decompression, usable on streams. Status: v0.2 phase 1 (see Roadmap).
+decompression, usable on streams. Status: v0.2 phase 2 (see Roadmap).
 
 ```python
 import lzrans
@@ -35,7 +35,8 @@ python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 
 | Stage | Implementation (`src/lzrans/`) |
 |---|---|
-| Match finding | `enc.c`: hash chains over a 1-32 MB window (by level), 5-byte hash, 8-byte compares, 3 repeat offsets probed first, lazy matching (depth 0-2) scored by length vs. offset cost. |
+| Match finding | Levels 1-6 (`enc.c`): hash chains over a 1-8 MB window, 5-byte hash, 3 repeat offsets probed first, lazy matching (depth 0-2). Levels 7-9 (`opt.c`): binary tree (BT4) over an 8-16 MB window collecting all match lengths per position. |
+| Parsing | Levels 7-9: price-based optimal parsing (forward DP over 4096-position segments, repeat offsets tracked per path, prices from the previous pass/block statistics; 2 passes at levels 8-9). |
 | Tokens | Sequences of (literal run, match length, offset). Offset code 0-2 = repeat offset, else a log-bucket code. Lengths/offsets use log-bucket codes (62 codes) + raw extra bits. |
 | Entropy coding | `rans.c`: 4 rANS streams per 256 KB block (literals, LL codes, ML codes, offset codes), 12-bit static model per block, 2 interleaved states, raw/run fallbacks. |
 | Decoding | `dec.c`: streams decoded into arrays with one table lookup per symbol, then a sequence loop with 16-byte wildcopy for literals and matches. |
@@ -67,6 +68,6 @@ are rejected for now.
 | Phase | Change | Status |
 |---|---|---|
 | P1 | Streaming frame, large window, sequence tokens, repeat offsets | done |
-| P2 | Binary-tree match finder + price-based optimal parsing | next |
-| P3 | Context-modelled entropy coding (literal contexts, match-byte context) | planned |
+| P2 | Binary-tree match finder + price-based optimal parsing | done |
+| P3 | Context-modelled entropy coding (literal contexts, match-byte context) | next |
 | P4 | Decoder speed (more interleaved states, branchless refill), x86 filter | planned |

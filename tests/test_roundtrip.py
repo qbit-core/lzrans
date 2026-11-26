@@ -40,7 +40,7 @@ CASES = {
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
-@pytest.mark.parametrize("level", [1, 4, 9])
+@pytest.mark.parametrize("level", [1, 4, 7, 9])
 def test_roundtrip(name, level):
     data = CASES[name]
     comp = lzrans.compress(data, level=level)
@@ -62,6 +62,11 @@ def test_never_expands_much():
     data = os.urandom(3 * BS)
     comp = lzrans.compress(data)
     assert len(comp) <= len(data) + 16 + 9 * 3 + 13   # header + stored blocks + end block
+
+
+def test_optimal_levels_beat_lazy():
+    data = CASES["text_300k"] + CASES["binary_mix"]
+    assert len(lzrans.compress(data, level=9)) < len(lzrans.compress(data, level=6))
 
 
 def test_big_window_finds_far_match():
@@ -197,11 +202,12 @@ def test_streaming_output_is_incremental():
     assert not d.eof
 
 
-def test_streaming_matches_one_shot_chunking_independent():
+@pytest.mark.parametrize("level", [5, 9])
+def test_streaming_matches_one_shot_chunking_independent(level):
     data = _text(700_000, 4)
     outs = set()
     for maxchunk in (1000, 65_536, 10**7):
-        c = lzrans.Compressor(level=5)
+        c = lzrans.Compressor(level=level)
         rnd = random.Random(0)
         outs.add(b"".join(c.compress(ch) for ch in _chunks(data, rnd, maxchunk)) + c.flush())
     assert len(outs) == 1                               # deterministic regardless of chunking

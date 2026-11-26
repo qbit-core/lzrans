@@ -12,6 +12,7 @@ setup(
                 "src/lzrans/module.c",
                 "src/lzrans/enc.c",
                 "src/lzrans/dec.c",
+                "src/lzrans/opt.c",
                 "src/lzrans/rans.c",
                 "src/lzrans/crc32.c",
             ],
