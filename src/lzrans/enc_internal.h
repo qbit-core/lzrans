@@ -34,6 +34,8 @@ struct lzr_cctx {
     size_t base;           /* levels 1-6: bytes slid out since the last rebase */
     uint8_t *rtag, *rhead; /* row finder: 8-bit tags (head[] holds the
                             * positions) and each row's newest slot       */
+    uint32_t hc[8];        /* row hashes of positions hcpos[] (pos & 7);   */
+    size_t hcpos[8];       /* computed once, used to prefetch, insert and search */
     uint32_t reps[LZR_NUM_REPS];
     xxh64_state xs;        /* checksum of the original content */
     uint64_t total_in;

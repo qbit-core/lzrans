@@ -73,6 +73,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->cap = 2 * c->wsize + LZR_BLOCK_SIZE;
     c->content_size = content_size;
     c->reps[0] = 1; c->reps[1] = 4; c->reps[2] = 8;
+    for (int k = 0; k < 8; k++) c->hcpos[k] = SIZE_MAX;
 
     c->buf = (uint8_t *)big_alloc(c->cap + LZR_SLACK, 0);
     c->head = (uint32_t *)big_alloc(((size_t)1 << c->lp.hlog) * sizeof(uint32_t), 1);
@@ -157,6 +158,17 @@ static inline uint32_t row_hash(const uint8_t *p, unsigned bits)
     return (uint32_t)(((v << (64 - 8 * LZR_HASH_LEN)) * 0x9FB21C651E98DF25ull) >> (64 - bits));
 }
 
+/* Row hash of buf[i], from the cache when present. */
+static inline uint32_t row_hash_at(const lzr_cctx *c, size_t i, unsigned bits)
+{
+    return c->hcpos[i & 7] == i ? c->hc[i & 7] : row_hash(c->buf + i, bits);
+}
+
+static inline void hash_cache_clear(lzr_cctx *c)
+{
+    for (int k = 0; k < 8; k++) c->hcpos[k] = SIZE_MAX;
+}
+
 /* Bit k set where tags[k] == tag, k < R (R = 16, 32 or 64). */
 static inline uint64_t row_match_mask(const uint8_t *tags, uint8_t tag, unsigned R)
 {
@@ -178,21 +190,30 @@ static inline uint64_t row_match_mask(const uint8_t *tags, uint8_t tag, unsigned
 static inline void row_insert_upto(lzr_cctx *c, size_t upto)
 {
     const unsigned rlog = c->lp.row, bits = c->lp.hlog - rlog + 8, rmask = (1u << rlog) - 1;
-    const size_t base = c->base;
-    size_t limit = c->end >= LZR_HASH_LEN ? c->end - LZR_HASH_LEN + 1 : 0;
+    const size_t base = c->base, end = c->end;
+    size_t limit = end >= LZR_HASH_LEN ? end - LZR_HASH_LEN + 1 : 0;
     if (upto > limit) upto = limit;
+    /* locals (restrict): byte stores would otherwise force reloads */
+    const uint8_t *restrict buf = c->buf;
+    uint8_t *restrict rtag = c->rtag, *restrict rhead = c->rhead;
+    uint32_t *restrict head = c->head, *restrict hc = c->hc;
+    size_t *restrict hcpos = c->hcpos;
     for (size_t i = c->ins; i < upto; i++) {
-        {   /* the row of a position a few bytes ahead: hides the miss */
-            uint32_t ha = row_hash(c->buf + i + 8, bits) >> 8;
-            __builtin_prefetch(c->rtag + ((size_t)ha << rlog));
-            __builtin_prefetch(c->head + ((size_t)ha << rlog));
+        uint32_t h = hcpos[i & 7] == i ? hc[i & 7] : row_hash(buf + i, bits), row = h >> 8;
+        const size_t ia = i + 8;   /* (takes the slot of i: read it first) */
+        if (ia + LZR_HASH_LEN <= end) {
+            /* hash a position 8 ahead (real bytes only, so the result does
+             * not depend on how input arrives), keep it, prefetch its row */
+            uint32_t ha = row_hash(buf + ia, bits);
+            hc[ia & 7] = ha; hcpos[ia & 7] = ia;
+            __builtin_prefetch(rtag + ((size_t)(ha >> 8) << rlog));
+            __builtin_prefetch(head + ((size_t)(ha >> 8) << rlog));
         }
-        uint32_t h = row_hash(c->buf + i, bits), row = h >> 8;
-        unsigned slot = (c->rhead[row] - 1) & rmask;
-        c->rhead[row] = (uint8_t)slot;
+        unsigned slot = (rhead[row] - 1) & rmask;
+        rhead[row] = (uint8_t)slot;
         size_t e = ((size_t)row << rlog) + slot;
-        c->rtag[e] = (uint8_t)h;
-        c->head[e] = (uint32_t)(base + i + 1);
+        rtag[e] = (uint8_t)h;
+        head[e] = (uint32_t)(base + i + 1);
     }
     if (upto > c->ins) c->ins = upto;
 }
@@ -225,7 +246,7 @@ static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *r
 
     /* 2) row finder: tag-matching slots, newest first */
     const unsigned rlog = c->lp.row, R = 1u << rlog;
-    const uint32_t h = row_hash(cur, c->lp.hlog - rlog + 8), row = h >> 8;
+    const uint32_t h = row_hash_at(c, p, c->lp.hlog - rlog + 8), row = h >> 8;
     const size_t r0 = (size_t)row << rlog;
     const unsigned hd = c->rhead[row];
     uint64_t m = row_match_mask(c->rtag + r0, (uint8_t)h, R);
@@ -233,17 +254,28 @@ static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *r
     if (hd) m = (m >> hd | m << (R - hd)) & (R == 64 ? ~0ull : (1ull << R) - 1);
     unsigned tries = c->lp.chain;
     size_t best_len = best.len >= LZR_MIN_MATCH ? best.len : LZR_MIN_MATCH - 1;
-    const size_t base = c->base;
+    const size_t base = c->base, wsize = c->wsize;
+    const uint32_t *const rpos = c->head + r0;
+    const uint8_t *const buf = c->buf;
+    {   /* start loading the data of the first candidates: those loads
+         * miss the cache and would otherwise run one after another */
+        uint64_t q = m;
+        for (int n = 0; q && n < 4; n++, q &= q - 1) {
+            size_t cq = (size_t)rpos[(hd + (unsigned)__builtin_ctzll(q)) & (R - 1)] - 1 - base;
+            if (cq < p) __builtin_prefetch(buf + cq);
+        }
+    }
     while (m && tries--) {
         unsigned k = (unsigned)__builtin_ctzll(m);
         m &= m - 1;
-        uint32_t cand = c->head[r0 + ((hd + k) & (R - 1))];
-        if (!cand || cand - 1 < base) break;          /* empty / slid out (older follow) */
-        size_t cp = cand - 1 - base;
-        if (cp >= p) continue;                          /* not yet valid (cannot happen) */
+        /* slot -> buffer index; an empty (0) or slid-out slot wraps to a
+         * huge index. Slots are newest first, so the first one out of
+         * reach (also: dist > window) ends the search. Only earlier
+         * positions are ever inserted, so cp < p for live slots. */
+        size_t cp = (size_t)rpos[(hd + k) & (R - 1)] - 1 - base;
         size_t dist = p - cp;
-        if (dist > c->wsize) break;
-        const uint8_t *ref = c->buf + cp;
+        if (cp >= p || dist > wsize) break;
+        const uint8_t *ref = buf + cp;
         if (ref[best_len] == cur[best_len] && rd32(ref) == first) {
             size_t len = match_len(ref, cur, maxlen);
             if (len > best_len) {
@@ -489,6 +521,7 @@ static void slide(lzr_cctx *c)
     c->pos -= delta;
     c->end -= delta;
     c->ins = c->ins > delta ? c->ins - delta : 0;
+    hash_cache_clear(c);   /* positions moved */
     size_t hs = (size_t)1 << c->lp.hlog;
     if (!c->lp.opt) {
         /* Levels 1-6 store base + index, so sliding only moves the base
@@ -615,6 +648,7 @@ static void job_compress(job_arg *a, lzr_cctx *w, lzr_buf *out)
     }
     w->end = a->je;
     w->ins = a->js > c->jover ? a->js - c->jover : 0;
+    hash_cache_clear(w);
     row_insert_upto(w, a->js);
     w->reps[0] = w->reps[1] = w->reps[2] = 0;
     w->huf[0].valid = 0;

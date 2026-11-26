@@ -52,6 +52,15 @@ int fse_build(fse_table *t)
         next[s] = t->norm[s];
         t->first[s] = (uint16_t)cum;
         t->hbf[s] = t->norm[s] ? (uint8_t)(31 - __builtin_clz(t->norm[s])) : 0;
+        /* the shift that puts X in [L, 2L) into [f, 2f) is
+         * (X + (m << 16) - (f << m)) >> 16 with m = LOG - floor(log2(f - 1))
+         * (m = LOG for f = 1): checked for every f and X */
+        if (t->norm[s]) {
+            uint32_t f = t->norm[s];
+            unsigned m = f == 1 ? FSE_LOG : FSE_LOG - (unsigned)(31 - __builtin_clz(f - 1));
+            t->dnb[s] = (m << 16) - (f << m);
+            t->dfs[s] = (int32_t)cum - (int32_t)f;
+        }
         cum += t->norm[s];
     }
     for (unsigned u = 0; u < FSE_L; u++) {
