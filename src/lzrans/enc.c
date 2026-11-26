@@ -13,6 +13,7 @@
 #include "rans.h"
 #include "codes.h"
 #include "crc32.h"
+#include "x86.h"
 #include "arc.h"
 
 #include "enc_internal.h"
@@ -110,7 +111,7 @@ void lzr_cctx_free(lzr_cctx *c)
     free(c->buf); free(c->head); free(c->prev);
     free(c->seq_ll); free(c->seq_ml); free(c->seq_dist);
     free(c->lits); free(c->llc); free(c->mlc); free(c->ofc);
-    free(c->extra); free(c->scratch); free(c->blk); free(c->am); free(c->arctmp);
+    free(c->extra); free(c->scratch); free(c->blk); free(c->am); free(c->arctmp); free(c->x86tmp);
     free(c);
 }
 
@@ -225,7 +226,7 @@ static int write_header(lzr_cctx *c, lzr_buf *out)
     uint8_t h[16];
     memcpy(h, LZR_MAGIC, 4);
     h[4] = LZR_VERSION;
-    h[5] = c->content_size >= 0 ? LZR_FLAG_SIZE : 0;
+    h[5] = (uint8_t)((c->content_size >= 0 ? LZR_FLAG_SIZE : 0) | (c->x86tmp ? LZR_FLAG_X86 : 0));
     h[6] = c->lp.wlog;
     h[7] = 0;
     size_t n = 8;
@@ -381,12 +382,13 @@ static void slide(lzr_cctx *c)
     if (c->lp.opt) opt_slide(c, d);
 }
 
-int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
+typedef struct { lzr_cctx *c; lzr_buf *out; } sink_ctx;
+
+/* Append (already filtered) content and compress every full block. */
+static int write_raw(void *ctx, const uint8_t *src, size_t n)
 {
-    if (c->finished) return LZR_ERR_PARAM;
-    if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
-    c->crc = lzr_crc32(c->crc, src, n);
-    c->total_in += n;
+    lzr_cctx *c = ((sink_ctx *)ctx)->c;
+    lzr_buf *out = ((sink_ctx *)ctx)->out;
     while (n) {
         if (c->end == c->cap) slide(c);
         size_t take = c->cap - c->end;
@@ -408,11 +410,40 @@ int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
     return LZR_OK;
 }
 
+int lzr_cctx_set_filter(lzr_cctx *c, int filter)
+{
+    if (c->header_done || (filter != LZR_FILTER_NONE && filter != LZR_FILTER_X86)) return LZR_ERR_PARAM;
+    free(c->x86tmp);
+    c->x86tmp = NULL;
+    if (filter == LZR_FILTER_X86) {
+        c->x86tmp = (uint8_t *)malloc(X86_CHUNK + 4);
+        if (!c->x86tmp) return LZR_ERR_NOMEM;
+        memset(&c->x86, 0, sizeof(c->x86));
+    }
+    return LZR_OK;
+}
+
+int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
+{
+    if (c->finished) return LZR_ERR_PARAM;
+    if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
+    c->crc = lzr_crc32(c->crc, src, n);   /* of the original content */
+    c->total_in += n;
+    sink_ctx s = {c, out};
+    if (c->x86tmp) return x86_run(&c->x86, src, n, 0, c->x86tmp, write_raw, &s);
+    return write_raw(&s, src, n);
+}
+
 int lzr_cctx_end(lzr_cctx *c, lzr_buf *out)
 {
     if (c->finished) return LZR_ERR_PARAM;
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
     if (c->content_size >= 0 && (uint64_t)c->content_size != c->total_in) return LZR_ERR_PARAM;
+    if (c->x86tmp) {
+        sink_ctx s = {c, out};
+        int r = x86_finish(&c->x86, write_raw, &s);
+        if (r) return r;
+    }
     while (c->pos < c->end) {
         size_t be = c->end - c->pos > LZR_BLOCK_SIZE ? c->pos + LZR_BLOCK_SIZE : c->end;
         int r = emit_block(c, c->pos, be, out);

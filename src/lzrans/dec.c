@@ -15,6 +15,7 @@
 #include "codes.h"
 #include "crc32.h"
 #include "arc.h"
+#include "x86.h"
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define MAX_COMP (2 * LZR_BLOCK_SIZE + 65536)   /* sanity cap on comp_len */
@@ -35,6 +36,8 @@ struct lzr_dctx {
     rans_dslot *tbl;
     code_info ct[VAL_CODES];
     arc_model am;
+    lzr_x86 x86;
+    uint8_t *x86tmp;   /* x86 filter work buffer, NULL = no filter */
 };
 
 lzr_dctx *lzr_dctx_new(void)
@@ -58,6 +61,7 @@ void lzr_dctx_free(lzr_dctx *d)
 {
     if (!d) return;
     free(d->in.p); free(d->hist);
+    free(d->x86tmp);
     free(d->lits); free(d->llc); free(d->mlc); free(d->ofc); free(d->tbl);
     free(d);
 }
@@ -209,6 +213,16 @@ static int init_history(lzr_dctx *d, int wlog)
     return d->hist ? LZR_OK : LZR_ERR_NOMEM;
 }
 
+typedef struct { lzr_dctx *d; lzr_buf *out; } out_ctx;
+
+/* Deliver decoded (unfiltered) content; the CRC covers the original. */
+static int emit_out(void *ctx, const uint8_t *p, size_t n)
+{
+    out_ctx *s = (out_ctx *)ctx;
+    s->d->crc = lzr_crc32(s->d->crc, p, n);
+    return buf_append(s->out, p, n);
+}
+
 /* Process one unit at in.p + ipos. Returns 1 if consumed, 0 if more input
  * is needed, 2 at the verified end, or LZR_ERR_*. */
 static int step(lzr_dctx *d, lzr_buf *out)
@@ -218,9 +232,11 @@ static int step(lzr_dctx *d, lzr_buf *out)
 
     if (d->state == ST_HEADER) {
         int wlog;
-        int r = lzr_frame_header(p, avail, &wlog, NULL, &d->content_size);
+        uint8_t flags;
+        int r = lzr_frame_header(p, avail, &wlog, &flags, &d->content_size);
         if (r <= 0) return r;
         if (init_history(d, wlog)) return LZR_ERR_NOMEM;
+        if ((flags & LZR_FLAG_X86) && !(d->x86tmp = (uint8_t *)malloc(X86_CHUNK + 4))) return LZR_ERR_NOMEM;
         d->ipos += (size_t)r;
         d->state = ST_BLOCKS;
         return 1;
@@ -238,6 +254,10 @@ static int step(lzr_dctx *d, lzr_buf *out)
 
     if (type == 2) {
         if (d->content_size >= 0 && (uint64_t)d->content_size != d->total_out) return LZR_ERR_CORRUPT;
+        if (d->x86tmp) {
+            out_ctx s = {d, out};
+            if (x86_finish(&d->x86, emit_out, &s)) return LZR_ERR_NOMEM;
+        }
         d->ipos += LZR_BLOCK_HDR + comp;
         d->state = ST_DONE;
         return rd32le(payload) == d->crc ? 2 : LZR_ERR_CHECKSUM;
@@ -257,12 +277,13 @@ static int step(lzr_dctx *d, lzr_buf *out)
         int r = decode_block(d, type, payload, comp, dst, raw);
         if (r) return r;
     }
-    d->crc = lzr_crc32(d->crc, dst, raw);
     d->op += raw;
     d->total_out += raw;
     d->ipos += LZR_BLOCK_HDR + comp;
-    if (buf_append(out, dst, raw)) return LZR_ERR_NOMEM;
-    return 1;
+    out_ctx s = {d, out};
+    /* history keeps the filtered bytes (matches refer to them) */
+    int r = d->x86tmp ? x86_run(&d->x86, dst, raw, 1, d->x86tmp, emit_out, &s) : emit_out(&s, dst, raw);
+    return r ? LZR_ERR_NOMEM : 1;
 }
 
 int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size_t *consumed)

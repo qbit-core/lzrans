@@ -1,7 +1,8 @@
 /*
  * fuzz_roundtrip.c - standalone ASan/UBSan stress test for the C core.
  * Build and run:  make -C tests/c run
- *   1. round-trips generated inputs at every level, feeding the encoder and
+ *   1. round-trips generated inputs at every level (with and without the x86
+ *      filter), feeding the encoder and
  *      decoder in random chunk sizes (streaming path);
  *   2. flips / truncates bytes of valid frames; the decoder must return an
  *      error (or the exact original) and never touch memory out of bounds.
@@ -20,6 +21,7 @@ static void gen(uint8_t *b, size_t n, int kind)
         case 1: b[i] = 'a'; break;                                    /* constant     */
         case 2: b[i] = (uint8_t)("abcabd"[i % 6]); break;             /* short period */
         case 3: b[i] = (uint8_t)(rnd() % 4); break;                   /* low entropy  */
+        case 5: b[i] = (rnd() % 6) ? (uint8_t)(rnd() % 3 ? 0 : rnd()) : 0xE8; break;   /* call-dense */
         default: /* text-like with copies from near and far back */
             b[i] = (i > 300000 && rnd() % 8) ? b[i - 1 - rnd() % (i > 2000000 ? 2000000 : 300000)]
                                               : (uint8_t)(32 + rnd() % 64);
@@ -32,6 +34,7 @@ static int compress_chunked(const uint8_t *src, size_t n, int level, lzr_buf *ou
     lzr_cctx *c = lzr_cctx_new(level, 0, (rnd() & 1) ? (int64_t)n : -1);
     if (!c) return -1;
     lzr_cctx_set_threads(c, 1 + (int)(rnd() % 4));
+    if (rnd() & 1) lzr_cctx_set_filter(c, LZR_FILTER_X86);
     size_t i = 0;
     int r = 0;
     while (!r && i < n) {
@@ -69,7 +72,7 @@ int main(int argc, char **argv)
     long fails = 0, rejected = 0;
     for (int it = 0; it < iters; it++) {
         size_t n = (it % 10 == 0) ? (rnd() % maxn) : (rnd() % 5000);
-        int kind = rnd() % 5, level = 1 + rnd() % 9;
+        int kind = rnd() % 6, level = 1 + rnd() % 9;
         gen(src, n, kind);
         lzr_buf comp = {0}, dec = {0};
         if (compress_chunked(src, n, level, &comp) || decompress_chunked(comp.p, comp.len, &dec) != 1 ||

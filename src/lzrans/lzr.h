@@ -29,7 +29,10 @@
 #define LZR_VERSION        3
 #define LZR_FLAG_ENCRYPTED 0x01u   /* reserved: future AEAD envelope       */
 #define LZR_FLAG_SIZE      0x02u   /* header carries the content size       */
-#define LZR_KNOWN_FLAGS    LZR_FLAG_SIZE
+#define LZR_FLAG_X86       0x04u   /* content passed the x86 filter (x86.h) */
+#define LZR_KNOWN_FLAGS    (LZR_FLAG_SIZE | LZR_FLAG_X86)
+#define LZR_FILTER_NONE    0
+#define LZR_FILTER_X86     1
 #define LZR_BLOCK_HDR      9
 #define LZR_LEVEL_MIN      1
 #define LZR_LEVEL_MAX      9
@@ -43,6 +46,9 @@ void lzr_cctx_free(lzr_cctx *c);
 /* Worker threads for the level 7-9 match finder (1 = none). The output is
  * identical for any thread count. Call before the first write. */
 void lzr_cctx_set_threads(lzr_cctx *c, int threads);
+/* Pre-filter: LZR_FILTER_NONE or LZR_FILTER_X86 (better ratio on x86
+ * machine code). Call before the first write. */
+int lzr_cctx_set_filter(lzr_cctx *c, int filter);
 /* Feed input; complete blocks are appended to out. */
 int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out);
 /* Compress buffered input and write the end block. The context is then done. */

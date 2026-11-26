@@ -16,6 +16,7 @@ from ._lzrans import (
     BLOCK_SIZE,
     FLAG_ENCRYPTED,
     FLAG_SIZE,
+    FLAG_X86,
     Compressor,
     Decompressor,
     FORMAT_VERSION,
@@ -30,6 +31,6 @@ from ._lzrans import (
 __all__ = [
     "compress", "decompress", "Compressor", "Decompressor", "crc32", "frame_info",
     "LzransError", "ChecksumError",
-    "BLOCK_SIZE", "FLAG_ENCRYPTED", "FLAG_SIZE", "FORMAT_VERSION",
+    "BLOCK_SIZE", "FLAG_ENCRYPTED", "FLAG_SIZE", "FLAG_X86", "FORMAT_VERSION",
 ]
 __version__ = "0.3.0.dev0"
