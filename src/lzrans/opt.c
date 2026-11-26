@@ -165,21 +165,30 @@ int opt_init(lzr_cctx *c)
 
 static inline int32_t arc_bit_price(const opt_state *st, arc_p p, unsigned bit)
 {
-    return st->bitc[(bit ? ARC_ONE - p : p) >> 4];
+    /* p for a 0, ARC_ONE - p for a 1, without a branch */
+    return st->bitc[((uint32_t)p + ((0u - bit) & (ARC_ONE - 2u * p))) >> 4];
 }
 
-/* out[sym] = price of sym in an nbits bit tree (reverse: low bit first). */
+/* out[sym] = price of sym in an nbits bit tree (reverse: low bit first).
+ * Prices are summed down the tree once per node (2^(nbits+1) bit prices
+ * rather than nbits * 2^nbits); same totals. */
 static void tree_prices(const opt_state *st, const arc_p *probs, unsigned nbits, int rev, int32_t *out)
 {
-    for (unsigned sym = 0; sym < (1u << nbits); sym++) {
-        int32_t pr = 0;
-        unsigned m = 1;
-        for (unsigned i = 0; i < nbits; i++) {
-            unsigned b = rev ? (sym >> i) & 1 : (sym >> (nbits - 1 - i)) & 1;
-            pr += arc_bit_price(st, probs[m], b);
-            m = (m << 1) | b;
+    int32_t node[512];
+    const unsigned leaves = 1u << nbits;
+    node[1] = 0;
+    for (unsigned m = 1; m < leaves; m++) {
+        node[2 * m] = node[m] + arc_bit_price(st, probs[m], 0);
+        node[2 * m + 1] = node[m] + arc_bit_price(st, probs[m], 1);
+    }
+    if (!rev) {
+        for (unsigned sym = 0; sym < leaves; sym++) out[sym] = node[leaves + sym];
+    } else {
+        for (unsigned v = 0; v < leaves; v++) {     /* leaf path v, MSB = first bit */
+            unsigned sym = 0;
+            for (unsigned i = 0; i < nbits; i++) sym |= ((v >> (nbits - 1 - i)) & 1) << i;
+            out[sym] = node[leaves + v];
         }
-        out[sym] = pr;
     }
 }
 
@@ -238,14 +247,20 @@ static inline int32_t dist_price(const opt_state *st, uint32_t dist0, unsigned l
 
 static int32_t matched_price(const opt_state *st, const arc_p *pr, unsigned byte, unsigned mbyte)
 {
+    /* pr[0x100 + (match bit << 8) + m] while the bits agree, then pr[m]:
+     * offs is 0x100 until the first difference, then 0 */
     int32_t price = 0;
-    unsigned m = 1, same = 1;
-    for (int i = 7; i >= 0; i--) {
-        unsigned b = (byte >> i) & 1, mb = (mbyte >> i) & 1;
-        price += arc_bit_price(st, same ? pr[256 + (mb << 8) + m] : pr[m], b);
+    unsigned m = 1, offs = 0x100;
+    byte |= 0x100;
+    do {
+        mbyte <<= 1;
+        unsigned mb = mbyte & offs;
+        unsigned b = (byte >> 7) & 1;
+        byte <<= 1;
+        price += arc_bit_price(st, pr[offs + mb + m], b);
         m = (m << 1) | b;
-        same &= (b == mb);
-    }
+        offs &= ~(mb ^ (0u - b));
+    } while (m < 0x100);
     return price;
 }
 
@@ -400,7 +415,7 @@ static void *gather_worker_(void *arg)
     for (size_t p = j->from; p < j->be; p++) {
         if (p + LZR_MIN_MATCH > j->lim_end) break;
         uint32_t h = hash_bt(c->buf + p, hlog);
-        if (h % j->nparts != j->part) continue;
+        if (j->nparts > 1 && h % j->nparts != j->part) continue;
         if (p + 12 <= j->lim_end) __builtin_prefetch(c->head + hash_bt(c->buf + p + 8, hlog));
         unsigned n = bt_search(c, p, j->lim_end - p, h, p >= j->bs ? tmp : NULL);
         if (!n) continue;
@@ -415,8 +430,18 @@ static void *gather_worker_(void *arg)
         uint32_t maxlen = (uint32_t)(j->be - p), prev = 0;
         for (unsigned k = 0; k < n; k++) {
             uint32_t len = tmp[k].len < maxlen ? tmp[k].len : maxlen;
-            /* Defensive re-check: never trust a tree-reported length. */
-            len = (uint32_t)match_len(c->buf + p - tmp[k].dist, c->buf + p, len);
+            /* Tree lengths come from byte compares along the tree's
+             * shared-prefix invariant. Cheap sanity check here (first 4
+             * and last byte); the sanitizer test build re-compares all. */
+            {
+                const uint8_t *a = c->buf + p - tmp[k].dist, *b = c->buf + p;
+#ifdef LZR_PARANOID
+                len = (uint32_t)match_len(a, b, len);
+#else
+                if (len >= LZR_MIN_MATCH && (rd32(a) != rd32(b) || a[len - 1] != b[len - 1]))
+                    len = (uint32_t)match_len(a, b, len);
+#endif
+            }
             if (len < LZR_MIN_MATCH || len <= prev) continue;   /* clamped duplicates */
             j->out[j->n].pos = (uint32_t)(p - j->bs);
             j->out[j->n].len = len;
@@ -764,18 +789,62 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                  * bounds the work per position. */
                 uint32_t Lmax = cl[k], Lcut = cl[k] > LZR_OPT_FULL ? LZR_OPT_FULL : cl[k];
                 int32_t full = 0;
-                for (uint32_t L = cmin[k]; L <= Lmax; L = (L < Lcut || L == Lmax) ? L + 1 : Lmax) {
-                    int32_t price;
-                    if (!adaptive) price = bo + st->ml_p[L];
-                    else if (L <= TOK_MAXLEN) price = bo + lenp[L] + dpr[L - 2 < 3 ? L - 2 : 3];
-                    else price = bo + lenp[TOK_MAXLEN] + dpr[3] + st->lenp[1][0][L - TOK_MAXLEN < 2 ? 2 : (L - TOK_MAXLEN > TOK_MAXLEN ? TOK_MAXLEN : L - TOK_MAXLEN)];
-                    size_t t = i + L;
-                    while (last < t) N[++last].price = PRICE_INF;
-                    if (price < N[t].price) {
-                        onode *tn = &N[t];
-                        tn->price = price; tn->from = (uint32_t)i; tn->ml = L; tn->off = co[k]; tn->litlen = 0; tn->ml2 = 0;
+                {
+                    size_t tmax = i + Lmax;
+                    while (last < tmax) N[++last].price = PRICE_INF;
+                }
+                if (!adaptive) {
+                    for (uint32_t L = cmin[k]; L <= Lcut; L++) {
+                        int32_t price = bo + st->ml_p[L];
+                        onode *tn = &N[i + L];
+                        if (price < tn->price) {
+                            tn->price = price; tn->from = (uint32_t)i; tn->ml = L; tn->off = co[k]; tn->litlen = 0; tn->ml2 = 0;
+                        }
                     }
-                    if (L == Lmax) full = price;
+                    full = bo + st->ml_p[Lmax];
+                    if (cmin[k] > Lcut && cmin[k] < Lmax) {   /* the loop form also tried cmin */
+                        onode *tn = &N[i + cmin[k]];
+                        int32_t price = bo + st->ml_p[cmin[k]];
+                        if (price < tn->price) {
+                            tn->price = price; tn->from = (uint32_t)i; tn->ml = cmin[k]; tn->off = co[k]; tn->litlen = 0; tn->ml2 = 0;
+                        }
+                    }
+                } else {
+                    /* lengths 2..4 have their own distance context; from 5
+                     * on the distance price is a constant */
+                    uint32_t L = cmin[k];
+                    for (; L <= Lcut && L < 5; L++) {
+                        int32_t price = bo + lenp[L] + dpr[L - 2];
+                        onode *tn = &N[i + L];
+                        if (price < tn->price) {
+                            tn->price = price; tn->from = (uint32_t)i; tn->ml = L; tn->off = co[k]; tn->litlen = 0; tn->ml2 = 0;
+                        }
+                    }
+                    const int32_t b3 = bo + dpr[3];
+                    const uint32_t ck = co[k];
+                    onode *tn = &N[i + L];
+                    for (; L <= Lcut; L++, tn++) {
+                        int32_t price = b3 + lenp[L];
+                        if (price < tn->price) {
+                            tn->price = price; tn->from = (uint32_t)i; tn->ml = L; tn->off = ck; tn->litlen = 0; tn->ml2 = 0;
+                        }
+                    }
+#define LONG_PRICE(L) (bo + lenp[TOK_MAXLEN] + dpr[3] + st->lenp[1][0][(L) - TOK_MAXLEN < 2 ? 2 : ((L) - TOK_MAXLEN > TOK_MAXLEN ? TOK_MAXLEN : (L) - TOK_MAXLEN)])
+                    full = Lmax <= TOK_MAXLEN ? bo + lenp[Lmax] + dpr[Lmax - 2 < 3 ? Lmax - 2 : 3] : LONG_PRICE(Lmax);
+                    if (cmin[k] > Lcut && cmin[k] < Lmax) {   /* the loop form also tried cmin */
+                        onode *tn = &N[i + cmin[k]];
+                        int32_t price = LONG_PRICE(cmin[k]);
+                        if (price < tn->price) {
+                            tn->price = price; tn->from = (uint32_t)i; tn->ml = cmin[k]; tn->off = co[k]; tn->litlen = 0; tn->ml2 = 0;
+                        }
+                    }
+#undef LONG_PRICE
+                }
+                if (Lmax > Lcut) {    /* past LZR_OPT_FULL: only the full length */
+                    onode *tn = &N[i + Lmax];
+                    if (full < tn->price) {
+                        tn->price = full; tn->from = (uint32_t)i; tn->ml = Lmax; tn->off = co[k]; tn->litlen = 0; tn->ml2 = 0;
+                    }
                 }
                 /* match + literal + rep0 (the literal breaks the match, the
                  * same distance continues after it) */

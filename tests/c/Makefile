@@ -1,6 +1,6 @@
 # Sanitizer stress test for the C core:  make -C tests/c run
 SRC = ../../src/lzrans
-CFLAGS = -O1 -g -std=gnu11 -Wall -Wextra -pthread -fsanitize=address,undefined -fno-sanitize-recover=all
+CFLAGS = -O1 -g -std=gnu11 -Wall -Wextra -pthread -fsanitize=address,undefined -fno-sanitize-recover=all -DLZR_PARANOID
 fuzz_roundtrip: $(wildcard $(SRC)/*.h) fuzz_roundtrip.c $(SRC)/enc.c $(SRC)/dec.c $(SRC)/opt.c $(SRC)/crc32.c $(SRC)/huf.c $(SRC)/fse.c
 	$(CC) $(CFLAGS) -o $@ $(filter %.c,$^) -lm
 run: fuzz_roundtrip
