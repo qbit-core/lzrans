@@ -13,6 +13,7 @@
 #include "rans.h"
 #include "codes.h"
 #include "crc32.h"
+#include "arc.h"
 
 #include "enc_internal.h"
 #ifdef LZR_TUNE
@@ -76,10 +77,20 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->ofc = (uint8_t *)malloc(MAX_SEQ);
     c->extra = (uint8_t *)malloc(MAX_SEQ * 8 + 16);
     c->scratch = (uint8_t *)malloc(2 * LZR_BLOCK_SIZE + 16);
-    c->blk = (uint8_t *)malloc(64 + stream_bound(LZR_BLOCK_SIZE, ALPHA_LIT) + 3 * stream_bound(MAX_SEQ, ALPHA_CODE) + MAX_SEQ * 8 + 16);
+    {
+        size_t rb = stream_bound(LZR_BLOCK_SIZE, ALPHA_LIT) + 3 * stream_bound(MAX_SEQ, ALPHA_CODE);
+        size_t ab = 4 + ARC_CAP_LIT + 3 * stream_bound(MAX_SEQ, ALPHA_CODE);
+        c->blk = (uint8_t *)malloc(64 + (rb > ab ? rb : ab) + MAX_SEQ * 8 + 16);
+    }
+    c->adaptive = level >= LZR_ADAPTIVE_LEVEL;
+#ifdef LZR_TUNE
+    if (getenv("LZR_ADAPT")) c->adaptive = atoi(getenv("LZR_ADAPT"));
+#endif
+    c->am = (arc_model *)malloc(2 * sizeof(arc_model));
+    if (c->am) arc_model_init(c->am);
     if (c->lp.opt && opt_init(c)) { lzr_cctx_free(c); return NULL; }
     if (!c->buf || !c->head || (!c->prev && !c->lp.opt) || !c->seq_ll || !c->seq_ml || !c->seq_dist || !c->lits ||
-        !c->llc || !c->mlc || !c->ofc || !c->extra || !c->scratch || !c->blk) {
+        !c->llc || !c->mlc || !c->ofc || !c->extra || !c->scratch || !c->blk || !c->am) {
         lzr_cctx_free(c);
         return NULL;
     }
@@ -98,7 +109,7 @@ void lzr_cctx_free(lzr_cctx *c)
     free(c->buf); free(c->head); free(c->prev);
     free(c->seq_ll); free(c->seq_ml); free(c->seq_dist);
     free(c->lits); free(c->llc); free(c->mlc); free(c->ofc);
-    free(c->extra); free(c->scratch); free(c->blk);
+    free(c->extra); free(c->scratch); free(c->blk); free(c->am);
     free(c);
 }
 
@@ -222,6 +233,32 @@ static int write_header(lzr_cctx *c, lzr_buf *out)
     return buf_append(out, h, n);
 }
 
+/* Block type 3 literal stream (see arc.h). The match byte of the first
+ * literal after a match is at distance rep0, so the repeat offsets are
+ * replayed from their state at the start of the block. */
+static size_t encode_lits_adaptive(lzr_cctx *c, size_t bs, size_t be, size_t ns, const uint32_t *reps_in, uint8_t *out)
+{
+    arc_model *am = c->am;
+    arc_enc e;
+    arce_init(&e, out);
+    uint32_t reps[LZR_NUM_REPS];
+    memcpy(reps, reps_in, sizeof(reps));
+    const uint8_t *buf = c->buf;
+    size_t p = bs;
+    for (size_t i = 0; i <= ns; i++) {
+        size_t n = i < ns ? c->seq_ll[i] : be - p;
+        for (size_t t = 0; t < n; t++, p++) {
+            arc_p *pr = am->lit[(p ? buf[p - 1] : 0) >> 5];
+            if (t == 0 && i > 0) arce_literal_matched(&e, pr, buf[p], buf[p - reps[0]]);
+            else arce_tree(&e, pr, 8, buf[p]);
+        }
+        if (i == ns) break;
+        commit_offset(reps, c->seq_dist[i]);
+        p += c->seq_ml[i];
+    }
+    return arce_finish(&e, out);
+}
+
 static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
 {
     const size_t raw = be - bs;
@@ -274,7 +311,17 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
 #else
 #define TS(i)
 #endif
-    k += stream_encode(b + k, c->lits, nlit, ALPHA_LIT, c->scratch); TS(0);
+    uint8_t btype = 1;
+    arc_model *am = c->am;
+    if (c->adaptive) {
+        btype = 3;
+        memcpy(am + 1, am, sizeof(*am));   /* for the stored fallback */
+        size_t len = encode_lits_adaptive(c, bs, be, ns, saved_reps, b + k + 4);
+        wr32le(b + k, (uint32_t)len);
+        k += 4 + len; TS(0);
+    } else {
+        k += stream_encode(b + k, c->lits, nlit, ALPHA_LIT, c->scratch); TS(0);
+    }
     k += stream_encode(b + k, c->llc, ns, ALPHA_CODE, c->scratch); TS(1);
     k += stream_encode(b + k, c->mlc, ns, ALPHA_CODE, c->scratch); TS(2);
     k += stream_encode(b + k, c->ofc, ns, ALPHA_CODE, c->scratch); TS(3);
@@ -286,13 +333,14 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
 
     size_t payload = k - LZR_BLOCK_HDR;
     if (payload < raw) {
-        b[0] = 1;
+        b[0] = btype;
         wr32le(b + 1, (uint32_t)raw);
         wr32le(b + 5, (uint32_t)payload);
         return buf_append(out, b, k);
     }
     /* Stored block; the decoder leaves its repeat offsets untouched. */
     memcpy(c->reps, saved_reps, sizeof(saved_reps));
+    if (btype == 3) memcpy(am, am + 1, sizeof(*am));
     uint8_t h[LZR_BLOCK_HDR] = {0};
     wr32le(h + 1, (uint32_t)raw);
     wr32le(h + 5, (uint32_t)raw);

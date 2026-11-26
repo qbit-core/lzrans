@@ -1,8 +1,8 @@
 /*
- * lzr.h - public C API of the lzrans core (frame format v2, streaming).
+ * lzr.h - public C API of the lzrans core (frame format v3, streaming).
  *
  * Frame layout (little-endian):
- *   "LZRN" | version u8 (=2) | flags u8 | window_log u8 | reserved u8
+ *   "LZRN" | version u8 (=3) | flags u8 | window_log u8 | reserved u8
  *   [content_size u64]                       if flags & LZR_FLAG_SIZE
  *   block*                                   until an end block
  *
@@ -12,6 +12,9 @@
  *                          literals | ll codes | ml codes | of codes
  *                          (rANS streams, see rans.h) | extra_len u32 | extra bits
  *     type 2  end:         raw_len = 0, payload = CRC32 of all content (u32)
+ *     type 3  compressed, adaptive literals: as type 1, but the literals are
+ *                          lit_len u32 | range-coded stream (see arc.h)
+ *   Match lengths are >= LZR_ML_BASE (2); the ml code holds length - 2.
  *
  * Matches may reach back up to 2^window_log bytes, across block borders.
  * The CRC sits at the end so a stream can be produced without knowing its

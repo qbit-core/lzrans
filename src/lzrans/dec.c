@@ -14,6 +14,7 @@
 #include "rans.h"
 #include "codes.h"
 #include "crc32.h"
+#include "arc.h"
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define MAX_COMP (2 * LZR_BLOCK_SIZE + 65536)   /* sanity cap on comp_len */
@@ -33,6 +34,7 @@ struct lzr_dctx {
     uint8_t *lits, *llc, *mlc, *ofc;
     rans_dslot *tbl;
     code_info ct[VAL_CODES];
+    arc_model am;
 };
 
 lzr_dctx *lzr_dctx_new(void)
@@ -48,6 +50,7 @@ lzr_dctx *lzr_dctx_new(void)
     d->tbl = (rans_dslot *)malloc(RANS_M * sizeof(rans_dslot));
     if (!d->lits || !d->llc || !d->mlc || !d->ofc || !d->tbl) { lzr_dctx_free(d); return NULL; }
     code_table_init(d->ct);
+    arc_model_init(&d->am);
     return d;
 }
 
@@ -100,15 +103,27 @@ static inline void copy_match(uint8_t *op, size_t dist, size_t len)
     }
 }
 
-static int decode_block(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+/* Block types 1 and 3 (they differ only in how the literals are coded). */
+static int decode_block(lzr_dctx *d, int type, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
     if (avail < 8) return LZR_ERR_CORRUPT;
     size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8, c;
     if (nlit > raw || ns > MAX_SEQ || ns * LZR_ML_BASE + nlit > raw) return LZR_ERR_CORRUPT;
 
-    c = stream_decode(in + k, avail - k, d->lits, nlit, ALPHA_LIT, d->tbl);
-    if (nlit && !c) return LZR_ERR_CORRUPT;
-    k += c;
+    arc_dec ra = {0, 0, NULL, NULL, 0};   /* type 3 literals, decoded in the sequence loop */
+    arc_model *am = &d->am;
+    if (type == 3) {
+        if (avail - k < 4) return LZR_ERR_CORRUPT;
+        size_t la = rd32le(in + k);
+        k += 4;
+        if (la > avail - k) return LZR_ERR_CORRUPT;
+        arcd_init(&ra, in + k, la);
+        k += la;
+    } else {
+        c = stream_decode(in + k, avail - k, d->lits, nlit, ALPHA_LIT, d->tbl);
+        if (nlit && !c) return LZR_ERR_CORRUPT;
+        k += c;
+    }
     uint8_t *codes[3] = {d->llc, d->mlc, d->ofc};
     for (int s = 0; s < 3; s++) {
         c = stream_decode(in + k, avail - k, codes[s], ns, ALPHA_CODE, d->tbl);
@@ -122,15 +137,49 @@ static int decode_block(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *d
     bitr br = {0, 0, in + k, in + k + xlen, 0};
 
     const code_info *ct = d->ct;
-    const uint8_t *lp = d->lits, *lend = d->lits + nlit;
+    const uint8_t *lp = d->lits, *lend = d->lits + nlit;   /* type 3: only counts */
     uint8_t *o = dst, *const oend = dst + raw;
     uint32_t *reps = d->reps;
 
-    for (size_t i = 0; i < ns; i++) {
-        unsigned lc = d->llc[i], mc = d->mlc[i], oc = d->ofc[i];
-        if (lc >= VAL_CODES || mc >= VAL_CODES || oc >= OF_CODES) return LZR_ERR_CORRUPT;
-        size_t ll = ct[lc].base + br_get(&br, ct[lc].bits);
-        size_t ml = ct[mc].base + br_get(&br, ct[mc].bits) + LZR_ML_BASE;
+    for (size_t i = 0; i <= ns; i++) {
+        size_t ll, ml = 0;
+        unsigned mc = 0, oc = 0;
+        if (i < ns) {
+            unsigned lc = d->llc[i];
+            mc = d->mlc[i]; oc = d->ofc[i];
+            if (lc >= VAL_CODES || mc >= VAL_CODES || oc >= OF_CODES) return LZR_ERR_CORRUPT;
+            ll = ct[lc].base + br_get(&br, ct[lc].bits);
+            ml = ct[mc].base + br_get(&br, ct[mc].bits) + LZR_ML_BASE;
+            if (ll > (size_t)(lend - lp) || ll + ml > (size_t)(oend - o)) return LZR_ERR_CORRUPT;
+        } else {
+            ll = (size_t)(lend - lp);
+            if (ll != (size_t)(oend - o)) return LZR_ERR_CORRUPT;
+        }
+
+        /* literal run (lits buffer and history both have slack) */
+        if (type == 3) {
+            if (ll) {
+                uint8_t *le = o + ll;
+                unsigned prev = o > d->hist ? o[-1] : 0;
+                if (i) {   /* first literal after a match: match byte at rep0 */
+                    prev = arcd_literal_matched(&ra, am->lit[prev >> 5], o[-(ptrdiff_t)reps[0]]);
+                    *o++ = (uint8_t)prev;
+                }
+                while (o < le) {
+                    prev = arcd_tree(&ra, am->lit[prev >> 5], 8);
+                    *o++ = (uint8_t)prev;
+                }
+                o -= ll;
+            }
+        } else if (ll <= 16) {
+            memcpy(o, lp, 16);
+        } else {
+            memcpy(o, lp, ll);
+        }
+        o += ll;
+        lp += ll;
+        if (i == ns) break;
+
         uint32_t dist;
         if (oc >= LZR_NUM_REPS) {
             const code_info *e = &ct[oc - LZR_NUM_REPS];
@@ -141,21 +190,11 @@ static int decode_block(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *d
             if (oc == 1) { reps[1] = reps[0]; reps[0] = dist; }
             else if (oc == 2) { reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = dist; }
         }
-        if (ll > (size_t)(lend - lp) || ll + ml > (size_t)(oend - o)) return LZR_ERR_CORRUPT;
-
-        /* literal run (lits buffer and history both have slack) */
-        if (ll <= 16) memcpy(o, lp, 16);
-        else memcpy(o, lp, ll);
-        o += ll;
-        lp += ll;
-
         if (dist > (size_t)(o - d->hist) || dist > d->wsize) return LZR_ERR_CORRUPT;
         copy_match(o, dist, ml);
         o += ml;
     }
-    size_t rest = (size_t)(lend - lp);
-    if (rest != (size_t)(oend - o)) return LZR_ERR_CORRUPT;
-    memcpy(o, lp, rest);
+    if (type == 3 && (ra.err || ra.p != ra.end)) return LZR_ERR_CORRUPT;
     if (br.err || br.p != br.end) return LZR_ERR_CORRUPT;
     return LZR_OK;
 }
@@ -188,10 +227,10 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (avail < LZR_BLOCK_HDR) return 0;
     uint8_t type = p[0];
     size_t raw = rd32le(p + 1), comp = rd32le(p + 5);
-    if (type > 2 || raw > LZR_BLOCK_SIZE || comp > MAX_COMP) return LZR_ERR_CORRUPT;
+    if (type > 3 || raw > LZR_BLOCK_SIZE || comp > MAX_COMP) return LZR_ERR_CORRUPT;
     if (type == 0 && comp != raw) return LZR_ERR_CORRUPT;
     if (type == 2 && (raw != 0 || comp != 4)) return LZR_ERR_CORRUPT;
-    if (type == 1 && raw == 0) return LZR_ERR_CORRUPT;
+    if ((type == 1 || type == 3) && raw == 0) return LZR_ERR_CORRUPT;
     if (avail - LZR_BLOCK_HDR < comp) return 0;
     const uint8_t *payload = p + LZR_BLOCK_HDR;
 
@@ -213,7 +252,7 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (type == 0) {
         memcpy(dst, payload, raw);
     } else {
-        int r = decode_block(d, payload, comp, dst, raw);
+        int r = decode_block(d, type, payload, comp, dst, raw);
         if (r) return r;
     }
     d->crc = lzr_crc32(d->crc, dst, raw);
