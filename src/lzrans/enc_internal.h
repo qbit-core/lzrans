@@ -64,6 +64,8 @@ struct lzr_cctx {
     size_t jsize, jover;
     struct lzr_cctx **wk;  /* worker contexts (buf shared, tables own)      */
     lzr_buf *wout;         /* job outputs (jobs of them)                    */
+    struct lzr_batch *bt;  /* the open batch: jobs start as their input is
+                            * buffered (threads), see batch_feed in enc.c  */
 
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
