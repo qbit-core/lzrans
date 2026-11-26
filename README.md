@@ -10,6 +10,7 @@ decompression, usable on streams. Status: v0.2 phase 2 (see Roadmap).
 import lzrans
 
 blob = lzrans.compress(data, level=6)          # level 1 (fast) .. 9 (best)
+blob = lzrans.compress(data, level=9, threads=4)   # same bytes, faster
 assert lzrans.decompress(blob) == data         # ChecksumError on CRC mismatch
 
 # streaming, bounded memory
@@ -36,7 +37,8 @@ python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 | Stage | Implementation (`src/lzrans/`) |
 |---|---|
 | Match finding | Levels 1-6 (`enc.c`): hash chains over a 1-8 MB window, 5-byte hash, 3 repeat offsets probed first, lazy matching (depth 0-2). Levels 7-9 (`opt.c`): binary tree (BT4) over an 8-16 MB window collecting all match lengths per position. |
-| Parsing | Levels 7-9: price-based optimal parsing (forward DP over 4096-position segments, repeat offsets tracked per path, prices from the previous pass/block statistics; 2 passes at levels 8-9). |
+| Parsing | Levels 7-9: price-based optimal parsing (forward DP over 4096-position segments, repeat offsets tracked per path, prices from the previous block's statistics). |
+| Threads | Levels 7-9: hash buckets are split between threads (each tree only links positions of its own bucket, so no locks), and the next block is gathered in the background while the current one is parsed. Output is byte-identical for any thread count. |
 | Tokens | Sequences of (literal run, match length, offset). Offset code 0-2 = repeat offset, else a log-bucket code. Lengths/offsets use log-bucket codes (62 codes) + raw extra bits. |
 | Entropy coding | `rans.c`: 4 rANS streams per 256 KB block (literals, LL codes, ML codes, offset codes), 12-bit static model per block, 2 interleaved states, raw/run fallbacks. |
 | Decoding | `dec.c`: streams decoded into arrays with one table lookup per symbol, then a sequence loop with 16-byte wildcopy for literals and matches. |

@@ -18,12 +18,13 @@
 
 /* Levels 1-6: hash chains + lazy parsing (window, hash bits, lazy depth,
  * chain steps, nice length). Levels 7-9: binary tree + optimal parsing
- * (chain = tree depth, opt = number of parsing passes). */
+ * (chain = tree depth, opt = number of parsing passes; a second pass
+ * gained <0.5% ratio for ~40% more time, so all use one). */
 static const level_params LEVELS[LZR_LEVEL_MAX + 1] = {
     {0, 0, 0, 0, 0, 0},
     {20, 16, 0, 4, 16, 0},    {21, 17, 1, 8, 24, 0},    {22, 18, 1, 16, 32, 0},
     {22, 19, 1, 24, 48, 0},   {23, 20, 2, 32, 64, 0},   {23, 20, 2, 64, 96, 0},
-    {23, 20, 0, 16, 64, 1},   {24, 21, 0, 32, 128, 2},  {24, 22, 0, 48, 273, 2},
+    {23, 20, 0, 16, 128, 1},  {24, 21, 0, 24, 273, 1},  {24, 22, 0, 48, 273, 1},
 };
 
 
@@ -42,10 +43,16 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     if (getenv("LZR_NICE")) c->lp.nice = (uint16_t)atoi(getenv("LZR_NICE"));
     if (getenv("LZR_PASSES")) c->lp.opt = (uint8_t)atoi(getenv("LZR_PASSES"));
     if (getenv("LZR_WLOG")) c->lp.wlog = (uint8_t)atoi(getenv("LZR_WLOG"));
+    if (getenv("LZR_THREADS")) c->threads = atoi(getenv("LZR_THREADS"));
 #endif
     /* A window larger than the known input only wastes memory. */
-    while (content_size >= 0 && c->lp.wlog > LZR_WLOG_MIN && ((uint64_t)1 << (c->lp.wlog - 1)) >= (uint64_t)content_size)
-        c->lp.wlog--;
+    {
+        /* the tree finder needs >= 2 blocks of slack, see opt_init() */
+        unsigned min_wlog = c->lp.opt ? 20 : LZR_WLOG_MIN;
+        if (c->lp.wlog < min_wlog) c->lp.wlog = (uint8_t)min_wlog;
+        while (content_size >= 0 && c->lp.wlog > min_wlog && ((uint64_t)1 << (c->lp.wlog - 1)) >= (uint64_t)content_size)
+            c->lp.wlog--;
+    }
     if (c->lp.hlog > c->lp.wlog) c->lp.hlog = c->lp.wlog;
     c->wsize = (size_t)1 << c->lp.wlog;
     c->wmask = c->wsize - 1;
@@ -53,9 +60,9 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->content_size = content_size;
     c->reps[0] = 1; c->reps[1] = 4; c->reps[2] = 8;
 
-    c->buf = (uint8_t *)malloc(c->cap + LZR_SLACK);
-    c->head = (uint32_t *)calloc((size_t)1 << c->lp.hlog, sizeof(uint32_t));
-    if (!c->lp.opt) c->prev = (uint32_t *)calloc(c->wsize, sizeof(uint32_t));   /* chains: lazy levels only */
+    c->buf = (uint8_t *)big_alloc(c->cap + LZR_SLACK, 0);
+    c->head = (uint32_t *)big_alloc(((size_t)1 << c->lp.hlog) * sizeof(uint32_t), 1);
+    if (!c->lp.opt) c->prev = (uint32_t *)big_alloc(c->wsize * sizeof(uint32_t), 1);   /* chains: lazy levels only */
     c->seq_ll = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_ml = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_dist = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
@@ -73,6 +80,11 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
         return NULL;
     }
     return c;
+}
+
+void lzr_cctx_set_threads(lzr_cctx *c, int threads)
+{
+    c->threads = threads < 1 ? 1 : (threads > LZR_MAX_THREADS ? LZR_MAX_THREADS : threads);
 }
 
 void lzr_cctx_free(lzr_cctx *c)

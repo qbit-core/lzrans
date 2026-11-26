@@ -56,6 +56,25 @@ static inline uint32_t rd32le(const uint8_t *p) {
 static inline void wr64le(uint8_t *p, uint64_t v) { wr32le(p, (uint32_t)v); wr32le(p + 4, (uint32_t)(v >> 32)); }
 static inline uint64_t rd64le(const uint8_t *p) { return (uint64_t)rd32le(p) | ((uint64_t)rd32le(p + 4) << 32); }
 
+/* Large tables (match-finder trees, windows) are accessed randomly; on
+ * Linux, back them with transparent huge pages to cut TLB misses. */
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+static inline void *big_alloc(size_t n, int zero)
+{
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (n >= (1u << 21)) {
+        void *p = NULL;
+        if (posix_memalign(&p, 1u << 21, n) != 0) return NULL;
+        madvise(p, n, MADV_HUGEPAGE);
+        if (zero) memset(p, 0, n);
+        return p;
+    }
+#endif
+    return zero ? calloc(1, n) : malloc(n);
+}
+
 /* Growable output buffer shared by encoder and decoder. */
 typedef struct {
     uint8_t *p;

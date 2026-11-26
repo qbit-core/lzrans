@@ -237,3 +237,35 @@ def test_streaming_corruption_raises():
     with pytest.raises(lzrans.LzransError):
         for i in range(0, len(comp), 4096):
             d.decompress(bytes(comp[i:i + 4096]))
+
+
+# ---------------- threads ----------------
+
+@pytest.mark.parametrize("level", [7, 9])
+def test_threads_do_not_change_output(level):
+    data = CASES["text_300k"] * 3 + CASES["binary_mix"] + CASES["far_match_3m"]
+    ref = lzrans.compress(data, level=level, threads=1)
+    for t in (2, 3, 4, 0):
+        assert lzrans.compress(data, level=level, threads=t) == ref
+    c = lzrans.Compressor(level=level, threads=4)
+    rnd = random.Random(5)
+    streamed = b"".join(c.compress(ch) for ch in _chunks(data, rnd, 500_000)) + c.flush()
+    assert lzrans.decompress(streamed) == data
+    assert lzrans.decompress(ref) == data
+
+
+def test_threads_identical_on_window_sized_input():
+    # Inputs larger than the window exercise tree-slot reuse across threads.
+    rnd = random.Random(11)
+    parts = [_text(200_000, k) for k in range(8)]
+    data = b"".join(rnd.choice(parts)[: rnd.randint(1000, 200_000)] for _ in range(80))
+    c1 = lzrans.compress(data, level=7, window_log=20, threads=1)
+    assert lzrans.compress(data, level=7, window_log=20, threads=4) == c1
+    assert lzrans.decompress(c1) == data
+
+
+def test_threads_validated():
+    with pytest.raises(ValueError):
+        lzrans.compress(b"x", threads=-1)
+    with pytest.raises(ValueError):
+        lzrans.Compressor(threads=99)

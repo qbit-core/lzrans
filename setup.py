@@ -2,7 +2,7 @@
 import sys
 from setuptools import Extension, setup
 
-extra = ["/O2"] if sys.platform == "win32" else ["-O3", "-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers"]
+extra = ["/O2"] if sys.platform == "win32" else ["-O3", "-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers"]
 
 setup(
     ext_modules=[
@@ -18,7 +18,7 @@ setup(
             ],
             include_dirs=["src/lzrans"],
             extra_compile_args=extra,
-            libraries=[] if sys.platform == "win32" else ["m"],
+            libraries=[] if sys.platform == "win32" else ["m", "pthread"],
         )
     ],
 )

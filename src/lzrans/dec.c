@@ -164,7 +164,7 @@ static int init_history(lzr_dctx *d, int wlog)
 {
     d->wsize = (size_t)1 << wlog;
     d->hcap = 2 * d->wsize + LZR_BLOCK_SIZE;
-    d->hist = (uint8_t *)malloc(d->hcap + LZR_SLACK);
+    d->hist = (uint8_t *)big_alloc(d->hcap + LZR_SLACK, 0);
     return d->hist ? LZR_OK : LZR_ERR_NOMEM;
 }
 

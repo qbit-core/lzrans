@@ -19,6 +19,9 @@
  */
 #include "enc_internal.h"
 #include <math.h>
+#if LZR_HAVE_THREADS
+#include <pthread.h>
+#endif
 
 #define OPT_NUM     4096
 #define MAX_CAND    48
@@ -27,6 +30,18 @@
 #define PRICE_INF   0x3FFFFFFF
 
 typedef struct { uint32_t len, dist; } mpair;
+
+typedef struct { uint32_t pos, len, dist; } mrec;
+
+typedef struct {
+    lzr_cctx *c;
+    size_t from, bs, be, lim_end;
+    unsigned part, nparts;
+    mrec *out;
+    size_t n, cap;
+    int err;
+} gjob;
+
 
 typedef struct {
     int32_t price;
@@ -38,13 +53,30 @@ typedef struct {
     uint32_t lit[256], llc[VAL_CODES], mlc[VAL_CODES], ofc[OF_CODES];
 } prices_t;
 
+#ifndef LZR_OPT_FULL
+#define LZR_OPT_FULL 32
+#endif
 #define ML_TABLE 512                     /* > max nice length */
 #define LL_TABLE 4096
 
+/* Match cache for one block (two of them, so the next block can be
+ * gathered in the background while the current one is parsed). */
 typedef struct {
     uint32_t *mstart;      /* [B+1] index of the first cached pair per position */
     mpair *pairs;
     size_t pcap;
+    gjob jobs[LZR_MAX_THREADS];
+} mcache;
+
+typedef struct {
+    mcache mc[2];
+    int cur;               /* cache holding the block being parsed           */
+#if LZR_HAVE_THREADS
+    pthread_t pend_tid;    /* background gather of the next block            */
+#endif
+    int pending, pend_err;
+    size_t pend_bs, pend_be, pend_lim;
+    lzr_cctx *pend_c;
     onode *nodes;
     uint32_t (*path)[3];
     prices_t pr;
@@ -56,21 +88,40 @@ int opt_init(lzr_cctx *c)
 {
     opt_state *st = (opt_state *)calloc(1, sizeof(opt_state));
     c->opt = st;
-    c->son = (uint32_t *)calloc(2 * c->wsize, sizeof(uint32_t));
+    c->son = (uint32_t *)big_alloc(2 * c->wsize * sizeof(uint32_t), 1);
+    /* son[] is a ring indexed by position & (wsize-1). Worker threads run
+     * at different positions within a block (and one may gather the next
+     * block), so a slot can be reused by position cm + wsize while another
+     * thread still sees cm as in range. Treating nodes older than
+     * wsize - 2 blocks as out of range makes that impossible, and makes the
+     * result identical for every thread count. */
+    c->bt_maxdist = c->wsize - 2 * (size_t)LZR_BLOCK_SIZE;
     if (!st || !c->son) return LZR_ERR_NOMEM;
-    st->pcap = (size_t)LZR_BLOCK_SIZE * 4;
-    st->mstart = (uint32_t *)malloc((LZR_BLOCK_SIZE + 1) * sizeof(uint32_t));
-    st->pairs = (mpair *)malloc(st->pcap * sizeof(mpair));
+    for (int k = 0; k < 2; k++) {
+        mcache *m = &st->mc[k];
+        m->pcap = (size_t)LZR_BLOCK_SIZE * 2;
+        m->mstart = (uint32_t *)malloc((LZR_BLOCK_SIZE + 1) * sizeof(uint32_t));
+        m->pairs = (mpair *)malloc(m->pcap * sizeof(mpair));
+        if (!m->mstart || !m->pairs) return LZR_ERR_NOMEM;
+    }
     st->nodes = (onode *)malloc((OPT_NUM + NODE_EXTRA) * sizeof(onode));
     st->path = malloc((OPT_NUM + NODE_EXTRA) * sizeof(*st->path));
-    if (!st->mstart || !st->pairs || !st->nodes || !st->path) return LZR_ERR_NOMEM;
+    if (!st->nodes || !st->path) return LZR_ERR_NOMEM;
     return LZR_OK;
 }
 
 void opt_free(lzr_cctx *c)
 {
     opt_state *st = (opt_state *)c->opt;
-    if (st) { free(st->mstart); free(st->pairs); free(st->nodes); free(st->path); free(st); }
+    opt_sync(c);
+    if (st) {
+        for (int k = 0; k < 2; k++) {
+            for (unsigned t = 0; t < LZR_MAX_THREADS; t++) free(st->mc[k].jobs[t].out);
+            free(st->mc[k].mstart);
+            free(st->mc[k].pairs);
+        }
+        free(st->nodes); free(st->path); free(st);
+    }
     free(c->son);
     c->opt = NULL;
     c->son = NULL;
@@ -78,6 +129,9 @@ void opt_free(lzr_cctx *c)
 
 void opt_slide(lzr_cctx *c, uint32_t d)
 {
+    opt_state *st = (opt_state *)c->opt;
+    opt_sync(c);                     /* the background gather reads buf/tree */
+    if (st->pending) { st->pend_bs -= d; st->pend_be -= d; st->pend_lim -= d; }
     for (size_t i = 0; i < 2 * c->wsize; i++) c->son[i] = c->son[i] > d ? c->son[i] - d : 0;
 }
 
@@ -90,12 +144,11 @@ static inline uint32_t hash_bt(const uint8_t *p, unsigned hlog)
 
 /* Insert position p into its tree; if `out` is given, also return matches of
  * strictly increasing length (up to MAX_CAND). `avail` = readable bytes. */
-static unsigned bt_search(lzr_cctx *c, size_t p, size_t avail, mpair *out)
+static unsigned bt_search(lzr_cctx *c, size_t p, size_t avail, uint32_t h, mpair *out)
 {
     const uint8_t *buf = c->buf, *cur = buf + p;
     const size_t wmask = c->wmask;
     const size_t limit = avail < c->lp.nice ? avail : c->lp.nice;
-    uint32_t h = hash_bt(cur, c->lp.hlog);
     uint32_t cm1 = c->head[h];
     c->head[h] = (uint32_t)(p + 1);
 
@@ -108,10 +161,19 @@ static unsigned bt_search(lzr_cctx *c, size_t p, size_t avail, mpair *out)
     for (;;) {
         if (!cm1 || depth-- == 0) { *ptr0 = *ptr1 = 0; break; }
         size_t cm = cm1 - 1, delta = p - cm;
-        if (delta >= c->wsize) { *ptr0 = *ptr1 = 0; break; }
+        if (delta >= c->bt_maxdist) { *ptr0 = *ptr1 = 0; break; }
         uint32_t *pair = son + ((cm & wmask) << 1);
         const uint8_t *pb = buf + cm;
         size_t len = len0 < len1 ? len0 : len1;
+#if 1
+        /* The next node is one of the two children: start fetching both
+         * (tree node and string) while this node is compared. */
+        {
+            uint32_t a = pair[0], b = pair[1];
+            if (a) { __builtin_prefetch(son + (((a - 1) & wmask) << 1)); __builtin_prefetch(buf + a - 1 + len); }
+            if (b) { __builtin_prefetch(son + (((b - 1) & wmask) << 1)); __builtin_prefetch(buf + b - 1 + len); }
+        }
+#endif
         if (pb[len] == cur[len]) {
             len++;
             len += match_len(pb + len, cur + len, limit - len);
@@ -127,53 +189,124 @@ static unsigned bt_search(lzr_cctx *c, size_t p, size_t avail, mpair *out)
     return n;
 }
 
-/* Fill the match cache for [bs, be). */
-static int gather(lzr_cctx *c, opt_state *st, size_t bs, size_t be)
+/* ---------------- parallel match gathering ----------------
+ *
+ * Every position belongs to exactly one tree (the one rooted at its hash
+ * bucket), and a tree only links positions of its own bucket. So buckets
+ * can be split between threads: each worker walks all positions in order
+ * but only handles those whose bucket it owns, touching disjoint head[] and
+ * son[] entries. Each tree sees its positions in the same order whatever
+ * the thread count, so the output is identical for 1 or N threads.
+ */
+
+
+#ifdef LZR_TUNE
+#include <time.h>
+double lzr_t_worker[LZR_MAX_THREADS];
+static double now_w(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+#endif
+static void *gather_worker_(void *arg);
+static void *gather_worker(void *arg)
 {
-    /* Bytes readable for tree comparisons: up to LZR_LOOKAHEAD past the
-     * block (always present for non-final blocks). Keeping the compare
-     * limit at `nice` everywhere except the very end of the input keeps
-     * the tree ordering consistent, and output independent of chunking. */
-    const size_t lim_end = be + LZR_LOOKAHEAD < c->end ? be + LZR_LOOKAHEAD : c->end;
+#ifdef LZR_TUNE
+    double t0 = now_w();
+    void *r = gather_worker_(arg);
+    lzr_t_worker[((gjob *)arg)->part] += now_w() - t0;
+    return r;
+#else
+    return gather_worker_(arg);
+#endif
+}
+static void *gather_worker_(void *arg)
+{
+    gjob *j = (gjob *)arg;
+    lzr_cctx *c = j->c;
+    const unsigned hlog = c->lp.hlog;
     mpair tmp[MAX_CAND];
-
-    for (size_t q = c->ins; q < bs; q++)                    /* catch up */
-        if (q + LZR_MIN_MATCH <= lim_end) bt_search(c, q, lim_end - q, NULL);
-
-    size_t np = 0, p = bs;
-    while (p < be) {
-        st->mstart[p - bs] = (uint32_t)np;
-        if (p + LZR_MIN_MATCH > lim_end) { p++; continue; }
-        unsigned n = bt_search(c, p, lim_end - p, tmp);
-        if (np + n > st->pcap) {
-            size_t ncap = st->pcap * 2;
-            mpair *np2 = (mpair *)realloc(st->pairs, ncap * sizeof(mpair));
-            if (!np2) return LZR_ERR_NOMEM;
-            st->pairs = np2;
-            st->pcap = ncap;
+    j->n = 0;
+    for (size_t p = j->from; p < j->be; p++) {
+        if (p + LZR_MIN_MATCH > j->lim_end) break;
+        uint32_t h = hash_bt(c->buf + p, hlog);
+        if (h % j->nparts != j->part) continue;
+        if (p + 12 <= j->lim_end) __builtin_prefetch(c->head + hash_bt(c->buf + p + 8, hlog));
+        unsigned n = bt_search(c, p, j->lim_end - p, h, p >= j->bs ? tmp : NULL);
+        if (!n) continue;
+        if (j->n + n > j->cap) {
+            size_t ncap = j->cap ? j->cap * 2 : 65536;
+            while (ncap < j->n + n) ncap *= 2;
+            mrec *o = (mrec *)realloc(j->out, ncap * sizeof(mrec));
+            if (!o) { j->err = 1; return NULL; }
+            j->out = o;
+            j->cap = ncap;
         }
-        uint32_t maxlen = (uint32_t)(be - p), prev = 0, longest = 0;
+        uint32_t maxlen = (uint32_t)(j->be - p), prev = 0;
         for (unsigned k = 0; k < n; k++) {
             uint32_t len = tmp[k].len < maxlen ? tmp[k].len : maxlen;
             /* Defensive re-check: never trust a tree-reported length. */
             len = (uint32_t)match_len(c->buf + p - tmp[k].dist, c->buf + p, len);
             if (len < LZR_MIN_MATCH || len <= prev) continue;   /* clamped duplicates */
-            st->pairs[np].len = len;
-            st->pairs[np].dist = tmp[k].dist;
-            np++;
+            j->out[j->n].pos = (uint32_t)(p - j->bs);
+            j->out[j->n].len = len;
+            j->out[j->n].dist = tmp[k].dist;
+            j->n++;
             prev = len;
         }
-        if (n) longest = tmp[n - 1].len;
-        if (longest >= c->lp.nice) {
-            /* Long match: the parser will take it, so only insert. */
-            size_t stop = p + (prev ? prev : 1);
-            for (size_t q = p + 1; q < stop; q++) {
-                st->mstart[q - bs] = (uint32_t)np;
-                if (q + LZR_MIN_MATCH <= lim_end) bt_search(c, q, lim_end - q, NULL);
+    }
+    return NULL;
+}
+
+/* Fill the match cache for [bs, be). */
+/* Bytes readable for tree comparisons: up to LZR_LOOKAHEAD past the block
+ * (always present for non-final blocks). Keeping the compare limit at
+ * `nice` everywhere except the very end of the input keeps the tree
+ * ordering consistent, and output independent of chunking. */
+static size_t gather_limit(const lzr_cctx *c, size_t be)
+{
+    return be + LZR_LOOKAHEAD < c->end ? be + LZR_LOOKAHEAD : c->end;
+}
+
+static int gather(lzr_cctx *c, mcache *st, size_t bs, size_t be, size_t lim_end)
+{
+    unsigned T = c->threads < 1 ? 1 : (c->threads > LZR_MAX_THREADS ? LZR_MAX_THREADS : c->threads);
+    gjob *jobs = st->jobs;
+    for (unsigned t = 0; t < T; t++) {
+        jobs[t].c = c; jobs[t].from = c->ins; jobs[t].bs = bs; jobs[t].be = be;
+        jobs[t].lim_end = lim_end; jobs[t].part = t; jobs[t].nparts = T; jobs[t].err = 0;
+    }
+#if LZR_HAVE_THREADS
+    pthread_t tid[LZR_MAX_THREADS];
+    unsigned started = 0;
+    for (unsigned t = 1; t < T; t++) {
+        if (pthread_create(&tid[t], NULL, gather_worker, &jobs[t]) != 0) break;
+        started = t;
+    }
+    gather_worker(&jobs[0]);
+    for (unsigned t = 1; t <= started; t++) pthread_join(tid[t], NULL);
+    for (unsigned t = started + 1; t < T; t++) gather_worker(&jobs[t]);   /* thread start failed */
+#else
+    for (unsigned t = 0; t < T; t++) gather_worker(&jobs[t]);
+#endif
+
+    /* Merge the per-partition lists (each sorted by position). */
+    size_t total = 0;
+    for (unsigned t = 0; t < T; t++) { if (jobs[t].err) return LZR_ERR_NOMEM; total += jobs[t].n; }
+    if (total > st->pcap) {
+        mpair *np2 = (mpair *)realloc(st->pairs, total * sizeof(mpair));
+        if (!np2) return LZR_ERR_NOMEM;
+        st->pairs = np2;
+        st->pcap = total;
+    }
+    size_t idx[LZR_MAX_THREADS] = {0}, np = 0;
+    for (size_t p = 0; p < be - bs; p++) {
+        st->mstart[p] = (uint32_t)np;
+        for (unsigned t = 0; t < T; t++) {
+            gjob *j = &jobs[t];
+            while (idx[t] < j->n && j->out[idx[t]].pos == p) {
+                st->pairs[np].len = j->out[idx[t]].len;
+                st->pairs[np].dist = j->out[idx[t]].dist;
+                np++;
+                idx[t]++;
             }
-            p = stop;
-        } else {
-            p++;
         }
     }
     st->mstart[be - bs] = (uint32_t)np;
@@ -270,6 +403,7 @@ static inline void emit_seq(lzr_cctx *c, size_t *ns, size_t *nlit, size_t *lit_s
 
 static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_t *nlit_out)
 {
+    const mcache *mc = &st->mc[st->cur];
     const prices_t *pr = &st->pr;
     const uint8_t *buf = c->buf;
     const uint32_t nice = c->lp.nice;
@@ -290,7 +424,14 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
         uint32_t f_len = 0, f_off = 0;
 
         for (size_t i = 0; i < seg; i++) {
-            const onode *n = &N[i];
+            onode *n = &N[i];
+            /* Repeat offsets on the cheapest path to i are derived here,
+             * once, rather than on every tentative update. */
+            if (i) {
+                const onode *f = &N[n->from];
+                memcpy(n->reps, f->reps, sizeof(n->reps));
+                if (n->ml) commit_offset(n->reps, n->off);
+            }
             const size_t cur = p + i;
             const uint8_t *cp = buf + cur;
 
@@ -300,7 +441,6 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             if (lp < N[i + 1].price) {
                 onode *t = &N[i + 1];
                 t->price = lp; t->from = (uint32_t)i; t->ml = 0; t->off = 0; t->litlen = n->litlen + 1;
-                memcpy(t->reps, n->reps, sizeof(t->reps));
             }
 
             /* candidate matches: repeat offsets of this path, then the tree */
@@ -317,8 +457,8 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 if (len > best_len) { best_len = len; best_off = r; }
             }
             uint32_t prevlen = LZR_MIN_MATCH - 1;
-            for (uint32_t k = st->mstart[cur - bs]; k < st->mstart[cur - bs + 1]; k++) {
-                uint32_t len = st->pairs[k].len, d = st->pairs[k].dist, off = d + 2;
+            for (uint32_t k = mc->mstart[cur - bs]; k < mc->mstart[cur - bs + 1]; k++) {
+                uint32_t len = mc->pairs[k].len, d = mc->pairs[k].dist, off = d + 2;
                 for (uint32_t r = 0; r < LZR_NUM_REPS; r++) if (n->reps[r] == d) { off = r; break; }
                 cl[nc] = len; co[nc] = off; cmin[nc] = prevlen + 1; nc++;
                 prevlen = len;
@@ -331,15 +471,17 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             int32_t base = n->price + st->ll_p[0];
             for (unsigned k = 0; k < nc; k++) {
                 int32_t bo = base + of_price(pr, co[k]);
-                for (uint32_t L = cmin[k]; L <= cl[k]; L++) {
+                /* Lengths past LZR_OPT_FULL are only tried at full length:
+                 * cutting a long match short almost never pays, and this
+                 * bounds the work per position. */
+                uint32_t Lmax = cl[k], Lcut = cl[k] > LZR_OPT_FULL ? LZR_OPT_FULL : cl[k];
+                for (uint32_t L = cmin[k]; L <= Lmax; L = (L < Lcut || L == Lmax) ? L + 1 : Lmax) {
                     int32_t price = bo + st->ml_p[L];
                     size_t t = i + L;
                     while (last < t) N[++last].price = PRICE_INF;
                     if (price < N[t].price) {
                         onode *tn = &N[t];
                         tn->price = price; tn->from = (uint32_t)i; tn->ml = L; tn->off = co[k]; tn->litlen = 0;
-                        memcpy(tn->reps, n->reps, sizeof(tn->reps));
-                        commit_offset(tn->reps, co[k]);
                     }
                 }
             }
@@ -373,10 +515,68 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
     return ns;
 }
 
+#ifdef LZR_TUNE
+#include <time.h>
+double lzr_t_gather, lzr_t_parse;
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+#define TSTART double t0_ = now_s()
+#define TACC(v) do { double t1_ = now_s(); v += t1_ - t0_; t0_ = t1_; } while (0)
+#else
+#define TSTART
+#define TACC(v)
+#endif
+
+#if LZR_HAVE_THREADS
+static void *gather_async(void *arg)
+{
+    opt_state *st = (opt_state *)arg;
+    st->pend_err = gather(st->pend_c, &st->mc[st->cur ^ 1], st->pend_bs, st->pend_be, st->pend_lim);
+    return NULL;
+}
+#endif
+
+/* Wait for a background gather (keeps its result for the next block). */
+void opt_sync(lzr_cctx *c)
+{
+#if LZR_HAVE_THREADS
+    opt_state *st = (opt_state *)c->opt;
+    if (st && st->pending == 1) {
+        pthread_join(st->pend_tid, NULL);
+        st->pending = 2;             /* finished, result not consumed yet */
+    }
+#else
+    (void)c;
+#endif
+}
+
 size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
 {
     opt_state *st = (opt_state *)c->opt;
-    if (gather(c, st, bs, be)) return (size_t)-1;
+    TSTART;
+    /* 1. matches for this block: from the background gather, or now */
+    opt_sync(c);
+    if (st->pending && st->pend_bs == bs && st->pend_be == be) {
+        st->cur ^= 1;
+        st->pending = 0;
+        if (st->pend_err) return (size_t)-1;
+    } else {
+        if (st->pending) return (size_t)-1;      /* cannot happen: blocks are sequential */
+        if (gather(c, &st->mc[st->cur], bs, be, gather_limit(c, be))) return (size_t)-1;
+    }
+    /* 2. with threads, gather the next block while this one is parsed.
+     * Only when that block and its look-ahead are already buffered, so the
+     * result is the same as gathering it later. */
+#if LZR_HAVE_THREADS
+    if (c->threads > 1 && c->end >= be + LZR_BLOCK_SIZE + LZR_LOOKAHEAD) {
+        st->pend_c = c;
+        st->pend_bs = be;
+        st->pend_be = be + LZR_BLOCK_SIZE;
+        st->pend_lim = gather_limit(c, st->pend_be);   /* read here: c->end changes */
+        st->pend_err = 0;
+        if (pthread_create(&st->pend_tid, NULL, gather_async, st) == 0) st->pending = 1;
+    }
+#endif
+    TACC(lzr_t_gather);
     if (!c->have_stats) default_prices(&st->pr);
 
     uint32_t saved[LZR_NUM_REPS];
@@ -390,6 +590,7 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
         build_tables(st);
         ns = parse_pass(c, st, bs, be, nlit_out);
     }
+    TACC(lzr_t_parse);
     prices_from_parse(c, &st->pr, ns, *nlit_out);   /* seed the next block */
     c->have_stats = 1;
     return ns;
