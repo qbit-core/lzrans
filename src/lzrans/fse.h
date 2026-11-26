@@ -30,6 +30,8 @@ typedef struct {
     uint16_t st[FSE_L];          /* encoder: next states, by symbol run */
     uint16_t first[FSE_MAXSYM];  /* encoder: start of each symbol's run */
     uint8_t hbf[FSE_MAXSYM];     /* encoder: floor(log2(norm))          */
+    uint32_t dnb[FSE_MAXSYM];    /* encoder: nb = (X + dnb) >> 16       */
+    int32_t dfs[FSE_MAXSYM];     /* encoder: first - norm               */
 } fse_table;
 
 /* Normalise counts (at least one present) to sum FSE_L. */
@@ -74,11 +76,11 @@ static inline void fse_put(fbw *w, const fse_table *t, uint32_t *x, unsigned s)
 /* fse_put without the write: returns the bits (count in *nb). */
 static inline uint32_t fse_step(const fse_table *t, uint32_t *x, unsigned s, unsigned *nbp)
 {
-    uint32_t X = *x, f = t->norm[s];
-    unsigned nb = (unsigned)(31 - __builtin_clz(X)) - t->hbf[s];
-    if ((X >> nb) < f) nb--;
+    /* nb as in fse_put, from one add and shift (dnb: see fse_build) */
+    uint32_t X = *x;
+    unsigned nb = (X + t->dnb[s]) >> 16;
     *nbp = nb;
-    *x = t->st[t->first[s] + (X >> nb) - f];
+    *x = t->st[(int32_t)(X >> nb) + t->dfs[s]];
     return X & ((1u << nb) - 1);
 }
 
