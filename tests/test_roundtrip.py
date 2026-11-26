@@ -285,6 +285,22 @@ def test_job_mode_levels_1_6(level):
     assert len(ref) <= len(one) * 1.01
 
 
+def test_job_mode_freed_mid_stream():
+    # Dropping a threaded compressor with queued jobs (and helper threads
+    # running) must not leak or crash; a fresh one still produces the
+    # normal output.
+    data = _text(200_000, 1) * 30
+    c = lzrans.Compressor(level=0, threads=4)
+    ref = c.compress(data) + c.flush()
+    assert lzrans.decompress(ref) == data
+    for cut in (1_000_000, 4_500_000, 5_000_000):
+        c = lzrans.Compressor(level=0, threads=4)
+        c.compress(data[:cut])
+        del c
+    c = lzrans.Compressor(level=0, threads=4)
+    assert c.compress(data) + c.flush() == ref
+
+
 def test_threads_validated():
     with pytest.raises(ValueError):
         lzrans.compress(b"x", threads=-1)

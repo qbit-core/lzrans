@@ -134,9 +134,12 @@ void lzr_cctx_set_threads(lzr_cctx *c, int threads)
     c->threads = threads < 1 ? 1 : (threads > LZR_MAX_THREADS ? LZR_MAX_THREADS : threads);
 }
 
+static void batch_free(struct lzr_batch *b);
+
 void lzr_cctx_free(lzr_cctx *c)
 {
     if (!c) return;
+    if (c->bt) batch_free(c->bt);   /* lets an open batch's helpers finish first */
     if (c->wk) {
         for (int t = 0; t < c->threads; t++) {
             lzr_cctx *w = c->wk[t];
@@ -566,12 +569,14 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     /* codes, and the extra bits in the order they are written: ll and ml
      * together (<= 16 + 16 bits, block size 2^18), then the offset */
     for (size_t i = 0; i < ns; i++) {
-        unsigned nl, nm, no = 0;
-        uint32_t el, em, eo = 0;
-        c->llc[i] = (uint8_t)val_code(c->seq_ll[i], &nl, &el);
-        c->mlc[i] = (uint8_t)ml_code(c->seq_ml[i] - LZR_ML_BASE, &nm, &em);
+        unsigned nl, nm, no;
+        uint32_t el, em, eo;
+        c->llc[i] = (uint8_t)code_bf(c->seq_ll[i], 4, &nl, &el);
+        c->mlc[i] = (uint8_t)code_bf(c->seq_ml[i] - LZR_ML_BASE, ML_DLOG, &nm, &em);
         uint32_t off = c->seq_dist[i];
-        c->ofc[i] = (uint8_t)(off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &no, &eo));
+        int rep = off < LZR_NUM_REPS;
+        unsigned oc = code_bf(rep ? 0 : off - LZR_NUM_REPS, 4, &no, &eo);
+        c->ofc[i] = (uint8_t)(rep ? off : LZR_NUM_REPS + oc);
         c->xlm[i] = el | em << nl;
         c->nlm[i] = (uint8_t)(nl + nm);
         c->xof[i] = eo;
@@ -605,14 +610,18 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
         /* common case: the three state transitions in one write (<= 27 bits) */
         const fse_table *T0 = &c->fse[0], *T1 = &c->fse[1], *T2 = &c->fse[2];
         uint32_t x0 = x[0], x1 = x[1], x2 = x[2];
+        /* branch-free flushes: n <= 7 + 27, then <= 7 + 32 + 24 (offsets
+         * < 2^27) bits between them */
         for (size_t i = ns; i-- > 0;) {
             unsigned n2, n1, n0;
             uint32_t b2 = fse_step(T2, &x2, c->ofc[i], &n2);
             uint32_t b1 = fse_step(T1, &x1, c->mlc[i], &n1);
             uint32_t b0 = fse_step(T0, &x0, c->llc[i], &n0);
-            fbw_put(&w, b2 | b1 << n2 | (uint64_t)b0 << (n2 + n1), n2 + n1 + n0);
-            fbw_put(&w, c->xlm[i], c->nlm[i]);
-            fbw_put(&w, c->xof[i], c->nof[i]);
+            fbw_add(&w, b2 | b1 << n2 | (uint64_t)b0 << (n2 + n1), n2 + n1 + n0);
+            fbw_flush8(&w);
+            fbw_add(&w, c->xlm[i], c->nlm[i]);
+            fbw_add(&w, c->xof[i], c->nof[i]);
+            fbw_flush8(&w);
         }
         x[0] = x0; x[1] = x1; x[2] = x2;
     } else {
@@ -724,6 +733,26 @@ static void slide(lzr_cctx *c)
 #include <pthread.h>
 #endif
 
+typedef struct { lzr_cctx *c; size_t js, je; int r; } job_arg;
+
+/* A batch: up to c->jobs jobs over buf[pos, cap). Jobs are queued as soon
+ * as their input is buffered (batch_feed), and helper threads start on
+ * them while the caller is still copying (and hashing) the rest; the
+ * caller joins in when the batch is closed (batch_finish). Every job is
+ * compressed the same way whichever thread takes it, so the output does
+ * not depend on the thread count or on timing. */
+struct lzr_batch {
+    job_arg a[2 * LZR_MAX_THREADS];
+    int nready, next, closed, nthr;
+#if LZR_HAVE_THREADS
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_t tid[LZR_MAX_THREADS];
+    struct { struct lzr_batch *b; lzr_cctx *w; lzr_buf *outs; } arg[LZR_MAX_THREADS];
+#endif
+};
+
+
 static lzr_cctx *worker_new(const lzr_cctx *c)
 {
     lzr_cctx *w = (lzr_cctx *)calloc(1, sizeof(*w));
@@ -785,6 +814,17 @@ static int jobs_setup(lzr_cctx *c)
         free(wk); free(wout); free(nb);
         return LZR_ERR_NOMEM;
     }
+    struct lzr_batch *bt = (struct lzr_batch *)calloc(1, sizeof(*bt));
+    if (!bt) {
+        for (int t = 0; t < c->threads; t++) lzr_cctx_free(wk[t]);
+        free(wk); free(wout); free(nb);
+        return LZR_ERR_NOMEM;
+    }
+#if LZR_HAVE_THREADS
+    pthread_mutex_init(&bt->mu, NULL);
+    pthread_cond_init(&bt->cv, NULL);
+#endif
+    c->bt = bt;
     c->wk = wk;
     c->wout = wout;
     c->jobs = K;
@@ -796,8 +836,6 @@ static int jobs_setup(lzr_cctx *c)
     c->head = NULL; c->rtag = NULL; c->rhead = NULL;
     return LZR_OK;
 }
-
-typedef struct { lzr_cctx *c; size_t js, je; int r; } job_arg;
 
 /* Compress job j, buf[js, je), with worker w into wout[j]. */
 static void job_compress(job_arg *a, lzr_cctx *w, lzr_buf *out)
@@ -827,47 +865,114 @@ static void job_compress(job_arg *a, lzr_cctx *w, lzr_buf *out)
     }
 }
 
-typedef struct { job_arg *a; int n; int *next; lzr_cctx *w; lzr_buf *outs; } job_runner;
-
-/* Take jobs in order until none are left. */
-static void *job_loop(void *p)
+/* Take queued jobs in order until the batch is closed and drained. */
+static void batch_work(struct lzr_batch *b, lzr_cctx *w, lzr_buf *outs)
 {
-    job_runner *r = (job_runner *)p;
+#if LZR_HAVE_THREADS
+    pthread_mutex_lock(&b->mu);
     for (;;) {
-        int j = __atomic_fetch_add(r->next, 1, __ATOMIC_RELAXED);
-        if (j >= r->n) return NULL;
-        job_compress(&r->a[j], r->w, &r->outs[j]);
+        while (b->next >= b->nready && !b->closed) pthread_cond_wait(&b->cv, &b->mu);
+        if (b->next >= b->nready) break;
+        int j = b->next++;
+        pthread_mutex_unlock(&b->mu);
+        job_compress(&b->a[j], w, &outs[j]);
+        pthread_mutex_lock(&b->mu);
+    }
+    pthread_mutex_unlock(&b->mu);
+#else
+    while (b->next < b->nready) { int j = b->next++; job_compress(&b->a[j], w, &outs[j]); }
+#endif
+}
+
+#if LZR_HAVE_THREADS
+static void *batch_thread(void *p)
+{
+    struct { struct lzr_batch *b; lzr_cctx *w; lzr_buf *outs; } *t = p;
+    batch_work(t->b, t->w, t->outs);
+    return NULL;
+}
+#endif
+
+static void batch_free(struct lzr_batch *b)
+{
+#if LZR_HAVE_THREADS
+    if (b->nthr) {
+        pthread_mutex_lock(&b->mu);
+        b->closed = 1;
+        pthread_cond_broadcast(&b->cv);
+        pthread_mutex_unlock(&b->mu);
+        for (int t = 1; t < b->nthr; t++) pthread_join(b->tid[t], NULL);
+    }
+    pthread_mutex_destroy(&b->mu);
+    pthread_cond_destroy(&b->cv);
+#endif
+    free(b);
+}
+
+/* Queue job buf[js, je); the first job of a batch starts the helpers. */
+static void batch_add(lzr_cctx *c, size_t js, size_t je)
+{
+    struct lzr_batch *b = c->bt;
+    job_arg *a = &b->a[b->nready];
+    a->c = c; a->js = js; a->je = je; a->r = LZR_OK;
+#if LZR_HAVE_THREADS
+    pthread_mutex_lock(&b->mu);
+    b->nready++;
+    pthread_cond_signal(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+    if (b->nthr == 0) {
+        /* helpers wk[1..]: the caller is wk[0] and works once it closes */
+        b->nthr = 1;
+        for (int t = 1; t < c->threads; t++) {
+            b->arg[t].b = b; b->arg[t].w = c->wk[t]; b->arg[t].outs = c->wout;
+            if (pthread_create(&b->tid[t], NULL, batch_thread, &b->arg[t]) != 0) break;
+            b->nthr = t + 1;
+        }
+    }
+#else
+    b->nready++;
+#endif
+}
+
+/* Queue every full job that is now buffered. */
+static void batch_feed(lzr_cctx *c)
+{
+    struct lzr_batch *b = c->bt;
+    while (b->nready < c->jobs) {
+        size_t js = c->pos + (size_t)b->nready * c->jsize;
+        if (c->end - js < c->jsize || c->end < js) break;
+        batch_add(c, js, js + c->jsize);
     }
 }
 
-/* Compress buf[pos, upto) as jobs (all but the last are jsize bytes) and
- * append them in order; then keep jover bytes of history. */
-static int jobs_run(lzr_cctx *c, size_t upto, lzr_buf *out)
+/* Queue the rest of buf[pos, end) (the last job may be short), run the
+ * batch to the end, append the jobs in order and keep jover bytes of
+ * history. */
+static int batch_finish(lzr_cctx *c, lzr_buf *out)
 {
-    job_arg a[2 * LZR_MAX_THREADS];
-    int n = 0, next = 0;
-    for (size_t js = c->pos; js < upto && n < c->jobs; js += c->jsize, n++) {
-        a[n].c = c; a[n].js = js;
-        a[n].je = upto - js > c->jsize ? js + c->jsize : upto;
-    }
-    job_runner run[LZR_MAX_THREADS];
-    int T = c->threads < n ? c->threads : n;
-    for (int t = 0; t < T; t++) { run[t].a = a; run[t].n = n; run[t].next = &next; run[t].w = c->wk[t]; run[t].outs = c->wout; }
+    struct lzr_batch *b = c->bt;
+    batch_feed(c);
+    size_t js = c->pos + (size_t)b->nready * c->jsize;
+    if (b->nready < c->jobs && js < c->end) batch_add(c, js, c->end);
+    int n = b->nready;
 #if LZR_HAVE_THREADS
-    pthread_t tid[LZR_MAX_THREADS];
-    int started = 1;
-    for (; started < T; started++)
-        if (pthread_create(&tid[started], NULL, job_loop, &run[started]) != 0) break;
-    job_loop(&run[0]);
-    for (int t = 1; t < started; t++) pthread_join(tid[t], NULL);
-#else
-    job_loop(&run[0]);
+    pthread_mutex_lock(&b->mu);
+    b->closed = 1;
+    pthread_cond_broadcast(&b->cv);
+    pthread_mutex_unlock(&b->mu);
 #endif
-    for (int j = 0; j < n; j++) {
-        if (a[j].r) return a[j].r;
-        if (buf_append(out, c->wout[j].p, c->wout[j].len)) return LZR_ERR_NOMEM;
+    batch_work(b, c->wk[0], c->wout);
+#if LZR_HAVE_THREADS
+    for (int t = 1; t < b->nthr; t++) pthread_join(b->tid[t], NULL);
+#endif
+    b->nready = b->next = b->closed = b->nthr = 0;
+    int r = LZR_OK;
+    for (int j = 0; j < n && !r; j++) {
+        r = b->a[j].r;
+        if (!r && buf_append(out, c->wout[j].p, c->wout[j].len)) r = LZR_ERR_NOMEM;
     }
-    c->pos = a[n - 1].je;
+    if (r) return r;
+    if (n) c->pos = b->a[n - 1].je;
     /* keep jover bytes of history */
     size_t keep_from = c->pos > c->jover ? c->pos - c->jover : 0;
     if (keep_from) {
@@ -878,24 +983,30 @@ static int jobs_run(lzr_cctx *c, size_t upto, lzr_buf *out)
     return LZR_OK;
 }
 
-typedef struct { lzr_cctx *c; lzr_buf *out; } sink_ctx;
+typedef struct { lzr_cctx *c; lzr_buf *out; int hash; } sink_ctx;   /* hash: src is the original content */
 
 /* Append (already filtered) content and compress every full block. */
 static int write_raw(void *ctx, const uint8_t *src, size_t n)
 {
     lzr_cctx *c = ((sink_ctx *)ctx)->c;
     lzr_buf *out = ((sink_ctx *)ctx)->out;
+    const int hash = ((sink_ctx *)ctx)->hash;
     if (c->jobs) {
         while (n) {
+            /* copy at most one job at a time, so that each job is queued
+             * (and compressed by the other threads) while the rest is copied */
             size_t take = c->cap - c->end;
             if (take > n) take = n;
+            if (take > c->jsize) take = c->jsize;
             memcpy(c->buf + c->end, src, take);
+            if (hash) xxh64_update(&c->xs, src, take);
             c->end += take;
             memset(c->buf + c->end, 0, 8);
             src += take;
             n -= take;
+            batch_feed(c);
             if (c->end == c->cap) {   /* a full batch */
-                int r = jobs_run(c, c->end, out);
+                int r = batch_finish(c, out);
                 if (r) return r;
             }
         }
@@ -906,6 +1017,7 @@ static int write_raw(void *ctx, const uint8_t *src, size_t n)
         size_t take = c->cap - c->end;
         if (take > n) take = n;
         memcpy(c->buf + c->end, src, take);
+        if (hash) xxh64_update(&c->xs, src, take);
         c->end += take;
         memset(c->buf + c->end, 0, 8);   /* deterministic hashing past the end */
         src += take;
@@ -944,10 +1056,14 @@ int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
     if (c->finished) return LZR_ERR_PARAM;
     if (!c->header_done && jobs_setup(c)) return LZR_ERR_NOMEM;
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
-    xxh64_update(&c->xs, src, n);   /* of the original content */
     c->total_in += n;
-    sink_ctx s = {c, out};
-    if (c->x86tmp) return x86_run(&c->x86, src, n, 0, c->x86tmp, write_raw, &s);
+    /* the checksum is of the original content: hashed here before the
+     * filter, else by write_raw piece by piece as it is copied */
+    sink_ctx s = {c, out, !c->x86tmp};
+    if (c->x86tmp) {
+        xxh64_update(&c->xs, src, n);
+        return x86_run(&c->x86, src, n, 0, c->x86tmp, write_raw, &s);
+    }
     return write_raw(&s, src, n);
 }
 
@@ -958,12 +1074,12 @@ int lzr_cctx_end(lzr_cctx *c, lzr_buf *out)
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
     if (c->content_size >= 0 && (uint64_t)c->content_size != c->total_in) return LZR_ERR_PARAM;
     if (c->x86tmp) {
-        sink_ctx s = {c, out};
+        sink_ctx s = {c, out, 0};
         int r = x86_finish(&c->x86, write_raw, &s);
         if (r) return r;
     }
     while (c->jobs && c->pos < c->end) {
-        int r = jobs_run(c, c->end, out);
+        int r = batch_finish(c, out);
         if (r) return r;
     }
     while (c->pos < c->end) {

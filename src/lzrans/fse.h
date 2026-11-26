@@ -55,6 +55,25 @@ static inline void fbw_put(fbw *w, uint64_t v, unsigned len)
     if (w->n >= 32) { wr32le(w->p, (uint32_t)w->acc); w->p += 4; w->acc >>= 32; w->n -= 32; }
 }
 
+/* Branch-free variant: fbw_add appends without flushing (the caller keeps
+ * n <= 64), fbw_flush8 writes 8 bytes and keeps the n & 7 bits that do not
+ * fill a byte. The bytes are the same as with fbw_put; up to 7 bytes past
+ * w->p are overwritten (zeros), so the buffer needs that slack. */
+static inline void fbw_add(fbw *w, uint64_t v, unsigned len)
+{
+    w->acc |= v << w->n;
+    w->n += len;
+}
+
+static inline void fbw_flush8(fbw *w)
+{
+    wr64le(w->p, w->acc);
+    unsigned nb = w->n >> 3;   /* <= 7 */
+    w->p += nb;
+    w->acc = (w->acc >> (nb * 4)) >> (nb * 4);
+    w->n &= 7;
+}
+
 /* Writes the end marker and flushes; returns the end pointer. */
 static inline uint8_t *fbw_close(fbw *w)
 {

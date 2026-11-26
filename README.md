@@ -6,7 +6,7 @@ CPython native extension.
 
 **Goal:** levels 1-8 match zstd -19 in ratio and speed; level 9 beats
 xz -9 in ratio; level 0 is a zstd -3 class fast level. Streaming throughout.
-Status: v0.10 phase 11 (see Roadmap).
+Status: v0.11 phase 12 (see Roadmap).
 
 ```python
 import lzrans
@@ -87,3 +87,4 @@ are rejected for now.
 | P9 | Type 4 decoder speed (branch-free tree decoding; format and output unchanged): 1.2-1.6x, about xz -9 decode speed or faster | done |
 | P10 | Level 9 single-thread compression speed (parser and tree walk, output unchanged): 1.0-1.3x, about xz -9 except on source code | done |
 | P11 | Level 0 (double-hash fast level, zstd -3 class: 0.84x its speed at 1 thread, 1.16x at 4 threads) + levels 1-6 1.0-1.1x faster with the same output | done |
+| P12 | Same output, faster: job-mode threads overlap input copy/checksum with compression (L0 4 threads +17%, 1.22x zstd -3; L1-6 +5-8%); branch-free type 5 bit writers (L0 1 thread +8%) | done |
