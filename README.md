@@ -5,7 +5,7 @@ Streaming LZ77 compressor with two entropy back ends: a fast one
 CPython native extension.
 
 **Goal:** levels 1-8 match zstd -19 in ratio and speed; level 9 beats
-xz -9 in ratio. Streaming throughout. Status: v0.8 phase 9 (see Roadmap).
+xz -9 in ratio. Streaming throughout. Status: v0.9 phase 10 (see Roadmap).
 
 ```python
 import lzrans
@@ -84,4 +84,4 @@ are rejected for now.
 | P7 | Row match finder for levels 1-6 (2-5x faster compression at about the same ratio) | done |
 | P8 | Parallel jobs for levels 1-6 (threads > 1, format unchanged) + single-thread micro-optimizations | done |
 | P9 | Type 4 decoder speed (branch-free tree decoding; format and output unchanged): 1.2-1.6x, about xz -9 decode speed or faster | done |
-| P10 | Compression speed of the priced parser (level 9) | planned |
+| P10 | Level 9 single-thread compression speed (parser and tree walk, output unchanged): 1.0-1.3x, about xz -9 except on source code | done |
