@@ -1,9 +1,9 @@
 /*
  * module.c - CPython binding for the lzrans C core.
  *
- *   compress(data, level=6, window_log=0, threads=1) -> bytes
+ *   compress(data, level=6, window_log=0, threads=1, filter=None) -> bytes
  *   decompress(data) -> bytes
- *   Compressor(level=6, window_log=0, threads=1): .compress(data), .flush()
+ *   Compressor(level=6, window_log=0, threads=1, filter=None): .compress(data), .flush()
  *   Decompressor(): .decompress(data) -> bytes, .eof, .unused_data
  *   crc32(data, value=0) -> int                     (zlib-compatible)
  *   frame_info(data) -> (content_size | None, window_log, flags)
@@ -83,15 +83,26 @@ static int check_level(int level, int wlog)
     return 0;
 }
 
+/* filter: None or "x86" -> LZR_FILTER_*, or -1 with an exception set. */
+static int parse_filter(PyObject *f)
+{
+    if (!f || f == Py_None) return LZR_FILTER_NONE;
+    if (PyUnicode_Check(f) && PyUnicode_CompareWithASCIIString(f, "x86") == 0) return LZR_FILTER_X86;
+    PyErr_SetString(PyExc_ValueError, "filter must be None or \"x86\"");
+    return -1;
+}
+
 /* ---------------- one-shot ---------------- */
 
 static PyObject *py_compress(PyObject *self, PyObject *args, PyObject *kw)
 {
-    static char *kwlist[] = {"data", "level", "window_log", "threads", NULL};
+    static char *kwlist[] = {"data", "level", "window_log", "threads", "filter", NULL};
     Py_buffer in;
     int level = 6, wlog = 0, threads = 1;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|iii:compress", kwlist, &in, &level, &wlog, &threads)) return NULL;
-    if (check_level(level, wlog) || check_threads(threads)) { PyBuffer_Release(&in); return NULL; }
+    PyObject *fobj = NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|iiiO:compress", kwlist, &in, &level, &wlog, &threads, &fobj)) return NULL;
+    int filter = parse_filter(fobj);
+    if (filter < 0 || check_level(level, wlog) || check_threads(threads)) { PyBuffer_Release(&in); return NULL; }
     threads = resolve_threads(threads);
 
     lzr_buf out = {0};
@@ -101,7 +112,8 @@ static PyObject *py_compress(PyObject *self, PyObject *args, PyObject *kw)
     if (!c) r = LZR_ERR_NOMEM;
     else {
         lzr_cctx_set_threads(c, threads);
-        r = buf_reserve(&out, (size_t)in.len / 2 + 64);
+        r = lzr_cctx_set_filter(c, filter);
+        if (!r) r = buf_reserve(&out, (size_t)in.len / 2 + 64);
         if (!r) r = lzr_cctx_write(c, (const uint8_t *)in.buf, (size_t)in.len, &out);
         if (!r) r = lzr_cctx_end(c, &out);
         lzr_cctx_free(c);
@@ -183,15 +195,18 @@ typedef struct {
 
 static int Compressor_init(CompressorObject *self, PyObject *args, PyObject *kw)
 {
-    static char *kwlist[] = {"level", "window_log", "threads", NULL};
+    static char *kwlist[] = {"level", "window_log", "threads", "filter", NULL};
     int level = 6, wlog = 0, threads = 1;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "|iii:Compressor", kwlist, &level, &wlog, &threads)) return -1;
-    if (check_level(level, wlog) || check_threads(threads)) return -1;
+    PyObject *fobj = NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|iiiO:Compressor", kwlist, &level, &wlog, &threads, &fobj)) return -1;
+    int filter = parse_filter(fobj);
+    if (filter < 0 || check_level(level, wlog) || check_threads(threads)) return -1;
     threads = resolve_threads(threads);
     if (self->c) { lzr_cctx_free(self->c); self->c = NULL; }
     self->c = lzr_cctx_new(level, wlog, -1);
     if (!self->c) { PyErr_NoMemory(); return -1; }
     lzr_cctx_set_threads(self->c, threads);
+    if (lzr_cctx_set_filter(self->c, filter)) { PyErr_NoMemory(); return -1; }
     if (!self->lock && !(self->lock = PyThread_allocate_lock())) { PyErr_NoMemory(); return -1; }
     return 0;
 }
@@ -248,7 +263,7 @@ static PyTypeObject CompressorType = {
     .tp_name = "lzrans.Compressor",
     .tp_basicsize = sizeof(CompressorObject),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_doc = "Compressor(level=6, window_log=0, threads=1): streaming compressor.",
+    .tp_doc = "Compressor(level=6, window_log=0, threads=1, filter=None): streaming compressor.",
     .tp_new = PyType_GenericNew,
     .tp_init = (initproc)Compressor_init,
     .tp_dealloc = (destructor)Compressor_dealloc,
@@ -350,8 +365,9 @@ static PyTypeObject DecompressorType = {
 
 static PyMethodDef methods[] = {
     {"compress", (PyCFunction)(void (*)(void))py_compress, METH_VARARGS | METH_KEYWORDS,
-     "compress(data, level=6, window_log=0, threads=1) -> bytes\n"
-     "threads: match-finder threads for levels 7-9 (0 = auto, up to 4). Output is identical for any value."},
+     "compress(data, level=6, window_log=0, threads=1, filter=None) -> bytes\n"
+     "threads: match-finder threads for levels 7-9 (0 = auto, up to 4). Output is identical for any value.\n"
+     "filter: None, or \"x86\" for x86/x86-64 machine code (executables, libraries)."},
     {"decompress", py_decompress, METH_O, "decompress(data) -> bytes"},
     {"crc32", py_crc32, METH_VARARGS, "crc32(data, value=0) -> int (zlib-compatible)"},
     {"frame_info", py_frame_info, METH_O, "frame_info(data) -> (content_size or None, window_log, flags)"},
@@ -374,6 +390,7 @@ PyMODINIT_FUNC PyInit__lzrans(void)
         PyModule_AddObjectRef(m, "Decompressor", (PyObject *)&DecompressorType) < 0 ||
         PyModule_AddIntConstant(m, "FLAG_ENCRYPTED", LZR_FLAG_ENCRYPTED) < 0 ||
         PyModule_AddIntConstant(m, "FLAG_SIZE", LZR_FLAG_SIZE) < 0 ||
+        PyModule_AddIntConstant(m, "FLAG_X86", LZR_FLAG_X86) < 0 ||
         PyModule_AddIntConstant(m, "BLOCK_SIZE", LZR_BLOCK_SIZE) < 0 ||
         PyModule_AddIntConstant(m, "FORMAT_VERSION", LZR_VERSION) < 0) {
         Py_DECREF(m);

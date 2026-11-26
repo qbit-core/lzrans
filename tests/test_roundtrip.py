@@ -286,3 +286,57 @@ def test_adaptive_model_survives_stored_blocks(level):
     d = lzrans.Decompressor()
     out = b"".join(d.decompress(blob[i:i + 1000]) for i in range(0, len(blob), 1000))
     assert out == data and d.eof
+
+
+def _x86_like(n, seed=3):
+    # Code-like bytes: many E8 calls with small displacements, plus E8 at
+    # chunk-hostile spots (stream end, operands that contain E8 bytes).
+    rnd = random.Random(seed)
+    out = bytearray()
+    targets = [rnd.randrange(0, n) for _ in range(300)]
+    while len(out) < n:
+        k = rnd.random()
+        if k < 0.3:
+            out += b"\xe8" + ((rnd.choice(targets) - len(out) - 5) & 0xFFFFFFFF).to_bytes(4, "little")
+        elif k < 0.35:
+            out += b"\xe8\xe8\xe8"
+        else:
+            out += rnd.randbytes(rnd.randint(1, 6))
+    return bytes(out[:n]) + b"\xe8\x01\x02"
+
+
+@pytest.mark.parametrize("level", [1, 6, 9])
+def test_x86_filter_roundtrip(level):
+    data = _x86_like(700_000)
+    blob = lzrans.compress(data, level=level, filter="x86")
+    assert lzrans.frame_info(blob)[2] & lzrans.FLAG_X86
+    assert lzrans.decompress(blob) == data
+    # chunked streaming in both directions gives the same bytes
+    c = lzrans.Compressor(level=level, filter="x86")
+    rnd = random.Random(1)
+    parts, i = [], 0
+    while i < len(data):
+        j = i + rnd.randint(1, 9000)
+        parts.append(c.compress(data[i:j]))
+        i = j
+    blob2 = b"".join(parts) + c.flush()
+    d = lzrans.Decompressor()
+    out = b"".join(d.decompress(blob2[k:k + 777]) for k in range(0, len(blob2), 777))
+    assert out == data and d.eof
+
+
+@pytest.mark.parametrize("data", [b"", b"\xe8", b"\xe8\x00\x00\x00", b"\xe8\x00\x00\x00\x00", bytes(range(256)) * 50])
+def test_x86_filter_edge_cases(data):
+    assert lzrans.decompress(lzrans.compress(data, filter="x86")) == data
+
+
+def test_x86_filter_helps_code():
+    data = _x86_like(1 << 20)
+    assert len(lzrans.compress(data, 9, filter="x86")) < len(lzrans.compress(data, 9))
+
+
+def test_filter_validated():
+    with pytest.raises(ValueError):
+        lzrans.compress(b"x", filter="arm")
+    with pytest.raises(ValueError):
+        lzrans.Compressor(filter=1)

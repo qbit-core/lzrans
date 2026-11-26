@@ -11,6 +11,7 @@ import lzrans
 
 blob = lzrans.compress(data, level=6)          # level 1 (fast) .. 9 (best)
 blob = lzrans.compress(data, level=9, threads=4)   # same bytes, faster
+blob = lzrans.compress(exe_bytes, level=9, filter="x86")   # x86/x86-64 code
 assert lzrans.decompress(blob) == data         # ChecksumError on CRC mismatch
 
 # streaming, bounded memory
@@ -38,6 +39,7 @@ python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 |---|---|
 | Match finding | Levels 1-6 (`enc.c`): hash chains over a 1-8 MB window, 5-byte hash, 3 repeat offsets probed first, lazy matching (depth 0-2). Levels 7-9 (`opt.c`): binary tree (BT4) over an 8-16 MB window collecting all match lengths per position. |
 | Parsing | Levels 7-9: price-based optimal parsing (forward DP over 4096-position segments, repeat offsets tracked per path, prices from the previous block's statistics). |
+| Filter | `x86.h` (opt-in, `filter="x86"`): CALL (E8) rel32 operands with displacement < 2^25 are rewritten as absolute targets (mod 2^26), so repeated calls become repeated bytes. Bijective and streaming (holds back <= 4 bytes); the CRC covers the original content. ~4% smaller on an x86-64 shared object. |
 | Threads | Levels 7-9: hash buckets are split between threads (each tree only links positions of its own bucket, so no locks), and the next block is gathered in the background while the current one is parsed. Output is byte-identical for any thread count. |
 | Tokens | Sequences of (literal run, match length >= 2, offset). Offset code 0-2 = repeat offset, else a log-bucket code. Lengths/offsets use log-bucket codes (62 codes) + raw extra bits. Repeat-offset matches may be 2-3 bytes long (levels 7-9). |
 | Entropy coding | `rans.c`: LL/ML/offset codes as rANS streams, 12-bit static model per 256 KB block, 2 interleaved states, raw/run fallbacks. Literals: levels 1-5 the same; levels 6-9 (`arc.h`) an adaptive binary range coder. The first literal after a match is coded against the byte at rep0 (LZMA's "matched literal") with previous-byte context; the other literals go round-robin to 4 independent order-0 coders that the decoder runs interleaved and branch-free. Models persist across blocks, and the optimal parser prices literals from them. |
@@ -58,7 +60,7 @@ block*: type u8 | raw_len u32 | comp_len u32 | payload
 ```
 
 `flags`: bit 0 = encrypted (reserved), bit 1 = content size present
-(set by one-shot `compress`). Decoders reject unknown versions and flags.
+(set by one-shot `compress`), bit 2 = x86 filter applied to the content. Decoders reject unknown versions and flags.
 
 ## Encryption hook (not implemented yet)
 
@@ -74,4 +76,5 @@ are rejected for now.
 | P1 | Streaming frame, large window, sequence tokens, repeat offsets | done |
 | P2 | Binary-tree match finder + price-based optimal parsing | done |
 | P3 | Adaptive literal coding (literal contexts, match-byte context), short repeat matches | done |
-| P4 | x86 filter (binaries), adaptive code streams if decode speed allows | planned |
+| P4 | x86 filter (binaries) | done |
+| P5 | Decoder speed on literal-heavy data (SIMD lanes), adaptive code streams if it allows | planned |
