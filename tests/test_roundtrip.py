@@ -264,6 +264,27 @@ def test_threads_identical_on_window_sized_input():
     assert lzrans.decompress(c1) == data
 
 
+@pytest.mark.parametrize("level", [1, 3, 6])
+def test_job_mode_levels_1_6(level):
+    # Levels 1-6 with threads > 1 compress independent 4 MB jobs: the
+    # output is the same for any thread count > 1 and any input chunking,
+    # within ~1% of the single-thread size, and always decodes.
+    rnd = random.Random(level)
+    parts = [_text(200_000, k) for k in range(6)] + [CASES["binary_mix"]]
+    data = b"".join(rnd.choice(parts)[: rnd.randint(1000, 200_000)] for _ in range(120))
+    one = lzrans.compress(data, level=level, threads=1)
+    ref = lzrans.compress(data, level=level, threads=2)
+    for t in (3, 4, 0):
+        assert lzrans.compress(data, level=level, threads=t) == ref
+    streamed = []
+    for t, maxchunk in ((2, 700_000), (4, 50_000)):   # (no content size in the header)
+        c = lzrans.Compressor(level=level, threads=t)
+        streamed.append(b"".join(c.compress(ch) for ch in _chunks(data, rnd, maxchunk)) + c.flush())
+    assert streamed[0] == streamed[1]
+    assert lzrans.decompress(ref) == data and lzrans.decompress(streamed[0]) == data
+    assert len(ref) <= len(one) * 1.01
+
+
 def test_threads_validated():
     with pytest.raises(ValueError):
         lzrans.compress(b"x", threads=-1)

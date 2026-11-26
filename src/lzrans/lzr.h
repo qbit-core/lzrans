@@ -47,8 +47,10 @@ typedef struct lzr_cctx lzr_cctx;
 /* window_log 0 = level default. content_size < 0 = unknown. */
 lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size);
 void lzr_cctx_free(lzr_cctx *c);
-/* Worker threads for the level 7-9 match finder (1 = none). The output is
- * identical for any thread count. Call before the first write. */
+/* Worker threads (1 = none). Levels 7-9: match finder threads, output
+ * identical for any thread count. Levels 1-6: parallel 4 MB jobs, output
+ * identical for any thread count > 1 (and ~0.1% larger than with one).
+ * Call before the first write. */
 void lzr_cctx_set_threads(lzr_cctx *c, int threads);
 /* Pre-filter: LZR_FILTER_NONE or LZR_FILTER_X86 (better ratio on x86
  * machine code). Call before the first write. */

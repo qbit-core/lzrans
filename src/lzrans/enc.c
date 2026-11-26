@@ -123,6 +123,17 @@ void lzr_cctx_set_threads(lzr_cctx *c, int threads)
 void lzr_cctx_free(lzr_cctx *c)
 {
     if (!c) return;
+    if (c->wk) {
+        for (int t = 0; t < c->threads; t++) {
+            lzr_cctx *w = c->wk[t];
+            if (!w) continue;
+            w->buf = NULL;   /* shared */
+            lzr_cctx_free(w);
+        }
+        for (int j = 0; j < c->jobs; j++) free(c->wout[j].p);
+        free(c->wk);
+        free(c->wout);
+    }
     opt_free(c);
     free(c->buf); free(c->head); free(c->rtag); free(c->rhead);
     free(c->seq_ll); free(c->seq_ml); free(c->seq_dist);
@@ -203,7 +214,7 @@ static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *r
     /* 1) repeat offsets: cheapest to code, try them first */
     for (uint32_t r = 0; r < LZR_NUM_REPS; r++) {
         uint32_t d = reps[r];
-        if (d > p || d > c->wsize) continue;
+        if (!d || d > p || d > c->wsize) continue;   /* 0: unknown (job start) */
         if (rd32(cur - d) != first) continue;
         uint32_t len = (uint32_t)match_len(cur - d, cur, maxlen);
         int g = gain_of(len, r);
@@ -495,6 +506,177 @@ static void slide(lzr_cctx *c)
     opt_slide(c, d);
 }
 
+/* ---------------- job mode (levels 1-6, threads > 1) ----------------
+ * The input is cut into jobs of jsize bytes, independent of the thread
+ * count. A worker compresses one job alone: it indexes the jover bytes
+ * before the job (so matches still reach back), then parses and codes the
+ * job's blocks with no state from earlier jobs. The format needs no change:
+ *  - repeat offsets start unknown (0) and are used only once known; an
+ *    explicit offset updates the decoder's repeat history the same way
+ *    whatever it held, so after it the encoder knows the decoder's state;
+ *  - the first block of a job builds new entropy tables (no repeat mode).
+ * The main thread appends the jobs' blocks in order. Output is identical
+ * for any thread count > 1; one thread keeps the sequential path, whose
+ * ratio is slightly better (no job borders). */
+#ifndef LZR_JOB_LOG
+#define LZR_JOB_LOG 22        /* 4 MB jobs */
+#endif
+#if LZR_HAVE_THREADS
+#include <pthread.h>
+#endif
+
+static lzr_cctx *worker_new(const lzr_cctx *c)
+{
+    lzr_cctx *w = (lzr_cctx *)calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    w->lp = c->lp;
+    w->wsize = c->wsize; w->wmask = c->wmask; w->cap = c->cap;
+    w->threads = 1;
+    w->head = (uint32_t *)big_alloc(((size_t)1 << w->lp.hlog) * sizeof(uint32_t), 1);
+    w->rtag = (uint8_t *)big_alloc((size_t)1 << w->lp.hlog, 1);
+    w->rhead = (uint8_t *)big_alloc((size_t)1 << (w->lp.hlog - w->lp.row), 1);
+    w->seq_ll = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
+    w->seq_ml = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
+    w->seq_dist = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
+    w->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE);
+    w->llc = (uint8_t *)malloc(MAX_SEQ);
+    w->mlc = (uint8_t *)malloc(MAX_SEQ);
+    w->ofc = (uint8_t *)malloc(MAX_SEQ);
+    w->xlm = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
+    w->xof = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
+    w->nlm = (uint8_t *)malloc(MAX_SEQ);
+    w->nof = (uint8_t *)malloc(MAX_SEQ);
+    w->blk = (uint8_t *)malloc(64 + huf_bound(LZR_BLOCK_SIZE) + 3 * (1 + 3 * FSE_MAXSYM) + 11 * (size_t)MAX_SEQ + 64);
+    w->huf = (huf_table *)calloc(2, sizeof(huf_table));
+    w->fse = (fse_table *)calloc(6, sizeof(fse_table));
+    if (!w->head || !w->rtag || !w->rhead || !w->seq_ll || !w->seq_ml || !w->seq_dist || !w->lits || !w->llc ||
+        !w->mlc || !w->ofc || !w->xlm || !w->xof || !w->nlm || !w->nof || !w->blk || !w->huf || !w->fse) {
+        lzr_cctx_free(w);
+        return NULL;
+    }
+    return w;
+}
+
+/* Before the first write: switch to job mode if it applies. The buffer
+ * then holds jover bytes of history plus one batch (threads jobs). */
+static int jobs_setup(lzr_cctx *c)
+{
+    if (c->lp.opt || c->threads < 2) return LZR_OK;
+    /* history indexed before each job: the whole window up to 8 MB, else
+     * half of it (measured: ratio within ~0.1% of one thread on our sets;
+     * a shorter history lost >1% on data with far repeats) */
+    c->jsize = (size_t)1 << LZR_JOB_LOG;
+    c->jover = c->wsize <= ((size_t)8 << 20) ? c->wsize : c->wsize / 2;
+#ifdef LZR_TUNE
+    if (getenv("LZR_JOB")) c->jsize = (size_t)1 << atoi(getenv("LZR_JOB"));
+    if (getenv("LZR_OVL")) c->jover = (size_t)1 << atoi(getenv("LZR_OVL"));
+    if (c->jover > c->wsize) c->jover = c->wsize;
+#endif
+    /* a batch holds 2 jobs per thread: threads take jobs as they finish,
+     * which evens out jobs of unequal difficulty */
+    const int K = 2 * c->threads;
+    size_t cap = c->jover + (size_t)K * c->jsize;
+    uint8_t *nb = (uint8_t *)big_alloc(cap + LZR_SLACK, 0);
+    lzr_cctx **wk = (lzr_cctx **)calloc((size_t)c->threads, sizeof(*wk));
+    lzr_buf *wout = (lzr_buf *)calloc((size_t)K, sizeof(*wout));
+    int ok = nb && wk && wout;
+    for (int t = 0; ok && t < c->threads; t++) ok = (wk[t] = worker_new(c)) != NULL;
+    if (!ok) {
+        for (int t = 0; wk && t < c->threads; t++) lzr_cctx_free(wk[t]);
+        free(wk); free(wout); free(nb);
+        return LZR_ERR_NOMEM;
+    }
+    c->wk = wk;
+    c->wout = wout;
+    c->jobs = K;
+    free(c->buf);
+    c->buf = nb;
+    c->cap = cap;
+    /* the main context's own match tables are not used in job mode */
+    free(c->head); free(c->rtag); free(c->rhead);
+    c->head = NULL; c->rtag = NULL; c->rhead = NULL;
+    return LZR_OK;
+}
+
+typedef struct { lzr_cctx *c; size_t js, je; int r; } job_arg;
+
+/* Compress job j, buf[js, je), with worker w into wout[j]. */
+static void job_compress(job_arg *a, lzr_cctx *w, lzr_buf *out)
+{
+    lzr_cctx *c = a->c;
+    out->len = 0;
+    w->buf = c->buf;
+    /* forget everything from earlier jobs: positions below the new base
+     * read as "slid out" (rows keep their slots, the search stops there) */
+    w->base += c->cap + 1;
+    if (w->base + c->cap >= LZR_REBASE_AT) {
+        memset(w->head, 0, ((size_t)1 << w->lp.hlog) * sizeof(uint32_t));
+        w->base = 0;
+    }
+    w->end = a->je;
+    w->ins = a->js > c->jover ? a->js - c->jover : 0;
+    row_insert_upto(w, a->js);
+    w->reps[0] = w->reps[1] = w->reps[2] = 0;
+    w->huf[0].valid = 0;
+    w->fse[0].valid = w->fse[1].valid = w->fse[2].valid = 0;
+    a->r = LZR_OK;
+    for (size_t bs = a->js; bs < a->je && !a->r; bs += LZR_BLOCK_SIZE) {
+        size_t be = a->je - bs > LZR_BLOCK_SIZE ? bs + LZR_BLOCK_SIZE : a->je;
+        a->r = emit_block(w, bs, be, out);
+    }
+}
+
+typedef struct { job_arg *a; int n; int *next; lzr_cctx *w; lzr_buf *outs; } job_runner;
+
+/* Take jobs in order until none are left. */
+static void *job_loop(void *p)
+{
+    job_runner *r = (job_runner *)p;
+    for (;;) {
+        int j = __atomic_fetch_add(r->next, 1, __ATOMIC_RELAXED);
+        if (j >= r->n) return NULL;
+        job_compress(&r->a[j], r->w, &r->outs[j]);
+    }
+}
+
+/* Compress buf[pos, upto) as jobs (all but the last are jsize bytes) and
+ * append them in order; then keep jover bytes of history. */
+static int jobs_run(lzr_cctx *c, size_t upto, lzr_buf *out)
+{
+    job_arg a[2 * LZR_MAX_THREADS];
+    int n = 0, next = 0;
+    for (size_t js = c->pos; js < upto && n < c->jobs; js += c->jsize, n++) {
+        a[n].c = c; a[n].js = js;
+        a[n].je = upto - js > c->jsize ? js + c->jsize : upto;
+    }
+    job_runner run[LZR_MAX_THREADS];
+    int T = c->threads < n ? c->threads : n;
+    for (int t = 0; t < T; t++) { run[t].a = a; run[t].n = n; run[t].next = &next; run[t].w = c->wk[t]; run[t].outs = c->wout; }
+#if LZR_HAVE_THREADS
+    pthread_t tid[LZR_MAX_THREADS];
+    int started = 1;
+    for (; started < T; started++)
+        if (pthread_create(&tid[started], NULL, job_loop, &run[started]) != 0) break;
+    job_loop(&run[0]);
+    for (int t = 1; t < started; t++) pthread_join(tid[t], NULL);
+#else
+    job_loop(&run[0]);
+#endif
+    for (int j = 0; j < n; j++) {
+        if (a[j].r) return a[j].r;
+        if (buf_append(out, c->wout[j].p, c->wout[j].len)) return LZR_ERR_NOMEM;
+    }
+    c->pos = a[n - 1].je;
+    /* keep jover bytes of history */
+    size_t keep_from = c->pos > c->jover ? c->pos - c->jover : 0;
+    if (keep_from) {
+        memmove(c->buf, c->buf + keep_from, c->end - keep_from);
+        c->pos -= keep_from;
+        c->end -= keep_from;
+    }
+    return LZR_OK;
+}
+
 typedef struct { lzr_cctx *c; lzr_buf *out; } sink_ctx;
 
 /* Append (already filtered) content and compress every full block. */
@@ -502,6 +684,22 @@ static int write_raw(void *ctx, const uint8_t *src, size_t n)
 {
     lzr_cctx *c = ((sink_ctx *)ctx)->c;
     lzr_buf *out = ((sink_ctx *)ctx)->out;
+    if (c->jobs) {
+        while (n) {
+            size_t take = c->cap - c->end;
+            if (take > n) take = n;
+            memcpy(c->buf + c->end, src, take);
+            c->end += take;
+            memset(c->buf + c->end, 0, 8);
+            src += take;
+            n -= take;
+            if (c->end == c->cap) {   /* a full batch */
+                int r = jobs_run(c, c->end, out);
+                if (r) return r;
+            }
+        }
+        return LZR_OK;
+    }
     while (n) {
         if (c->end == c->cap) slide(c);
         size_t take = c->cap - c->end;
@@ -543,6 +741,7 @@ int lzr_cctx_set_filter(lzr_cctx *c, int filter)
 int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
 {
     if (c->finished) return LZR_ERR_PARAM;
+    if (!c->header_done && jobs_setup(c)) return LZR_ERR_NOMEM;
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
     xxh64_update(&c->xs, src, n);   /* of the original content */
     c->total_in += n;
@@ -554,11 +753,16 @@ int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
 int lzr_cctx_end(lzr_cctx *c, lzr_buf *out)
 {
     if (c->finished) return LZR_ERR_PARAM;
+    if (!c->header_done && jobs_setup(c)) return LZR_ERR_NOMEM;
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
     if (c->content_size >= 0 && (uint64_t)c->content_size != c->total_in) return LZR_ERR_PARAM;
     if (c->x86tmp) {
         sink_ctx s = {c, out};
         int r = x86_finish(&c->x86, write_raw, &s);
+        if (r) return r;
+    }
+    while (c->jobs && c->pos < c->end) {
+        int r = jobs_run(c, c->end, out);
         if (r) return r;
     }
     while (c->pos < c->end) {

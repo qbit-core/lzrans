@@ -55,6 +55,14 @@ struct lzr_cctx {
     lzr_x86 x86;           /* x86 filter state (if x86tmp)                 */
     uint8_t *x86tmp;       /* x86 filter work buffer, NULL = no filter     */
 
+    /* levels 1-6 with threads > 1: input is cut into jobs of jsize bytes
+     * (whole blocks), compressed independently by worker contexts that
+     * first index the jover bytes before the job (see jobs_run in enc.c) */
+    int jobs;              /* job mode on: up to `jobs` jobs per batch      */
+    size_t jsize, jover;
+    struct lzr_cctx **wk;  /* worker contexts (buf shared, tables own)      */
+    lzr_buf *wout;         /* job outputs (jobs of them)                    */
+
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
     uint8_t *lits, *llc, *mlc, *ofc, *blk;
