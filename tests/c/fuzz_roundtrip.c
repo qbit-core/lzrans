@@ -48,10 +48,13 @@ static int compress_chunked(const uint8_t *src, size_t n, int level, lzr_buf *ou
     return r;
 }
 
-/* Returns 1 = verified end, <0 error, 0 = truncated. */
+/* Returns 1 = verified end, <0 error, 0 = truncated. Every other call
+ * uses one-buffer mode (decoding straight into out). */
 static int decompress_chunked(const uint8_t *src, size_t n, lzr_buf *out)
 {
+    static unsigned calls;
     lzr_dctx *d = lzr_dctx_new();
+    if (calls++ & 1) lzr_dctx_set_output(d, out);
     size_t i = 0;
     int r = 0;
     while (r == 0 && i < n) {

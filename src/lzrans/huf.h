@@ -37,8 +37,8 @@ size_t huf_encode(uint8_t *out, const uint8_t *lits, size_t n, huf_table *prev);
  * Reads up to 8 bytes past the section (the caller keeps slack). */
 size_t huf_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t);
 
-/* Price (in 1/256 bits) of each byte value under the code that huf_encode
- * would build for these counts. */
+/* Code lengths (<= HUF_MAXLEN, 0 = absent) that huf_encode would build
+ * for these counts; at least one count must be nonzero. */
 void huf_lengths(const uint32_t *cnt, uint8_t *len);
 
 #endif

@@ -185,7 +185,7 @@ static inline uint64_t ld64(const uint8_t *p)
     return v;
 }
 
-size_t huf_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+static inline __attribute__((always_inline)) size_t huf_decode_impl(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
 {
     if (!n) return 0;
     if (avail < 2) return 0;
@@ -265,4 +265,24 @@ size_t huf_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_t
         if (s < 3 ? e != end[s] : e > end[s]) return 0;
     }
     return (size_t)(p[3] + (pos[3] + 7) / 8 - in);
+}
+
+static __attribute__((noinline)) size_t huf_decode_generic(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+{
+    return huf_decode_impl(in, avail, out, n, t);
+}
+
+#ifdef LZR_BMI2_DISPATCH
+static __attribute__((noinline)) LZR_TARGET_BMI2 size_t huf_decode_bmi2(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+{
+    return huf_decode_impl(in, avail, out, n, t);
+}
+#endif
+
+size_t huf_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+{
+#ifdef LZR_BMI2_DISPATCH
+    if (LZR_HAS_BMI2()) return huf_decode_bmi2(in, avail, out, n, t);
+#endif
+    return huf_decode_generic(in, avail, out, n, t);
 }

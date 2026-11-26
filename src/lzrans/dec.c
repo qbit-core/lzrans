@@ -255,7 +255,7 @@ static int decode_tokens(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
 /* Block type 5 (see emit_seqs5 in enc.c): Huffman literals into d->lits,
  * then one loop that decodes each sequence from the tANS bit stream and
  * executes it at once. */
-static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
     if (avail < 8) return LZR_ERR_CORRUPT;
     size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8;
@@ -351,26 +351,37 @@ static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
 #define DECODE_SEQ(LL, ML, DIST)                                               \
     do {                                                                       \
         const seq_dent el_ = dll[sll], em_ = dml[sml], eo_ = dof[sof];         \
-        /* all extra bits in one read: ll, ml, of were written in that order; \
-         * at most 25 + 31 bits (ll + ml <= block size), so one reload */      \
+        /* extra bits (ll, ml, of written in that order), then the three      \
+         * state updates (of, ml, ll): one read and one reload when they fit  \
+         * in 56 bits (nearly always), else two of each */                    \
         const unsigned xl_ = el_.xb, xm_ = em_.xb, xo_ = eo_.xb;               \
-        uint64_t v_ = BGET64(xl_ + xm_ + xo_); used += xl_ + xm_ + xo_;        \
+        const unsigned no_ = eo_.nb, nm_ = em_.nb, nl_ = el_.nb;               \
+        const unsigned xs_ = xl_ + xm_ + xo_, ss_ = no_ + nm_ + nl_;           \
+        uint64_t v_;                                                           \
+        uint32_t w_;                                                           \
+        if (LZR_LIKELY(xs_ + ss_ <= 56)) {                                     \
+            uint64_t t_ = BGET64(xs_ + ss_); used += xs_ + ss_;                \
+            v_ = t_ >> ss_;                                                    \
+            w_ = (uint32_t)(t_ & ((1u << ss_) - 1));                           \
+            BRELOAD();                                                         \
+        } else {                                                               \
+            v_ = BGET64(xs_); used += xs_;                                     \
+            BRELOAD();                                                         \
+            w_ = BGET(ss_); used += ss_;                                       \
+            BRELOAD();                                                         \
+        }                                                                      \
         LL = el_.base + (uint32_t)(v_ & ((1u << xl_) - 1));                    \
         ML = em_.base + (uint32_t)((v_ >> xl_) & ((1u << xm_) - 1));           \
         uint32_t ov_ = eo_.base + (uint32_t)(v_ >> (xl_ + xm_));               \
-        if (ov_ >= LZR_NUM_REPS) { DIST = ov_ - 3; rep2 = rep1; rep1 = rep0; rep0 = DIST; } \
-        else if (ov_ == 0) { DIST = rep0; }                                    \
-        else if (ov_ == 1) { DIST = rep1; rep1 = rep0; rep0 = DIST; }          \
-        else { DIST = rep2; rep2 = rep1; rep1 = rep0; rep0 = DIST; }           \
-        BRELOAD();                                                             \
-        {   /* the three state updates in one read (of, ml, ll written) */     \
-            const unsigned no_ = eo_.nb, nm_ = em_.nb, nl_ = el_.nb;           \
-            uint32_t v_ = BGET(no_ + nm_ + nl_); used += no_ + nm_ + nl_;      \
-            sof = eo_.next + (v_ & ((1u << no_) - 1));                         \
-            sml = em_.next + ((v_ >> no_) & ((1u << nm_) - 1));                \
-            sll = el_.next + (v_ >> (no_ + nm_));                              \
-        }                                                                      \
-        BRELOAD();                                                             \
+        /* repeat index 0-2 or distance + 3; written for conditional moves */ \
+        uint32_t r_ = ov_ == 0 ? rep0 : ov_ == 1 ? rep1 : rep2;                \
+        DIST = ov_ >= LZR_NUM_REPS ? ov_ - 3 : r_;                             \
+        rep2 = ov_ >= 2 ? rep1 : rep2;                                         \
+        rep1 = ov_ >= 1 ? rep0 : rep1;                                         \
+        rep0 = DIST;                                                           \
+        sof = eo_.next + (w_ & ((1u << no_) - 1));                             \
+        sml = em_.next + ((w_ >> no_) & ((1u << nm_) - 1));                    \
+        sll = el_.next + (w_ >> (no_ + nm_));                                  \
     } while (0)
     /* Execute it: literal run, then the match (checked here). */
 #define EXEC_SEQ(LL, ML, DIST)                                                 \
@@ -427,6 +438,26 @@ done:
     if (tail != (size_t)(oend - o)) return LZR_ERR_CORRUPT;
     memcpy(o, lp, tail);
     return LZR_OK;
+}
+
+static __attribute__((noinline)) int decode_block5_generic(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_block5_impl(d, in, avail, dst, raw);
+}
+
+#ifdef LZR_BMI2_DISPATCH
+static __attribute__((noinline)) LZR_TARGET_BMI2 int decode_block5_bmi2(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_block5_impl(d, in, avail, dst, raw);
+}
+#endif
+
+static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+#ifdef LZR_BMI2_DISPATCH
+    if (LZR_HAS_BMI2()) return decode_block5_bmi2(d, in, avail, dst, raw);
+#endif
+    return decode_block5_generic(d, in, avail, dst, raw);
 }
 
 static int init_history(lzr_dctx *d, int wlog)
