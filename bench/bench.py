@@ -38,9 +38,9 @@ def best_time(fn, arg, min_total=0.3):
 def run(name, data):
     mb = len(data) / 1e6
     rows = []
-    codecs = [(f"lzrans -{lv}", lambda d, lv=lv: lzrans.compress(d, lv), lzrans.decompress) for lv in (1, 6, 7, 9)]
+    codecs = [(f"lzrans -{lv}", lambda d, lv=lv: lzrans.compress(d, lv), lzrans.decompress) for lv in (1, 6, 8, 9)]
     codecs += [(f"lzrans -{lv} (4 thr)", lambda d, lv=lv: lzrans.compress(d, lv, threads=4), lzrans.decompress)
-               for lv in (7, 9)]
+               for lv in (8, 9)]
     codecs += [("zlib -9", lambda d: zlib.compress(d, 9), zlib.decompress)]
     codecs += [(f"xz -{lv}", lambda d, lv=lv: lzma.compress(d, preset=lv), lzma.decompress) for lv in (6, 9)]
     try:

@@ -23,7 +23,7 @@ static PyObject *raise_code(int code)
     switch (code) {
     case LZR_ERR_NOMEM: return PyErr_NoMemory();
     case LZR_ERR_CHECKSUM:
-        PyErr_SetString(LzrChecksumError, "CRC32 mismatch: decompressed data is corrupt");
+        PyErr_SetString(LzrChecksumError, "checksum mismatch: decompressed data is corrupt");
         return NULL;
     case LZR_ERR_UNSUPPORTED:
         PyErr_SetString(LzrError, "unsupported frame version or flags (encrypted frames are not supported yet)");
@@ -134,25 +134,40 @@ static PyObject *py_decompress(PyObject *self, PyObject *arg)
     size_t used = 0;
     int64_t csize = -1;
     int hr = lzr_frame_header((const uint8_t *)in.buf, (size_t)in.len, NULL, NULL, &csize);
+    /* When the header carries the content size (one-shot compress), decode
+     * straight into the result bytes object: no growth, no final copy. The
+     * decoder rejects frames that produce more than content_size bytes, so
+     * the buffer (size + wildcopy slack) never needs to grow. */
+    PyObject *bytes = NULL;
+    const size_t extra = LZR_SLACK + 64;
+    if (hr > 0 && csize > 0 && (uint64_t)csize <= (uint64_t)in.len * 4096u + (1u << 20) &&
+        (uint64_t)csize <= (uint64_t)PY_SSIZE_T_MAX - extra) {
+        bytes = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)((size_t)csize + extra));
+        if (!bytes) { PyBuffer_Release(&in); return NULL; }
+        out.p = (uint8_t *)PyBytes_AS_STRING(bytes);
+        out.cap = (size_t)csize + extra;
+        out.fixed = 1;
+    }
     Py_BEGIN_ALLOW_THREADS
     lzr_dctx *d = lzr_dctx_new();
     if (!d) r = LZR_ERR_NOMEM;
     else {
-        /* Pre-size the output when the header carries the content size. */
-        r = (hr > 0 && csize > 0 && (uint64_t)csize <= (uint64_t)in.len * 4096u + (1u << 20))
-                ? buf_reserve(&out, (size_t)csize) : LZR_OK;
+        r = lzr_dctx_set_output(d, &out);
         if (!r) r = lzr_dctx_write(d, (const uint8_t *)in.buf, (size_t)in.len, &out, &used);
         lzr_dctx_free(d);
     }
     Py_END_ALLOW_THREADS
     Py_ssize_t inlen = in.len;
     PyBuffer_Release(&in);
-    PyObject *res;
-    if (r < 0) res = raise_code(r);
-    else if (r != 1) { PyErr_SetString(LzrError, "truncated lzrans frame (no end block)"); res = NULL; }
-    else if ((Py_ssize_t)used != inlen) { PyErr_SetString(LzrError, "trailing data after lzrans frame"); res = NULL; }
-    else res = take_bytes(&out);
-    free(out.p);
+    PyObject *res = NULL;
+    if (r < 0) raise_code(r);
+    else if (r != 1) PyErr_SetString(LzrError, "truncated lzrans frame (no end block)");
+    else if ((Py_ssize_t)used != inlen) PyErr_SetString(LzrError, "trailing data after lzrans frame");
+    else if (bytes) {
+        if (_PyBytes_Resize(&bytes, (Py_ssize_t)out.len) == 0) { res = bytes; bytes = NULL; }
+    } else res = take_bytes(&out);
+    Py_XDECREF(bytes);
+    if (!out.fixed) free(out.p);
     return res;
 }
 

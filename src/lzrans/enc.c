@@ -3,23 +3,22 @@
  *
  * Structure:
  *   lzr_cctx          sliding input buffer (2*window + block), hash-chain
- *                     tables, repeat offsets, running CRC
+ *                     tables, repeat offsets, running XXH64
  *   find_best()       repeat-offset probes + hash-chain walk, scored by gain
  *   parse_block()     lazy parse (depth 0..2) into sequences + literals
- *   emit_block()      sequences -> code streams + extra bits -> rANS
+ *   emit_block()      sequences -> block type 5 (Huffman literals + tANS
+ *                     sequences) or type 4 (range-coded tokens, level 9)
  *   slide()           drops history older than the window, rebases tables
  */
 #include "lzr.h"
-#include "rans.h"
 #include "codes.h"
-#include "crc32.h"
+#include "xxh64.h"
 #include "x86.h"
 #include "arc.h"
 
 #include "enc_internal.h"
 #ifdef LZR_TUNE
 #include <stdio.h>
-size_t lzr_sz[5];
 #endif
 
 /* Levels 1-6: hash chains + lazy parsing (window, hash bits, lazy depth,
@@ -38,6 +37,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 {
     if (level < LZR_LEVEL_MIN || level > LZR_LEVEL_MAX) return NULL;
     lzr_cctx *c = (lzr_cctx *)calloc(1, sizeof(*c));
+    if (c) xxh64_init(&c->xs);
     if (!c) return NULL;
     c->lp = LEVELS[level];
     if (window_log) {
@@ -76,13 +76,12 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->llc = (uint8_t *)malloc(MAX_SEQ);
     c->mlc = (uint8_t *)malloc(MAX_SEQ);
     c->ofc = (uint8_t *)malloc(MAX_SEQ);
-    c->extra = (uint8_t *)malloc(MAX_SEQ * 8 + 16);
-    c->scratch = (uint8_t *)malloc(2 * LZR_BLOCK_SIZE + 16);
     {
-        size_t rb = stream_bound(LZR_BLOCK_SIZE, ALPHA_LIT) + 3 * stream_bound(MAX_SEQ, ALPHA_CODE);
-        /* type 4 stops at raw_len + one token (< 64 bytes) + pending bytes */
+        /* type 5: literals + tables + <= 11 bytes of bits per sequence;
+         * type 4 stops at raw_len + one token (< 64 bytes) + pending bytes */
+        size_t rb = huf_bound(LZR_BLOCK_SIZE) + 3 * (1 + 3 * FSE_MAXSYM) + 11 * (size_t)MAX_SEQ + 64;
         size_t ab = 2 * (size_t)LZR_BLOCK_SIZE + 4096;
-        c->blk = (uint8_t *)malloc(64 + (rb > ab ? rb : ab) + MAX_SEQ * 8 + 16);
+        c->blk = (uint8_t *)malloc(64 + (rb > ab ? rb : ab));
     }
     c->adaptive = level >= LZR_ADAPTIVE_LEVEL;
 #ifdef LZR_TUNE
@@ -90,9 +89,11 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 #endif
     c->tm = (tok_model *)malloc(2 * sizeof(tok_model));
     if (c->tm) tok_model_init(c->tm);
+    c->huf = (huf_table *)calloc(2, sizeof(huf_table));
+    c->fse = (fse_table *)calloc(6, sizeof(fse_table));
     if (c->lp.opt && opt_init(c)) { lzr_cctx_free(c); return NULL; }
     if (!c->buf || !c->head || (!c->prev && !c->lp.opt) || !c->seq_ll || !c->seq_ml || !c->seq_dist || !c->lits ||
-        !c->llc || !c->mlc || !c->ofc || !c->extra || !c->scratch || !c->blk || !c->tm) {
+        !c->llc || !c->mlc || !c->ofc || !c->blk || !c->tm || !c->huf || !c->fse) {
         lzr_cctx_free(c);
         return NULL;
     }
@@ -111,7 +112,7 @@ void lzr_cctx_free(lzr_cctx *c)
     free(c->buf); free(c->head); free(c->prev);
     free(c->seq_ll); free(c->seq_ml); free(c->seq_dist);
     free(c->lits); free(c->llc); free(c->mlc); free(c->ofc);
-    free(c->extra); free(c->scratch); free(c->blk); free(c->tm); free(c->x86tmp);
+    free(c->blk); free(c->tm); free(c->huf); free(c->fse); free(c->x86tmp);
     free(c);
 }
 
@@ -271,50 +272,69 @@ static size_t encode_tokens(lzr_cctx *c, size_t bs, size_t be, size_t ns, const 
     return n < raw ? n : (size_t)-1;
 }
 
-/* Block type 1 payload into b + LZR_BLOCK_HDR; returns the block size. */
-static size_t emit_seqs(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
+/* Block type 5 payload into b + LZR_BLOCK_HDR; returns the block size.
+ *   nseq u32 | nlit u32 | literal section (huf.h) |
+ *   if nseq: 3 table modes (ll, ml, of: 0 new + counts, 1 previous,
+ *   2 single symbol + that symbol) | bit stream (fse.h) to the block end */
+static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
 {
-    /* Sequences -> code symbols + raw extra bits (LL, ML, OF order). */
-    bitw bw = {0, 0, c->extra};
+    size_t k = LZR_BLOCK_HDR;
+    wr32le(b + k, (uint32_t)ns); k += 4;
+    wr32le(b + k, (uint32_t)nlit); k += 4;
+    k += huf_encode(b + k, c->lits, nlit, &c->huf[0]);
+    if (!ns) return k;
+
+    uint8_t *codes[3] = {c->llc, c->mlc, c->ofc};
+    const unsigned alpha[3] = {VAL_CODES, ML_CODES, OF_CODES};
+    uint32_t cnt[3][FSE_MAXSYM];
+    memset(cnt, 0, sizeof(cnt));
     for (size_t i = 0; i < ns; i++) {
         unsigned nb;
         uint32_t ex;
         c->llc[i] = (uint8_t)val_code(c->seq_ll[i], &nb, &ex);
-        bw_put(&bw, ex, nb);
-        c->mlc[i] = (uint8_t)val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
-        bw_put(&bw, ex, nb);
+        c->mlc[i] = (uint8_t)ml_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
         uint32_t off = c->seq_dist[i];
-        if (off < LZR_NUM_REPS) {
-            c->ofc[i] = (uint8_t)off;
-        } else {
-            c->ofc[i] = (uint8_t)(LZR_NUM_REPS + val_code(off - 3, &nb, &ex));   /* dist - 1 */
-            bw_put(&bw, ex, nb);
-        }
+        c->ofc[i] = (uint8_t)(off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &nb, &ex));
+        cnt[0][c->llc[i]]++; cnt[1][c->mlc[i]]++; cnt[2][c->ofc[i]]++;
     }
-    bw_flush(&bw);
-    size_t extra_len = (size_t)(bw.p - c->extra);
-
-    size_t k = LZR_BLOCK_HDR;
-    wr32le(b + k, (uint32_t)ns); k += 4;
-    wr32le(b + k, (uint32_t)nlit); k += 4;
-#ifdef LZR_TUNE
-    size_t k0 = k;
-    extern size_t lzr_sz[5];
-#define TS(i) do { lzr_sz[i] += k - k0; k0 = k; } while (0)
-#else
-#define TS(i)
-#endif
-    k += stream_encode(b + k, c->lits, nlit, ALPHA_LIT, c->scratch); TS(0);
-    k += stream_encode(b + k, c->llc, ns, ALPHA_CODE, c->scratch); TS(1);
-    k += stream_encode(b + k, c->mlc, ns, ALPHA_CODE, c->scratch); TS(2);
-    k += stream_encode(b + k, c->ofc, ns, ALPHA_CODE, c->scratch); TS(3);
-#ifdef LZR_TUNE
-    lzr_sz[4] += extra_len;
-#endif
-    wr32le(b + k, (uint32_t)extra_len); k += 4;
-    memcpy(b + k, c->extra, extra_len); k += extra_len;
-
-    return k;
+    int rle[3];
+    for (int t = 0; t < 3; t++) {
+        fse_table *T = &c->fse[t];
+        unsigned distinct = 0, sym = 0;
+        for (unsigned v = 0; v < alpha[t]; v++) if (cnt[t][v]) { distinct++; sym = v; }
+        rle[t] = distinct == 1;
+        if (rle[t]) { b[k++] = 2; b[k++] = (uint8_t)sym; continue; }
+        uint16_t norm[FSE_MAXSYM];
+        fse_normalize(cnt[t], alpha[t], (uint32_t)ns, norm);
+        uint8_t hdr[3 * FSE_MAXSYM];
+        size_t hl = fse_write_norm(hdr, norm, alpha[t]);
+        uint64_t cn = fse_cost(cnt[t], norm, alpha[t]) + hl * 8 * 256;
+        uint64_t cp = T->valid && T->alphabet == alpha[t] ? fse_cost(cnt[t], T->norm, alpha[t]) : UINT64_MAX;
+        if (cp <= cn) { b[k++] = 1; continue; }
+        b[k++] = 0;
+        memcpy(b + k, hdr, hl); k += hl;
+        memcpy(T->norm, norm, sizeof(norm));
+        T->alphabet = alpha[t];
+        fse_build(T);
+    }
+    /* bit stream, backwards over the sequences (see dec.c for the order) */
+    fbw w = {0, 0, b + k};
+    uint32_t x[3] = {FSE_L, FSE_L, FSE_L};
+    for (size_t i = ns; i-- > 0;) {
+        for (int t = 2; t >= 0; t--)
+            if (!rle[t]) fse_put(&w, &c->fse[t], &x[t], codes[t][i]);
+        unsigned nb;
+        uint32_t ex;
+        val_code(c->seq_ll[i], &nb, &ex);
+        fbw_put(&w, ex, nb);
+        ml_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
+        fbw_put(&w, ex, nb);
+        uint32_t off = c->seq_dist[i];
+        if (off >= LZR_NUM_REPS) { val_code(off - 3, &nb, &ex); fbw_put(&w, ex, nb); }
+    }
+    for (int t = 2; t >= 0; t--)
+        if (!rle[t]) fbw_put(&w, x[t] - FSE_L, FSE_LOG);
+    return (size_t)(fbw_close(&w) - b);
 }
 
 static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
@@ -329,15 +349,19 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
 
     uint8_t *b = c->blk;
     size_t k = LZR_BLOCK_HDR;
-    uint8_t btype = 1;
+    uint8_t btype = 5;
     tok_model *tm = c->tm;
+    if (!c->adaptive) {   /* save the repeatable tables for the stored fallback */
+        c->huf[1] = c->huf[0];
+        memcpy(c->fse + 3, c->fse, 3 * sizeof(fse_table));
+    }
     if (c->adaptive) {
         btype = 4;
         memcpy(tm + 1, tm, sizeof(*tm));   /* for the stored fallback */
         size_t n = encode_tokens(c, bs, be, ns, saved_reps, b + k);
         k = n == (size_t)-1 ? (size_t)-1 : k + n;
     } else {
-        k = emit_seqs(c, ns, nlit, b);
+        k = emit_seqs5(c, ns, nlit, b);
     }
 
     if (k != (size_t)-1 && k - LZR_BLOCK_HDR < raw) {
@@ -349,6 +373,7 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
     /* Stored block; the decoder leaves its repeat offsets and model untouched. */
     memcpy(c->reps, saved_reps, sizeof(saved_reps));
     if (btype == 4) memcpy(tm, tm + 1, sizeof(*tm));
+    if (btype == 5) { c->huf[0] = c->huf[1]; memcpy(c->fse, c->fse + 3, 3 * sizeof(fse_table)); }
     uint8_t h[LZR_BLOCK_HDR] = {0};
     wr32le(h + 1, (uint32_t)raw);
     wr32le(h + 5, (uint32_t)raw);
@@ -423,7 +448,7 @@ int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
 {
     if (c->finished) return LZR_ERR_PARAM;
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
-    c->crc = lzr_crc32(c->crc, src, n);   /* of the original content */
+    xxh64_update(&c->xs, src, n);   /* of the original content */
     c->total_in += n;
     sink_ctx s = {c, out};
     if (c->x86tmp) return x86_run(&c->x86, src, n, 0, c->x86tmp, write_raw, &s);
@@ -448,7 +473,7 @@ int lzr_cctx_end(lzr_cctx *c, lzr_buf *out)
     }
     uint8_t t[LZR_BLOCK_HDR + 4] = {2};
     wr32le(t + 5, 4);
-    wr32le(t + LZR_BLOCK_HDR, c->crc);
+    wr32le(t + LZR_BLOCK_HDR, (uint32_t)xxh64_digest(&c->xs));
     c->finished = 1;
     return buf_append(out, t, sizeof(t));
 }

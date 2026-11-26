@@ -26,16 +26,17 @@ static inline unsigned highbit32(uint32_t v) { return 31u - (unsigned)__builtin_
 #define LZR_MIN_MATCH   4                      /* new-offset matches */
 #define LZR_ML_BASE     2                      /* smallest codable match (repeat offsets) */
 #define LZR_NUM_REPS    3
+#define LZR_LIKELY(x) __builtin_expect(!!(x), 1)
+
+/* Hot decode loops are compiled twice on x86-64, the second time with BMI2
+ * (shlx/shrx/bzhi: variable shifts and bit-field masks in one instruction),
+ * and picked at run time, as zstd does. */
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(LZR_NO_BMI2)
+#define LZR_BMI2_DISPATCH 1
+#define LZR_TARGET_BMI2 __attribute__((target("bmi2")))
+#define LZR_HAS_BMI2() __builtin_cpu_supports("bmi2")
+#endif
 #define LZR_SLACK       32                     /* over-allocation for wildcopy   */
-
-/* ---- rANS parameters ---- */
-#define RANS_SCALE_BITS 12
-#define RANS_M          (1u << RANS_SCALE_BITS)   /* 4096 */
-#define RANS_L          (1u << 23)                /* lower state bound */
-
-/* Alphabets: literal bytes, and the three sequence code streams. */
-#define ALPHA_LIT   256
-#define ALPHA_CODE  72
 
 /* ---- error codes ---- */
 enum {
@@ -80,11 +81,13 @@ static inline void *big_alloc(size_t n, int zero)
 typedef struct {
     uint8_t *p;
     size_t len, cap;
+    int fixed;          /* memory not ours (e.g. a Python bytes): never realloc */
 } lzr_buf;
 
 static inline int buf_reserve(lzr_buf *b, size_t extra)
 {
     if (b->cap - b->len >= extra) return LZR_OK;
+    if (b->fixed) return LZR_ERR_CORRUPT;   /* more output than announced */
     size_t need = b->len + extra, cap = b->cap ? b->cap : 4096;
     while (cap < need) cap *= 2;
     uint8_t *np = (uint8_t *)realloc(b->p, cap);

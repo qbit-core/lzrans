@@ -1,33 +1,36 @@
 /*
- * lzr.h - public C API of the lzrans core (frame format v4, streaming).
+ * lzr.h - public C API of the lzrans core (frame format v5, streaming).
  *
  * Frame layout (little-endian):
- *   "LZRN" | version u8 (=4) | flags u8 | window_log u8 | reserved u8
+ *   "LZRN" | version u8 (=5) | flags u8 | window_log u8 | reserved u8
  *   [content_size u64]                       if flags & LZR_FLAG_SIZE
  *   block*                                   until an end block
  *
  *   block header: type u8 | raw_len u32 | comp_len u32 | payload[comp_len]
  *     type 0  stored:      payload = raw_len bytes
- *     type 1  compressed:  payload = nseq u32 | nlit u32 |
- *                          literals | ll codes | ml codes | of codes
- *                          (rANS streams, see rans.h) | extra_len u32 | extra bits
- *     type 2  end:         raw_len = 0, payload = CRC32 of all content (u32)
- *     type 4  compressed, token coding (levels 6-9): payload = one
- *                          adaptive range-coded stream of literal / match
- *                          tokens (arc.h); its model, state and the repeat
- *                          offsets carry over between blocks
+ *     type 2  end:         raw_len = 0, payload = low 32 bits of the XXH64
+ *                          (seed 0) of all content (u32)
+ *     type 4  token coding (level 9): one adaptive range-coded stream of
+ *                          literal / match tokens (arc.h); its model, state
+ *                          and the repeat offsets carry over between blocks
+ *     type 5  fast (levels 1-8): nseq u32 | nlit u32 | literal section
+ *                          (huf.h: 4 Huffman streams) | if nseq: ll/ml/of
+ *                          table modes + one backward tANS bit stream of
+ *                          states and extra bits (fse.h, dec.c). Tables and
+ *                          repeat offsets carry over between blocks.
  *   Match lengths are >= LZR_ML_BASE (2); the ml code holds length - 2.
+ *   Types 1 and 3 (older formats) are rejected.
  *
  * Matches may reach back up to 2^window_log bytes, across block borders.
- * The CRC sits at the end so a stream can be produced without knowing its
- * size in advance.
+ * The checksum sits at the end so a stream can be produced without knowing
+ * its size in advance.
  */
 #ifndef LZRANS_LZR_H
 #define LZRANS_LZR_H
 #include "common.h"
 
 #define LZR_MAGIC          "LZRN"
-#define LZR_VERSION        4
+#define LZR_VERSION        5
 #define LZR_FLAG_ENCRYPTED 0x01u   /* reserved: future AEAD envelope       */
 #define LZR_FLAG_SIZE      0x02u   /* header carries the content size       */
 #define LZR_FLAG_X86       0x04u   /* content passed the x86 filter (x86.h) */
@@ -65,6 +68,11 @@ void lzr_dctx_free(lzr_dctx *d);
  * After the end, *consumed (if given) tells how many bytes of src belonged
  * to the frame. */
 int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size_t *consumed);
+/* One-buffer mode: the caller passes this same `out` to every write and
+ * leaves it alone until the end. Output is then decoded in place (the
+ * output is the history): no copy, no history allocation. Call before the
+ * first write. Ignored for x86-filtered frames. */
+int lzr_dctx_set_output(lzr_dctx *d, lzr_buf *out);
 
 /* Parse the frame header only. Returns header length, or LZR_ERR_*. */
 int lzr_frame_header(const uint8_t *src, size_t n, int *window_log, uint8_t *flags, int64_t *content_size);
