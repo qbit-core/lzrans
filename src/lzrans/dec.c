@@ -131,16 +131,58 @@ static inline void copy_lits(uint8_t *o, const uint8_t *lp, size_t ll)
         else { range -= bound_; code -= bound_; *pp_ = (arc_p)(p_ - (p_ >> ARC_SHIFT)); b = 1; } \
         RC_NORM();                                                             \
     } while (0)
-#define RC_TREE(probs, nbits, out) do {                                        \
-        unsigned m_ = 1, b_;                                                   \
-        for (unsigned i_ = 0; i_ < (nbits); i_++) { RC_BIT(&(probs)[m_], b_); m_ = (m_ << 1) | b_; } \
-        out = m_ - (1u << (nbits));                                            \
+/* Branchless decisions for tree bits (literals, lengths, distances),
+ * whose outcomes are hard to predict. Same arithmetic as RC_BIT.
+ * RC_SEL sets m = all ones if the bit is 0 (code < bound), else 0, and
+ * range/code to bound/code or range - bound/code - bound. RC_PUPD then
+ * updates p: bit 0 p += (ONE - p) >> SHIFT, bit 1 p -= p >> SHIFT; both
+ * are p - ((p - k) >> SHIFT) with an arithmetic shift, k = ARC_K0 for
+ * bit 0 and 0 for bit 1 (checked for every p in 0..ONE). */
+#define ARC_K0 (ARC_ONE - (1u << ARC_SHIFT) + 1)
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(LZR_NO_ASM)
+/* The compiler does not reliably emit conditional moves here. */
+#define RC_SEL(m, bound) do {                                                  \
+        uint32_t rg_ = (bound), r1_ = range - (bound), c1_ = code - (bound);   \
+        __asm__("cmpl %[bd], %[cd]\n\t"                                        \
+                "cmovael %[xr], %[rg]\n\t"                                     \
+                "cmovael %[xc], %[cd]\n\t"                                     \
+                "sbbl %[mm], %[mm]"                                            \
+                : [rg] "+r"(rg_), [cd] "+r"(code), [mm] "=r"(m)               \
+                : [bd] "r"(bound), [xr] "r"(r1_), [xc] "r"(c1_)               \
+                : "cc");                                                       \
+        range = rg_;                                                           \
     } while (0)
-#define RC_RTREE(probs, nbits, out) do {                                       \
-        unsigned m_ = 1, b_, v_ = 0;                                           \
-        for (unsigned i_ = 0; i_ < (nbits); i_++) { RC_BIT(&(probs)[m_], b_); m_ = (m_ << 1) | b_; v_ |= b_ << i_; } \
-        out = v_;                                                              \
+#else
+#define RC_SEL(m, bound) do {                                                  \
+        m = 0u - (uint32_t)(code < (bound));                                   \
+        range = (bound) + (~m & (range - 2 * (bound)));                        \
+        code -= ~m & (bound);                                                  \
     } while (0)
+#endif
+#define RC_PUPD(p, m) ((arc_p)((p) - (uint32_t)((int32_t)((p) - ((m) & ARC_K0)) >> ARC_SHIFT)))
+/* Bit trees. The next node is probs[2m] or probs[2m + 1]; both are loaded
+ * while the current bit is decoded and the right one is picked after, so
+ * the load is off the bit-to-bit dependency chain. rev: the bits are the
+ * value LSB first (reverse tree); else MSB first. */
+#define RC_TREE_(probs, nbits, out, rev) do {                                  \
+        arc_p *pb_ = (probs);                                                  \
+        unsigned m_ = 1, v_ = 0;                                               \
+        uint32_t pc_ = pb_[1];                                                 \
+        for (unsigned i_ = 0; i_ < (nbits); i_++) {                            \
+            uint32_t bd_ = (range >> ARC_PBITS) * pc_, mm_, pl_ = 0, ph_ = 0;  \
+            if (i_ + 1 < (nbits)) { pl_ = pb_[2 * m_]; ph_ = pb_[2 * m_ + 1]; } \
+            RC_SEL(mm_, bd_);                                                  \
+            pb_[m_] = RC_PUPD(pc_, mm_);                                       \
+            unsigned b_ = mm_ + 1;                                             \
+            if (rev) v_ |= b_ << i_;                                           \
+            m_ = 2 * m_ + b_;                                                  \
+            pc_ = ph_ ^ ((pl_ ^ ph_) & mm_);                                   \
+            RC_NORM();                                                         \
+        }                                                                      \
+        out = (rev) ? v_ : m_ - (1u << (nbits));                               \
+    } while (0)
+#define RC_TREE(probs, nbits, out) RC_TREE_(probs, nbits, out, 0)
+#define RC_RTREE(probs, nbits, out) RC_TREE_(probs, nbits, out, 1)
 #define RC_LEN(l, ps, out) do {                                                \
         unsigned b0_, v0_;                                                     \
         RC_BIT(&(l)->choice, b0_);                                             \
@@ -150,7 +192,7 @@ static inline void copy_lits(uint8_t *o, const uint8_t *lp, size_t ll)
         RC_TREE((l)->high, 8, v0_); out = 18 + v0_;                            \
     } while (0)
 
-static int decode_tokens(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+static __attribute__((noinline)) int decode_tokens(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
     arc_dec r;
     if (arcd_init(&r, in, avail)) return LZR_ERR_CORRUPT;
@@ -171,16 +213,37 @@ static int decode_tokens(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
             arc_p *probs = m->lit[(o > hist ? o[-1] : 0) >> 5];
             unsigned v = 1;
             if (s >= 7) {
+                /* matched literal: probs[0x100 + (match bit << 8) + v]
+                 * while the decoded bits equal the match byte's, then
+                 * probs[v]; offs drops to 0 at the first difference */
                 if (rep0 > (size_t)(o - hist)) { err = 1; break; }
-                unsigned mbyte = o[-(ptrdiff_t)rep0];
-                for (int i = 7; i >= 0; i--) {
-                    unsigned mb = (mbyte >> i) & 1;
-                    RC_BIT(&probs[256 + (mb << 8) + v], bit);
-                    v = (v << 1) | bit;
-                    if (bit != mb) break;
+                unsigned mbyte = (unsigned)o[-(ptrdiff_t)rep0] << 1, offs = 0x100;
+                unsigned idx = offs + (mbyte & offs) + 1;
+                uint32_t pc = probs[idx];
+                for (int i = 0; i < 8; i++) {
+                    /* the next index for either outcome, loaded early */
+                    unsigned mb = mbyte & offs, mn = mbyte << 1;
+                    unsigned o0 = offs & ~mb, o1 = offs & mb;
+                    uint32_t pl = 0, ph = 0;
+                    if (i < 7) {   /* index < 0x300 */
+                        pl = probs[o0 + (mn & o0) + 2 * v];
+                        ph = probs[o1 + (mn & o1) + 2 * v + 1];
+                    }
+                    uint32_t bd = (range >> ARC_PBITS) * pc, mm;
+                    RC_SEL(mm, bd);
+                    probs[idx] = RC_PUPD(pc, mm);
+                    bit = mm + 1;
+                    v = 2 * v + bit;
+                    offs = o1 ^ ((o0 ^ o1) & mm);
+                    idx = offs + (mn & offs) + v;
+                    pc = ph ^ ((pl ^ ph) & mm);
+                    mbyte = mn;
+                    RC_NORM();
                 }
+            } else {
+                RC_TREE(probs, 8, v);
             }
-            while (v < 256) { RC_BIT(&probs[v], bit); v = (v << 1) | bit; }
+            v &= 0xFF;
             *o++ = (uint8_t)v;
             s = tok_after_lit(s);
             continue;

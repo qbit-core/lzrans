@@ -5,7 +5,7 @@ Streaming LZ77 compressor with two entropy back ends: a fast one
 CPython native extension.
 
 **Goal:** levels 1-8 match zstd -19 in ratio and speed; level 9 beats
-xz -9 in ratio. Streaming throughout. Status: v0.7 phase 8 (see Roadmap).
+xz -9 in ratio. Streaming throughout. Status: v0.8 phase 9 (see Roadmap).
 
 ```python
 import lzrans
@@ -45,7 +45,7 @@ python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 | Tokens | Sequences of (literal run, match length, offset); offsets 0-2 are the repeat offsets. |
 | Entropy coding, levels 1-8 | Block type 5, `huf.c` + `fse.c` (zstd-like): literals as 4 canonical Huffman streams (codes <= 11 bits, table reused across blocks when cheaper); literal-length / match-length / offset codes by table-driven ANS (tANS, 512 states, tables new / repeated / single-symbol per block) sharing one backward bit stream with the raw extra bits. |
 | Entropy coding, level 9 | Block type 4, `arc.h`: the coding layer of LZMA on our tokens. One adaptive binary range coder (12-bit probabilities); a 12-value state of the last token kinds selects literal/match/rep decisions; literals use the previous byte's top 3 bits as context and, right after a match, the byte at rep0 ("matched literal"); match lengths 2-273 by low/mid/high trees per position & 3; distances by 6-bit slot (context: length) plus reverse-tree or direct + 4 aligned bits. The model, state and repeat offsets carry over between blocks. |
-| Decoding | `dec.c`: type 5: Huffman literals into an array (4 streams interleaved, one table lookup per symbol); then one loop decodes each sequence (one bit-stream read in the common case, branch-free repeat offsets) and copies with fixed 16-byte chunks. The hot loops are also compiled for BMI2 and picked at run time. Type 4: one token loop. One-shot `decompress` decodes straight into the output buffer (no history copy). |
+| Decoding | `dec.c`: type 5: Huffman literals into an array (4 streams interleaved, one table lookup per symbol); then one loop decodes each sequence (one bit-stream read in the common case, branch-free repeat offsets) and copies with fixed 16-byte chunks. The hot loops are also compiled for BMI2 and picked at run time. Type 4: one token loop; tree bits (literals, lengths, distance slots) are decoded without branches (conditional moves), and the next tree node's probabilities are loaded before the current bit is known. One-shot `decompress` decodes straight into the output buffer (no history copy). |
 | Streaming | Input is consumed and output produced block by block. Encoder memory is about 2x window + match tables (levels 1-6: 5 bytes per row slot, up to 40 MB at level 6); decoder memory is about 2x window. |
 | Integrity | Low 32 bits of XXH64 (`xxh64.h`, same value as zstd's frame checksum) in the end block, plus structural checks: every bit stream must be consumed exactly. (`lzrans.crc32` stays available as a zlib-compatible helper.) |
 
@@ -83,4 +83,5 @@ are rejected for now.
 | P6 | Block type 5 (Huffman + tANS) for levels 1-8: zstd -19 class ratio and speed | done |
 | P7 | Row match finder for levels 1-6 (2-5x faster compression at about the same ratio) | done |
 | P8 | Parallel jobs for levels 1-6 (threads > 1, format unchanged) + single-thread micro-optimizations | done |
-| P9 | Type 4 decoder speed; compression speed of the priced parser | planned |
+| P9 | Type 4 decoder speed (branch-free tree decoding; format and output unchanged): 1.2-1.6x, about xz -9 decode speed or faster | done |
+| P10 | Compression speed of the priced parser (level 9) | planned |
