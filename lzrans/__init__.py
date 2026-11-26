@@ -33,4 +33,4 @@ __all__ = [
     "LzransError", "ChecksumError",
     "BLOCK_SIZE", "FLAG_ENCRYPTED", "FLAG_SIZE", "FLAG_X86", "FORMAT_VERSION",
 ]
-__version__ = "0.3.0.dev0"
+__version__ = "0.4.0.dev0"

@@ -37,6 +37,11 @@
 #define ARC_SHIFT 5
 #endif
 #define ARC_TOP (1u << 24)
+/* The parser prices from a shadow model updated with a slower rate: a
+ * smoother estimate than the coder's own (+0.1-0.3% ratio). */
+#ifndef ARC_DSHIFT
+#define ARC_DSHIFT (ARC_SHIFT + 1)
+#endif
 
 #define TOK_STATES 12
 #define TOK_PB 2                     /* position bits for contexts */
@@ -116,8 +121,8 @@ static inline void arce_shift_low(arc_enc *e)
 static inline void arce_bit(arc_enc *e, arc_p *pr, unsigned bit)
 {
     if (e->dry) {
-        if (!bit) *pr = (arc_p)(*pr + ((ARC_ONE - *pr) >> ARC_SHIFT));
-        else *pr = (arc_p)(*pr - (*pr >> ARC_SHIFT));
+        if (!bit) *pr = (arc_p)(*pr + ((ARC_ONE - *pr) >> ARC_DSHIFT));
+        else *pr = (arc_p)(*pr - (*pr >> ARC_DSHIFT));
         return;
     }
     uint32_t bound = (e->range >> ARC_PBITS) * *pr;

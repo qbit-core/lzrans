@@ -11,11 +11,15 @@
  *   2. parse_pass()    Forward dynamic programming over segments of up to
  *                      OPT_NUM positions. Each node keeps the cheapest
  *                      price to reach it, how it was reached (literal or
- *                      match length + offset) and the repeat offsets on
- *                      that path. Prices come from the symbol statistics
- *                      of the previous pass/block (log2 of frequencies).
- *   3. With 2 passes, the first pass only gathers statistics for the
- *      second, which produces the real sequences.
+ *                      match length + offset) and the repeat offsets
+ *                      (and token coder state) on that path. Block type 4
+ *                      (levels 7-9 by default): prices from a shadow copy
+ *                      of the adaptive token model, advanced over the
+ *                      tokens chosen so far before each segment. Block
+ *                      type 1: prices from the symbol statistics of the
+ *                      previous pass/block (log2 of frequencies).
+ *   3. With 2 passes (type 1), the first pass only gathers statistics for
+ *      the second, which produces the real sequences.
  */
 #include "enc_internal.h"
 #include <math.h>
@@ -23,9 +27,11 @@
 #include <pthread.h>
 #endif
 
+#ifndef OPT_NUM
 #define OPT_NUM     4096
+#endif
 #define MAX_CAND    48
-#define NODE_EXTRA  (300 + 16)
+#define NODE_EXTRA  (600 + 16)    /* match + literal + rep0 reaches 2 * 273 + 1 past */
 #define BITCOST     256                 /* price units per bit */
 #define PRICE_INF   0x3FFFFFFF
 
@@ -46,6 +52,7 @@ typedef struct {
 typedef struct {
     int32_t price;
     uint32_t from, ml, off, litlen;
+    uint32_t ml2;          /* != 0: match, 1 literal, then rep0 of this length */
     uint32_t reps[LZR_NUM_REPS];
     uint32_t state;        /* token model state (block type 4) on this path */
 } onode;
@@ -56,6 +63,9 @@ typedef struct {
 
 #ifndef LZR_OPT_FULL
 #define LZR_OPT_FULL 273
+#endif
+#ifndef SEG_MIN
+#define SEG_MIN 512            /* shortest segment ended early (type 4) */
 #endif
 #ifndef LZR_REP_MIN
 #define LZR_REP_MIN 2        /* repeat-offset matches may be this short */
@@ -92,6 +102,7 @@ typedef struct {
     tok_model pm;                  /* shadow model                          */
     uint32_t dreps[LZR_NUM_REPS];  /* repeat offsets at dpos                 */
     size_t dpos, dseq;             /* shadow position / next sequence        */
+    size_t dlit;                   /* start of that sequence's literal run   */
     int32_t litp[8][256];          /* plain literal, per context             */
     int32_t lenp[2][TOK_POS][TOK_MAXLEN + 1];   /* [0] new dist, [1] repeat  */
     int32_t slotp[4][TOK_DIST_SLOTS];
@@ -240,8 +251,8 @@ static void shadow_advance(lzr_cctx *c, opt_state *st, size_t bs, size_t ns, siz
     const uint8_t *buf = c->buf;
     size_t p = st->dpos;
     for (; st->dseq < ns; st->dseq++) {
-        size_t i = st->dseq;
-        for (size_t t = 0; t < c->seq_ll[i]; t++, p++)
+        size_t i = st->dseq, mpos = st->dlit + c->seq_ll[i];   /* literals before dpos are done */
+        for (; p < mpos; p++)
             tok_enc_lit(&e, m, buf + p, p ? buf[p - 1] : 0, st->dreps[0], (unsigned)(p - bs) & 3);
         uint32_t off = c->seq_dist[i];
         commit_offset(st->dreps, off);
@@ -253,6 +264,7 @@ static void shadow_advance(lzr_cctx *c, opt_state *st, size_t bs, size_t ns, siz
             p += len;
             ml -= len;
         }
+        st->dlit = p;
     }
     for (; p < upto; p++) tok_enc_lit(&e, m, buf + p, p ? buf[p - 1] : 0, st->dreps[0], (unsigned)(p - bs) & 3);
     st->dpos = p;
@@ -599,6 +611,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
         N[0].price = adaptive ? 0 : llp(st, ll0);
         N[0].litlen = ll0;
         N[0].ml = 0;
+        N[0].ml2 = 0;
         memcpy(N[0].reps, c->reps, sizeof(c->reps));
         size_t last = 0;
         int forced = 0;
@@ -606,6 +619,9 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
         uint32_t f_len = 0, f_off = 0;
 
         for (size_t i = 0; i < seg; i++) {
+            /* Every path passes through i: end the segment here, so the
+             * next one is priced from a fresher model (block type 4). */
+            if (adaptive && i >= SEG_MIN && last == i) break;
             onode *n = &N[i];
             /* Repeat offsets on the cheapest path to i are derived here,
              * once, rather than on every tentative update. */
@@ -613,7 +629,8 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 const onode *f = &N[n->from];
                 memcpy(n->reps, f->reps, sizeof(n->reps));
                 if (n->ml) commit_offset(n->reps, n->off);
-                n->state = !n->ml ? tok_after_lit(f->state)
+                if (n->ml2) n->state = tok_after_rep(tok_after_lit(!n->ml ? f->state : n->off < LZR_NUM_REPS ? tok_after_rep(f->state) : tok_after_match(f->state)));
+                else n->state = !n->ml ? tok_after_lit(f->state)
                            : n->ml == 1 ? tok_after_short(f->state)
                            : n->off < LZR_NUM_REPS ? tok_after_rep(f->state) : tok_after_match(f->state);
             }
@@ -633,7 +650,25 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             }
             if (lp < N[i + 1].price) {
                 onode *t = &N[i + 1];
-                t->price = lp; t->from = (uint32_t)i; t->ml = 0; t->off = 0; t->litlen = n->litlen + 1;
+                t->price = lp; t->from = (uint32_t)i; t->ml = 0; t->off = 0; t->litlen = n->litlen + 1; t->ml2 = 0;
+            }
+            /* literal + rep0, for when the literal is not the cheapest way
+             * to i + 1 */
+            if (adaptive && cur + 3 <= be && n->reps[0] < cur + 1 &&
+                cp[1] == cp[1 - (ptrdiff_t)n->reps[0]] && cp[2] == cp[2 - (ptrdiff_t)n->reps[0]]) {
+                uint32_t d = n->reps[0], lim = (uint32_t)(be - cur - 1), len2;
+                if (lim > TOK_MAXLEN) lim = TOK_MAXLEN;
+                len2 = (uint32_t)match_len(cp + 1 - d, cp + 1, lim);
+                unsigned s2 = tok_after_lit(s), ps2 = (ps + 1) & (TOK_POS - 1);
+                int32_t price = lp + arc_bit_price(st, pm->is_match[s2][ps2], 1) + arc_bit_price(st, pm->is_rep[s2], 1) +
+                                arc_bit_price(st, pm->is_rep0[s2], 0) + arc_bit_price(st, pm->is_rep0_long[s2][ps2], 1) +
+                                st->lenp[1][ps2][len2];
+                size_t t = i + 1 + len2;
+                while (last < t) N[++last].price = PRICE_INF;
+                if (price < N[t].price) {
+                    onode *tn = &N[t];
+                    tn->price = price; tn->from = (uint32_t)i; tn->ml = 0; tn->off = 0; tn->litlen = 0; tn->ml2 = len2;
+                }
             }
             /* short rep: the byte at rep0, as a 1-byte match */
             if (adaptive && n->reps[0] <= cur && cp[-(ptrdiff_t)n->reps[0]] == cp[0]) {
@@ -641,7 +676,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                              arc_bit_price(st, pm->is_rep0[s], 0) + arc_bit_price(st, pm->is_rep0_long[s][ps], 0);
                 if (sp < N[i + 1].price) {
                     onode *t = &N[i + 1];
-                    t->price = sp; t->from = (uint32_t)i; t->ml = 1; t->off = 0; t->litlen = 0;
+                    t->price = sp; t->from = (uint32_t)i; t->ml = 1; t->off = 0; t->litlen = 0; t->ml2 = 0;
                 }
             }
 
@@ -716,6 +751,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                  * cutting a long match short almost never pays, and this
                  * bounds the work per position. */
                 uint32_t Lmax = cl[k], Lcut = cl[k] > LZR_OPT_FULL ? LZR_OPT_FULL : cl[k];
+                int32_t full = 0;
                 for (uint32_t L = cmin[k]; L <= Lmax; L = (L < Lcut || L == Lmax) ? L + 1 : Lmax) {
                     int32_t price;
                     if (!adaptive) price = bo + st->ml_p[L];
@@ -725,7 +761,34 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                     while (last < t) N[++last].price = PRICE_INF;
                     if (price < N[t].price) {
                         onode *tn = &N[t];
-                        tn->price = price; tn->from = (uint32_t)i; tn->ml = L; tn->off = co[k]; tn->litlen = 0;
+                        tn->price = price; tn->from = (uint32_t)i; tn->ml = L; tn->off = co[k]; tn->litlen = 0; tn->ml2 = 0;
+                    }
+                    if (L == Lmax) full = price;
+                }
+                /* match + literal + rep0 (the literal breaks the match, the
+                 * same distance continues after it) */
+                if (adaptive && Lmax <= TOK_MAXLEN && Lmax + 3 <= maxlen) {
+                    uint32_t d = co[k] < LZR_NUM_REPS ? n->reps[co[k]] : co[k] - 2;
+                    const uint8_t *q = cp + Lmax + 1;
+                    if (q[0] == q[-(ptrdiff_t)d] && q[1] == q[1 - (ptrdiff_t)d]) {
+                        uint32_t lim = maxlen - Lmax - 1, len2;
+                        if (lim > TOK_MAXLEN) lim = TOK_MAXLEN;
+                        len2 = (uint32_t)match_len(q - d, q, lim);
+                        unsigned s1 = co[k] < LZR_NUM_REPS ? tok_after_rep(s) : tok_after_match(s);
+                        unsigned ps1 = (ps + Lmax) & (TOK_POS - 1), ps2 = (ps1 + 1) & (TOK_POS - 1);
+                        unsigned s2 = tok_after_lit(s1);
+                        int32_t price = full + arc_bit_price(st, pm->is_match[s1][ps1], 0) +
+                                        matched_price(st, pm->lit[q[-2] >> 5], q[-1], q[-1 - (ptrdiff_t)d]) +
+                                        arc_bit_price(st, pm->is_match[s2][ps2], 1) + arc_bit_price(st, pm->is_rep[s2], 1) +
+                                        arc_bit_price(st, pm->is_rep0[s2], 0) + arc_bit_price(st, pm->is_rep0_long[s2][ps2], 1) +
+                                        st->lenp[1][ps2][len2];
+                        size_t t = i + Lmax + 1 + len2;
+                        while (last < t) N[++last].price = PRICE_INF;
+                        if (price < N[t].price) {
+                            onode *tn = &N[t];
+                            tn->price = price; tn->from = (uint32_t)i; tn->ml = Lmax; tn->off = co[k]; tn->litlen = 0;
+                            tn->ml2 = len2;
+                        }
                     }
                 }
             }
@@ -737,9 +800,15 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
         /* Backtrack the cheapest path, then emit it forwards. */
         size_t cnt = 0, j = endi;
         while (j > 0) {
-            if (N[j].ml) {
-                st->path[cnt][0] = N[j].from; st->path[cnt][1] = N[j].ml; st->path[cnt][2] = N[j].off;
+            if (N[j].ml2) {
+                st->path[cnt][0] = N[j].from + N[j].ml + 1; st->path[cnt][1] = N[j].ml2; st->path[cnt][2] = 0;
                 cnt++;
+            }
+            if (N[j].ml || N[j].ml2) {
+                if (N[j].ml) {
+                    st->path[cnt][0] = N[j].from; st->path[cnt][1] = N[j].ml; st->path[cnt][2] = N[j].off;
+                    cnt++;
+                }
                 j = N[j].from;
             } else {
                 j--;
@@ -836,7 +905,7 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
         if (c->adaptive) {
             st->pm = *c->tm;
             memcpy(st->dreps, c->reps, sizeof(st->dreps));
-            st->dpos = bs;
+            st->dpos = st->dlit = bs;
             st->dseq = 0;
         }
         ns = parse_pass(c, st, bs, be, nlit_out);
