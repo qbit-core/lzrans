@@ -1,4 +1,5 @@
 """Build script for the lzrans C extension (setuptools ext_modules)."""
+import glob
 import sys
 from setuptools import Extension, setup
 
@@ -16,6 +17,7 @@ setup(
                 "src/lzrans/rans.c",
                 "src/lzrans/crc32.c",
             ],
+            depends=sorted(glob.glob("src/lzrans/*.h")),   # rebuild when a header changes
             include_dirs=["src/lzrans"],
             extra_compile_args=extra,
             libraries=[] if sys.platform == "win32" else ["m", "pthread"],

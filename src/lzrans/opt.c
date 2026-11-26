@@ -56,6 +56,9 @@ typedef struct {
 #ifndef LZR_OPT_FULL
 #define LZR_OPT_FULL 32
 #endif
+#ifndef LZR_REP_MIN
+#define LZR_REP_MIN 2        /* repeat-offset matches may be this short */
+#endif
 #define ML_TABLE 512                     /* > max nice length */
 #define LL_TABLE 4096
 
@@ -82,6 +85,10 @@ typedef struct {
     prices_t pr;
     int32_t ml_p[ML_TABLE];   /* match-length price incl. extra bits, per pass */
     int32_t ll_p[LL_TABLE];   /* literal-run price incl. extra bits           */
+    /* adaptive literals (block type 3): prices from the model state at the
+     * start of the block */
+    uint16_t bitc[ARC_ONE >> 4];   /* price of a 0 bit by probability / 16 */
+    uint32_t litc[256];            /* plain literal                          */
 } opt_state;
 
 int opt_init(lzr_cctx *c)
@@ -107,7 +114,44 @@ int opt_init(lzr_cctx *c)
     st->nodes = (onode *)malloc((OPT_NUM + NODE_EXTRA) * sizeof(onode));
     st->path = malloc((OPT_NUM + NODE_EXTRA) * sizeof(*st->path));
     if (!st->nodes || !st->path) return LZR_ERR_NOMEM;
+    for (unsigned i = 0; i < (ARC_ONE >> 4); i++)
+        st->bitc[i] = (uint16_t)(-log2((i * 16 + 8) / (double)ARC_ONE) * BITCOST + 0.5);
     return LZR_OK;
+}
+
+static inline uint32_t arc_bit_price(const opt_state *st, arc_p p, unsigned bit)
+{
+    return st->bitc[(bit ? ARC_ONE - p : p) >> 4];
+}
+
+/* Plain literal prices from the live model (lane 0 stands in for all). */
+static void adaptive_lit_prices(lzr_cctx *c, opt_state *st)
+{
+    const arc_p *pr = c->am->plain[0];
+    uint32_t node[256];   /* price of reaching tree node m */
+    node[1] = 0;
+    for (unsigned m = 1; m < 128; m++) {
+        node[2 * m] = node[m] + arc_bit_price(st, pr[m], 0);
+        node[2 * m + 1] = node[m] + arc_bit_price(st, pr[m], 1);
+    }
+    for (unsigned b = 0; b < 256; b++) {
+        unsigned m = 128 + (b >> 1);
+        st->litc[b] = node[m] + arc_bit_price(st, pr[m], b & 1);
+    }
+}
+
+/* First literal after a match (coded against the match byte, see arc.h). */
+static uint32_t adaptive_matched_price(const opt_state *st, const arc_p *pr, unsigned byte, unsigned mbyte)
+{
+    uint32_t price = 0;
+    unsigned m = 1, same = 1;
+    for (int i = 7; i >= 0; i--) {
+        unsigned b = (byte >> i) & 1, mb = (mbyte >> i) & 1;
+        price += arc_bit_price(st, same ? pr[256 + (mb << 8) + m] : pr[m], b);
+        m = (m << 1) | b;
+        same &= (b == mb);
+    }
+    return price;
 }
 
 void opt_free(lzr_cctx *c)
@@ -346,7 +390,7 @@ static void prices_from_parse(lzr_cctx *c, prices_t *pr, size_t ns, size_t nlit)
     for (size_t i = 0; i < nlit; i++) lit[c->lits[i]]++;
     for (size_t i = 0; i < ns; i++) {
         llc[val_code(c->seq_ll[i], &nb, &ex)]++;
-        mlc[val_code(c->seq_ml[i] - LZR_MIN_MATCH, &nb, &ex)]++;
+        mlc[val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex)]++;
         uint32_t off = c->seq_dist[i];
         ofc[off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &nb, &ex)]++;
     }
@@ -373,9 +417,9 @@ static inline int32_t of_price(const prices_t *pr, uint32_t off)
 
 static void build_tables(opt_state *st)
 {
-    for (uint32_t L = LZR_MIN_MATCH; L < ML_TABLE; L++) {
+    for (uint32_t L = LZR_ML_BASE; L < ML_TABLE; L++) {
         unsigned nb; uint32_t ex;
-        unsigned mc = val_code(L - LZR_MIN_MATCH, &nb, &ex);
+        unsigned mc = val_code(L - LZR_ML_BASE, &nb, &ex);
         st->ml_p[L] = (int32_t)(st->pr.mlc[mc] + nb * BITCOST);
     }
     for (uint32_t L = 0; L < LL_TABLE; L++) st->ll_p[L] = ll_price(&st->pr, L);
@@ -437,7 +481,11 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
 
             /* literal transition (charges the change in literal-run cost) */
             if (last < i + 1) { N[i + 1].price = PRICE_INF; last = i + 1; }
-            int32_t lp = n->price + (int32_t)pr->lit[*cp] + llp(st, n->litlen + 1) - llp(st, n->litlen);
+            uint32_t lit_price;
+            if (!c->adaptive) lit_price = pr->lit[*cp];
+            else if (n->ml) lit_price = adaptive_matched_price(st, c->am->matched[cp[-1] >> 5], *cp, cp[-(ptrdiff_t)n->reps[0]]);
+            else lit_price = st->litc[*cp];
+            int32_t lp = n->price + (int32_t)lit_price + llp(st, n->litlen + 1) - llp(st, n->litlen);
             if (lp < N[i + 1].price) {
                 onode *t = &N[i + 1];
                 t->price = lp; t->from = (uint32_t)i; t->ml = 0; t->off = 0; t->litlen = n->litlen + 1;
@@ -450,10 +498,10 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             uint32_t best_len = 0, best_off = 0;
             for (uint32_t r = 0; r < LZR_NUM_REPS; r++) {
                 uint32_t d = n->reps[r];
-                if (d > cur || d > c->wsize || rd32(cp - d) != rd32(cp)) continue;
+                if (d > cur || d > c->wsize || cp[-(ptrdiff_t)d] != cp[0] || cp[1 - (ptrdiff_t)d] != cp[1]) continue;
                 uint32_t len = (uint32_t)match_len(cp - d, cp, maxlen);
-                if (len < LZR_MIN_MATCH) continue;
-                cl[nc] = len; co[nc] = r; cmin[nc] = LZR_MIN_MATCH; nc++;
+                if (len < LZR_REP_MIN) continue;
+                cl[nc] = len; co[nc] = r; cmin[nc] = LZR_REP_MIN; nc++;
                 if (len > best_len) { best_len = len; best_off = r; }
             }
             uint32_t prevlen = LZR_MIN_MATCH - 1;
@@ -588,6 +636,7 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
             memcpy(c->reps, saved, sizeof(saved));
         }
         build_tables(st);
+        if (c->adaptive) adaptive_lit_prices(c, st);
         ns = parse_pass(c, st, bs, be, nlit_out);
     }
     TACC(lzr_t_parse);

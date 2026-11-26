@@ -8,7 +8,7 @@
  *
  * Sequence fields:
  *   LL  literal run length          -> ll code
- *   ML  match length - MIN_MATCH    -> ml code
+ *   ML  match length - LZR_ML_BASE  -> ml code
  *   OF  0,1,2 = repeat offset #0..2; otherwise 3 + code(distance - 1)
  */
 #ifndef LZRANS_CODES_H

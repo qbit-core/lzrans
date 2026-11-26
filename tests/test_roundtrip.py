@@ -269,3 +269,20 @@ def test_threads_validated():
         lzrans.compress(b"x", threads=-1)
     with pytest.raises(ValueError):
         lzrans.Compressor(threads=99)
+
+
+@pytest.mark.parametrize("level", [6, 9])
+def test_adaptive_model_survives_stored_blocks(level):
+    # Levels 6-9 carry an adaptive literal model across blocks; incompressible
+    # blocks are stored and must leave it untouched on both sides.
+    rnd = random.Random(7)
+    parts = []
+    for i in range(6):
+        parts.append(_text(BS + 1234 * i, seed=i))
+        parts.append(rnd.randbytes(BS // 2 + 17 * i))
+    data = b"".join(parts)
+    blob = lzrans.compress(data, level=level)
+    assert lzrans.decompress(blob) == data
+    d = lzrans.Decompressor()
+    out = b"".join(d.decompress(blob[i:i + 1000]) for i in range(0, len(blob), 1000))
+    assert out == data and d.eof
