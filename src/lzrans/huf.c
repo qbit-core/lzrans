@@ -239,16 +239,36 @@ static inline __attribute__((always_inline)) size_t huf_decode_impl(const uint8_
     } while (0)
 #define HREFILL(S) do { p[S] += pos[S] >> 3; pos[S] &= 7; } while (0)
 
-    /* main loop: 4 symbols per stream per round (<= 44 + 7 bits), streams
-     * interleaved for instruction-level parallelism */
+    /* main loop: 4 symbols per stream per round (<= 44 + 7 bits, so one
+     * 64-bit load per stream and round), streams interleaved for
+     * instruction-level parallelism. Everything lives in scalars: a byte
+     * store may alias anything, so values in memory would be reloaded. */
     size_t rounds = (hi[3] - lo[3]) / 4, i;
-    for (i = 0; i < rounds; i++) {
-        HSTEP(0); HSTEP(1); HSTEP(2); HSTEP(3);
-        HSTEP(0); HSTEP(1); HSTEP(2); HSTEP(3);
-        HSTEP(0); HSTEP(1); HSTEP(2); HSTEP(3);
-        HSTEP(0); HSTEP(1); HSTEP(2); HSTEP(3);
-        HREFILL(0); HREFILL(1); HREFILL(2); HREFILL(3);
-        if (p[0] > end[0] || p[1] > end[1] || p[2] > end[2] || p[3] > end[3]) return 0;
+    {
+        const uint8_t *p0 = p[0], *p1 = p[1], *p2 = p[2], *p3 = p[3];
+        unsigned s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        uint8_t *o0 = o[0], *o1 = o[1], *o2 = o[2], *o3 = o[3];
+#define HSYM(C, S, O, K)                                                       \
+    do {                                                                       \
+        uint16_t e_ = dt[(C >> S) & mask];                                     \
+        O[K] = (uint8_t)e_;                                                    \
+        S += e_ >> 8;                                                          \
+    } while (0)
+        for (i = 0; i < rounds; i++) {
+            const uint64_t c0 = ld64(p0), c1 = ld64(p1), c2 = ld64(p2), c3 = ld64(p3);
+            HSYM(c0, s0, o0, 0); HSYM(c1, s1, o1, 0); HSYM(c2, s2, o2, 0); HSYM(c3, s3, o3, 0);
+            HSYM(c0, s0, o0, 1); HSYM(c1, s1, o1, 1); HSYM(c2, s2, o2, 1); HSYM(c3, s3, o3, 1);
+            HSYM(c0, s0, o0, 2); HSYM(c1, s1, o1, 2); HSYM(c2, s2, o2, 2); HSYM(c3, s3, o3, 2);
+            HSYM(c0, s0, o0, 3); HSYM(c1, s1, o1, 3); HSYM(c2, s2, o2, 3); HSYM(c3, s3, o3, 3);
+            o0 += 4; o1 += 4; o2 += 4; o3 += 4;
+            p0 += s0 >> 3; s0 &= 7; p1 += s1 >> 3; s1 &= 7;
+            p2 += s2 >> 3; s2 &= 7; p3 += s3 >> 3; s3 &= 7;
+            if (p0 > end[0] || p1 > end[1] || p2 > end[2] || p3 > end[3]) return 0;
+        }
+#undef HSYM
+        p[0] = p0; p[1] = p1; p[2] = p2; p[3] = p3;
+        pos[0] = s0; pos[1] = s1; pos[2] = s2; pos[3] = s3;
+        o[0] = o0; o[1] = o1; o[2] = o2; o[3] = o3;
     }
     for (int s = 0; s < 4; s++) {
         while (o[s] < out + hi[s]) {

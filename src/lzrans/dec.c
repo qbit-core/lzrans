@@ -4,8 +4,7 @@
  * Input is buffered until a whole block is available (its header gives
  * comp_len). Block type 5: the Huffman literals are decoded into an array
  * first; then one loop decodes each sequence from the tANS bit stream
- * (a few sequences ahead, prefetching the match source) and copies its
- * literal run and match with fixed-size chunks. Block type 4: one range
+ * and copies its literal run and match with fixed-size chunks. Block type 4: one range
  * decoder loop. Output goes to a history buffer that keeps the last
  * 2^window_log bytes, or, in one-buffer mode, straight into the output.
  */
@@ -298,7 +297,7 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
     /* Sequence tables: the tANS state step plus the code's base value and
      * extra-bit count in one entry. Offsets: value < 3 is a repeat index,
      * else distance + 3. A single-symbol stream is a one-state table. */
-    seq_dent *tb[3] = {d->sq[0], d->sq[1], d->sq[2]};
+    seq_dent *tb[3] = {d->sq[0], d->sq[1], d->sq[2]};   /* contiguous */
     unsigned tlog[3];
     for (int t = 0; t < 3; t++) {
         const fse_table *T = &d->fse[t];
@@ -308,7 +307,8 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
             unsigned sym = rle[t] ? rsym[t] : T->dt[u].sym;
             seq_dent *e = &tb[t][u];
             e->nb = rle[t] ? 0 : T->dt[u].nb;
-            e->next = rle[t] ? 0 : T->dt[u].base;
+            /* states index the three tables as one array */
+            e->next = (uint16_t)((rle[t] ? 0 : T->dt[u].base) + t * FSE_L);
             if (t == 0) { e->base = d->ct[sym].base; e->xb = d->ct[sym].bits; }
             else if (t == 1) { e->base = d->mt[sym].base + LZR_ML_BASE; e->xb = d->mt[sym].bits; }
             else if (sym < LZR_NUM_REPS) { e->base = sym; e->xb = 0; }
@@ -339,10 +339,10 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
     } while (0)
 
     unsigned sll = BGET(tlog[0]); used += tlog[0];
-    unsigned sml = BGET(tlog[1]); used += tlog[1];
-    unsigned sof = BGET(tlog[2]); used += tlog[2];
+    unsigned sml = BGET(tlog[1]) + FSE_L; used += tlog[1];
+    unsigned sof = BGET(tlog[2]) + 2 * FSE_L; used += tlog[2];
     BRELOAD();
-    const seq_dent *dll = tb[0], *dml = tb[1], *dof = tb[2];
+    const seq_dent *const sq = tb[0];
     uint32_t rep0 = d->reps[0], rep1 = d->reps[1], rep2 = d->reps[2];
     const uint8_t *hist = d->hist;
     const size_t wsize = d->wsize;
@@ -350,7 +350,7 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
     /* Decode a sequence (ll, ml, dist), advancing the bit stream. */
 #define DECODE_SEQ(LL, ML, DIST)                                               \
     do {                                                                       \
-        const seq_dent el_ = dll[sll], em_ = dml[sml], eo_ = dof[sof];         \
+        const seq_dent el_ = sq[sll], em_ = sq[sml], eo_ = sq[sof];                 \
         /* extra bits (ll, ml, of written in that order), then the three      \
          * state updates (of, ml, ll): one read and one reload when they fit  \
          * in 56 bits (nearly always), else two of each */                    \
@@ -395,36 +395,13 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
         o += ML;                                                               \
     } while (0)
 
-    /* Sequences are decoded SEQ_AHEAD ahead of execution, and the source of
-     * each match is prefetched meanwhile: far matches miss the cache. */
-    enum { SEQ_AHEAD = 8 };
-    size_t rll[SEQ_AHEAD], rml[SEQ_AHEAD];
-    uint32_t rdist[SEQ_AHEAD];
-    size_t ahead = (size_t)(o - hist);   /* history position after the decoded sequences */
-    size_t i = 0, lead = ns < SEQ_AHEAD ? ns : SEQ_AHEAD;
-    for (; i < lead; i++) {
+    /* (Decoding a few sequences ahead with prefetching measured no faster
+     * here, even past the cache size, so the loop stays simple.) */
+    for (size_t i = 0; i < ns; i++) {
         size_t ll, ml;
         uint32_t dist;
         DECODE_SEQ(ll, ml, dist);
-        ahead += ll;
-        if (dist <= ahead) __builtin_prefetch(hist + ahead - dist);
-        ahead += ml;
-        rll[i] = ll; rml[i] = ml; rdist[i] = dist;
-    }
-    for (; i < ns; i++) {
-        size_t ll, ml;
-        uint32_t dist;
-        DECODE_SEQ(ll, ml, dist);
-        ahead += ll;
-        if (dist <= ahead) __builtin_prefetch(hist + ahead - dist);
-        ahead += ml;
-        const size_t j = i % SEQ_AHEAD;
-        EXEC_SEQ(rll[j], rml[j], rdist[j]);
-        rll[j] = ll; rml[j] = ml; rdist[j] = dist;
-    }
-    for (size_t e = ns - lead; e < ns; e++) {
-        const size_t j = e % SEQ_AHEAD;
-        EXEC_SEQ(rll[j], rml[j], rdist[j]);
+        EXEC_SEQ(ll, ml, dist);
     }
 done:
 #undef DECODE_SEQ
