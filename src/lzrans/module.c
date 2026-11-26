@@ -1,22 +1,22 @@
 /*
  * module.c - CPython binding for the lzrans C core.
  *
- *   compress(data, level=5) -> bytes
+ *   compress(data, level=6, window_log=0) -> bytes
  *   decompress(data) -> bytes
- *   crc32(data, value=0) -> int        (zlib-compatible)
- *   frame_info(data) -> (original_size, crc32, flags)
+ *   Compressor(level=6, window_log=0): .compress(data) -> bytes, .flush() -> bytes
+ *   Decompressor(): .decompress(data) -> bytes, .eof, .unused_data
+ *   crc32(data, value=0) -> int                     (zlib-compatible)
+ *   frame_info(data) -> (content_size | None, window_log, flags)
  *
- * Accepts any C-contiguous buffer (bytes, bytearray, memoryview, ...).
- * The GIL is released while the C core runs, so threads can compress
- * in parallel.
+ * The GIL is released while the C core runs. A Compressor/Decompressor
+ * object must not be used from two threads at once (a lock guards it).
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include "frame.h"
+#include "lzr.h"
 #include "crc32.h"
 
-static PyObject *LzrError;   /* lzrans.LzransError (subclass of ValueError) */
-static PyObject *LzrChecksumError;
+static PyObject *LzrError, *LzrChecksumError;
 
 static PyObject *raise_code(int code)
 {
@@ -28,56 +28,93 @@ static PyObject *raise_code(int code)
     case LZR_ERR_UNSUPPORTED:
         PyErr_SetString(LzrError, "unsupported frame version or flags (encrypted frames are not supported yet)");
         return NULL;
+    case LZR_ERR_PARAM:
+        PyErr_SetString(PyExc_ValueError, "invalid argument or stream already finished");
+        return NULL;
     default:
         PyErr_SetString(LzrError, "corrupt or truncated lzrans frame");
         return NULL;
     }
 }
 
+/* Move a lzr_buf into a new bytes object and reset it. */
+static PyObject *take_bytes(lzr_buf *b)
+{
+    PyObject *r = PyBytes_FromStringAndSize((const char *)b->p, (Py_ssize_t)b->len);
+    b->len = 0;
+    return r;
+}
+
+static int check_level(int level, int wlog)
+{
+    if (level < LZR_LEVEL_MIN || level > LZR_LEVEL_MAX) {
+        PyErr_SetString(PyExc_ValueError, "level must be between 1 and 9");
+        return -1;
+    }
+    if (wlog && (wlog < LZR_WLOG_MIN || wlog > LZR_WLOG_MAX)) {
+        PyErr_SetString(PyExc_ValueError, "window_log must be 0 (auto) or between 18 and 26");
+        return -1;
+    }
+    return 0;
+}
+
+/* ---------------- one-shot ---------------- */
+
 static PyObject *py_compress(PyObject *self, PyObject *args, PyObject *kw)
 {
-    static char *kwlist[] = {"data", "level", NULL};
+    static char *kwlist[] = {"data", "level", "window_log", NULL};
     Py_buffer in;
-    int level = 5;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|i:compress", kwlist, &in, &level)) return NULL;
-    if (level < 1 || level > 9) {
-        PyBuffer_Release(&in);
-        PyErr_SetString(PyExc_ValueError, "level must be between 1 and 9");
-        return NULL;
-    }
-    size_t cap = lzr_compress_bound((size_t)in.len);
-    PyObject *out = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)cap);
-    if (!out) { PyBuffer_Release(&in); return NULL; }
+    int level = 6, wlog = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|ii:compress", kwlist, &in, &level, &wlog)) return NULL;
+    if (check_level(level, wlog)) { PyBuffer_Release(&in); return NULL; }
 
-    int64_t r;
+    lzr_buf out = {0};
+    int r;
     Py_BEGIN_ALLOW_THREADS
-    r = lzr_compress((const uint8_t *)in.buf, (size_t)in.len,
-                     (uint8_t *)PyBytes_AS_STRING(out), cap, level);
+    lzr_cctx *c = lzr_cctx_new(level, wlog, (int64_t)in.len);
+    if (!c) r = LZR_ERR_NOMEM;
+    else {
+        r = buf_reserve(&out, (size_t)in.len / 2 + 64);
+        if (!r) r = lzr_cctx_write(c, (const uint8_t *)in.buf, (size_t)in.len, &out);
+        if (!r) r = lzr_cctx_end(c, &out);
+        lzr_cctx_free(c);
+    }
     Py_END_ALLOW_THREADS
     PyBuffer_Release(&in);
-    if (r < 0) { Py_DECREF(out); return raise_code((int)r); }
-    if (_PyBytes_Resize(&out, (Py_ssize_t)r) < 0) return NULL;
-    return out;
+    PyObject *res = r ? raise_code(r) : take_bytes(&out);
+    free(out.p);
+    return res;
 }
 
 static PyObject *py_decompress(PyObject *self, PyObject *arg)
 {
     Py_buffer in;
     if (PyObject_GetBuffer(arg, &in, PyBUF_SIMPLE) < 0) return NULL;
-    uint64_t orig;
-    int r = lzr_frame_info((const uint8_t *)in.buf, (size_t)in.len, &orig, NULL, NULL);
-    if (r) { PyBuffer_Release(&in); return raise_code(r); }
-    if (orig > (uint64_t)PY_SSIZE_T_MAX) { PyBuffer_Release(&in); return PyErr_NoMemory(); }
-
-    PyObject *out = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)orig);
-    if (!out) { PyBuffer_Release(&in); return NULL; }
+    lzr_buf out = {0};
+    int r;
+    size_t used = 0;
+    int64_t csize = -1;
+    int hr = lzr_frame_header((const uint8_t *)in.buf, (size_t)in.len, NULL, NULL, &csize);
     Py_BEGIN_ALLOW_THREADS
-    r = lzr_decompress((const uint8_t *)in.buf, (size_t)in.len,
-                       (uint8_t *)PyBytes_AS_STRING(out), (size_t)orig);
+    lzr_dctx *d = lzr_dctx_new();
+    if (!d) r = LZR_ERR_NOMEM;
+    else {
+        /* Pre-size the output when the header carries the content size. */
+        r = (hr > 0 && csize > 0 && (uint64_t)csize <= (uint64_t)in.len * 4096u + (1u << 20))
+                ? buf_reserve(&out, (size_t)csize) : LZR_OK;
+        if (!r) r = lzr_dctx_write(d, (const uint8_t *)in.buf, (size_t)in.len, &out, &used);
+        lzr_dctx_free(d);
+    }
     Py_END_ALLOW_THREADS
+    Py_ssize_t inlen = in.len;
     PyBuffer_Release(&in);
-    if (r) { Py_DECREF(out); return raise_code(r); }
-    return out;
+    PyObject *res;
+    if (r < 0) res = raise_code(r);
+    else if (r != 1) { PyErr_SetString(LzrError, "truncated lzrans frame (no end block)"); res = NULL; }
+    else if ((Py_ssize_t)used != inlen) { PyErr_SetString(LzrError, "trailing data after lzrans frame"); res = NULL; }
+    else res = take_bytes(&out);
+    free(out.p);
+    return res;
 }
 
 static PyObject *py_crc32(PyObject *self, PyObject *args)
@@ -97,36 +134,216 @@ static PyObject *py_frame_info(PyObject *self, PyObject *arg)
 {
     Py_buffer in;
     if (PyObject_GetBuffer(arg, &in, PyBUF_SIMPLE) < 0) return NULL;
-    uint64_t orig = 0;
-    uint32_t crc = 0;
+    int wlog = 0;
     uint8_t flags = 0;
-    int r = lzr_frame_info((const uint8_t *)in.buf, (size_t)in.len, &orig, &crc, &flags);
+    int64_t size = -1;
+    int r = lzr_frame_header((const uint8_t *)in.buf, (size_t)in.len, &wlog, &flags, &size);
     PyBuffer_Release(&in);
-    if (r) return raise_code(r);
-    return Py_BuildValue("(KkB)", (unsigned long long)orig, (unsigned long)crc, flags);
+    if (r == 0) r = LZR_ERR_CORRUPT;
+    if (r < 0) return raise_code(r);
+    if (size < 0) return Py_BuildValue("(OiB)", Py_None, wlog, flags);
+    return Py_BuildValue("(LiB)", (long long)size, wlog, flags);
 }
+
+/* ---------------- Compressor ---------------- */
+
+typedef struct {
+    PyObject_HEAD
+    lzr_cctx *c;
+    lzr_buf out;
+    PyThread_type_lock lock;
+} CompressorObject;
+
+static int Compressor_init(CompressorObject *self, PyObject *args, PyObject *kw)
+{
+    static char *kwlist[] = {"level", "window_log", NULL};
+    int level = 6, wlog = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|ii:Compressor", kwlist, &level, &wlog)) return -1;
+    if (check_level(level, wlog)) return -1;
+    if (self->c) { lzr_cctx_free(self->c); self->c = NULL; }
+    self->c = lzr_cctx_new(level, wlog, -1);
+    if (!self->c) { PyErr_NoMemory(); return -1; }
+    if (!self->lock && !(self->lock = PyThread_allocate_lock())) { PyErr_NoMemory(); return -1; }
+    return 0;
+}
+
+static void Compressor_dealloc(CompressorObject *self)
+{
+    lzr_cctx_free(self->c);
+    free(self->out.p);
+    if (self->lock) PyThread_free_lock(self->lock);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+#define LOCK(o)   do { if (!PyThread_acquire_lock((o)->lock, 0)) { Py_BEGIN_ALLOW_THREADS PyThread_acquire_lock((o)->lock, 1); Py_END_ALLOW_THREADS } } while (0)
+#define UNLOCK(o) PyThread_release_lock((o)->lock)
+
+static PyObject *Compressor_compress(CompressorObject *self, PyObject *arg)
+{
+    if (!self->c) { PyErr_SetString(PyExc_ValueError, "Compressor not initialised"); return NULL; }
+    Py_buffer in;
+    if (PyObject_GetBuffer(arg, &in, PyBUF_SIMPLE) < 0) return NULL;
+    LOCK(self);
+    int r;
+    Py_BEGIN_ALLOW_THREADS
+    r = lzr_cctx_write(self->c, (const uint8_t *)in.buf, (size_t)in.len, &self->out);
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&in);
+    PyObject *res = r ? raise_code(r) : take_bytes(&self->out);
+    UNLOCK(self);
+    return res;
+}
+
+static PyObject *Compressor_flush(CompressorObject *self, PyObject *noargs)
+{
+    if (!self->c) { PyErr_SetString(PyExc_ValueError, "Compressor not initialised"); return NULL; }
+    LOCK(self);
+    int r;
+    Py_BEGIN_ALLOW_THREADS
+    r = lzr_cctx_end(self->c, &self->out);
+    Py_END_ALLOW_THREADS
+    PyObject *res = r ? raise_code(r) : take_bytes(&self->out);
+    UNLOCK(self);
+    return res;
+}
+
+static PyMethodDef Compressor_methods[] = {
+    {"compress", (PyCFunction)Compressor_compress, METH_O,
+     "compress(data) -> bytes. Feed data; returns any completed compressed output."},
+    {"flush", (PyCFunction)Compressor_flush, METH_NOARGS,
+     "flush() -> bytes. Finish the frame. The object cannot be used afterwards."},
+    {NULL}};
+
+static PyTypeObject CompressorType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "lzrans.Compressor",
+    .tp_basicsize = sizeof(CompressorObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "Compressor(level=6, window_log=0): streaming compressor.",
+    .tp_new = PyType_GenericNew,
+    .tp_init = (initproc)Compressor_init,
+    .tp_dealloc = (destructor)Compressor_dealloc,
+    .tp_methods = Compressor_methods,
+};
+
+/* ---------------- Decompressor ---------------- */
+
+typedef struct {
+    PyObject_HEAD
+    lzr_dctx *d;
+    lzr_buf out;
+    int eof;
+    PyObject *unused;
+    PyThread_type_lock lock;
+} DecompressorObject;
+
+static int Decompressor_init(DecompressorObject *self, PyObject *args, PyObject *kw)
+{
+    static char *kwlist[] = {NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, ":Decompressor", kwlist)) return -1;
+    if (self->d) lzr_dctx_free(self->d);
+    self->d = lzr_dctx_new();
+    if (!self->d) { PyErr_NoMemory(); return -1; }
+    self->eof = 0;
+    Py_XSETREF(self->unused, PyBytes_FromStringAndSize(NULL, 0));
+    if (!self->lock && !(self->lock = PyThread_allocate_lock())) { PyErr_NoMemory(); return -1; }
+    return self->unused ? 0 : -1;
+}
+
+static void Decompressor_dealloc(DecompressorObject *self)
+{
+    lzr_dctx_free(self->d);
+    free(self->out.p);
+    Py_XDECREF(self->unused);
+    if (self->lock) PyThread_free_lock(self->lock);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyObject *Decompressor_decompress(DecompressorObject *self, PyObject *arg)
+{
+    if (!self->d) { PyErr_SetString(PyExc_ValueError, "Decompressor not initialised"); return NULL; }
+    if (self->eof) { PyErr_SetString(PyExc_EOFError, "end of lzrans frame already reached"); return NULL; }
+    Py_buffer in;
+    if (PyObject_GetBuffer(arg, &in, PyBUF_SIMPLE) < 0) return NULL;
+    LOCK(self);
+    int r;
+    size_t used = 0;
+    Py_BEGIN_ALLOW_THREADS
+    r = lzr_dctx_write(self->d, (const uint8_t *)in.buf, (size_t)in.len, &self->out, &used);
+    Py_END_ALLOW_THREADS
+    PyObject *res = NULL;
+    if (r < 0) {
+        self->out.len = 0;
+        raise_code(r);
+    } else {
+        if (r == 1) {
+            self->eof = 1;
+            Py_XSETREF(self->unused, PyBytes_FromStringAndSize((const char *)in.buf + used,
+                                                               in.len - (Py_ssize_t)used));
+        }
+        res = self->unused ? take_bytes(&self->out) : NULL;
+    }
+    PyBuffer_Release(&in);
+    UNLOCK(self);
+    return res;
+}
+
+static PyObject *Decompressor_get_eof(DecompressorObject *self, void *c) { return PyBool_FromLong(self->eof); }
+static PyObject *Decompressor_get_unused(DecompressorObject *self, void *c)
+{
+    return Py_NewRef(self->unused ? self->unused : Py_None);
+}
+
+static PyMethodDef Decompressor_methods[] = {
+    {"decompress", (PyCFunction)Decompressor_decompress, METH_O,
+     "decompress(data) -> bytes. Feed compressed data; returns decoded output so far."},
+    {NULL}};
+
+static PyGetSetDef Decompressor_getset[] = {
+    {"eof", (getter)Decompressor_get_eof, NULL, "True once the end block was verified.", NULL},
+    {"unused_data", (getter)Decompressor_get_unused, NULL, "Bytes found after the end of the frame.", NULL},
+    {NULL}};
+
+static PyTypeObject DecompressorType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "lzrans.Decompressor",
+    .tp_basicsize = sizeof(DecompressorObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "Decompressor(): streaming decompressor.",
+    .tp_new = PyType_GenericNew,
+    .tp_init = (initproc)Decompressor_init,
+    .tp_dealloc = (destructor)Decompressor_dealloc,
+    .tp_methods = Decompressor_methods,
+    .tp_getset = Decompressor_getset,
+};
+
+/* ---------------- module ---------------- */
 
 static PyMethodDef methods[] = {
     {"compress", (PyCFunction)(void (*)(void))py_compress, METH_VARARGS | METH_KEYWORDS,
-     "compress(data, level=5) -> bytes"},
+     "compress(data, level=6, window_log=0) -> bytes"},
     {"decompress", py_decompress, METH_O, "decompress(data) -> bytes"},
     {"crc32", py_crc32, METH_VARARGS, "crc32(data, value=0) -> int (zlib-compatible)"},
-    {"frame_info", py_frame_info, METH_O, "frame_info(data) -> (original_size, crc32, flags)"},
+    {"frame_info", py_frame_info, METH_O, "frame_info(data) -> (content_size or None, window_log, flags)"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moddef = {PyModuleDef_HEAD_INIT, "_lzrans",
-                                    "LZ77 + 3-stream rANS compressor (C core).", -1, methods};
+                                    "LZ77 + rANS streaming compressor (C core).", -1, methods};
 
 PyMODINIT_FUNC PyInit__lzrans(void)
 {
     lzr_crc32_init();
+    if (PyType_Ready(&CompressorType) < 0 || PyType_Ready(&DecompressorType) < 0) return NULL;
     PyObject *m = PyModule_Create(&moddef);
     if (!m) return NULL;
     LzrError = PyErr_NewException("lzrans.LzransError", PyExc_ValueError, NULL);
     LzrChecksumError = PyErr_NewException("lzrans.ChecksumError", LzrError, NULL);
     if (PyModule_AddObjectRef(m, "LzransError", LzrError) < 0 ||
         PyModule_AddObjectRef(m, "ChecksumError", LzrChecksumError) < 0 ||
+        PyModule_AddObjectRef(m, "Compressor", (PyObject *)&CompressorType) < 0 ||
+        PyModule_AddObjectRef(m, "Decompressor", (PyObject *)&DecompressorType) < 0 ||
         PyModule_AddIntConstant(m, "FLAG_ENCRYPTED", LZR_FLAG_ENCRYPTED) < 0 ||
+        PyModule_AddIntConstant(m, "FLAG_SIZE", LZR_FLAG_SIZE) < 0 ||
         PyModule_AddIntConstant(m, "BLOCK_SIZE", LZR_BLOCK_SIZE) < 0 ||
         PyModule_AddIntConstant(m, "FORMAT_VERSION", LZR_VERSION) < 0) {
         Py_DECREF(m);

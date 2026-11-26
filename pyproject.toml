@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lzrans"
-version = "0.1.0"
-description = "LZ77 (64 KB hash-chain) + 3-stream rANS compressor with a C core"
+version = "0.2.0.dev0"
+description = "Streaming LZ77 + rANS compressor with a C core"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

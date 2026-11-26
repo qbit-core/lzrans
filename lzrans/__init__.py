@@ -1,10 +1,12 @@
 """lzrans - LZ77 (64 KB window) + 3-stream rANS compression with a C core.
 
 Public API:
-    compress(data, level=5) -> bytes
+    compress(data, level=6, window_log=0) -> bytes
     decompress(data) -> bytes
+    Compressor(level=6, window_log=0)   .compress(chunk) / .flush()
+    Decompressor()                      .decompress(chunk), .eof, .unused_data
     crc32(data, value=0) -> int
-    frame_info(data) -> (original_size, crc32, flags)
+    frame_info(data) -> (content_size or None, window_log, flags)
 
 Encryption hook: frames carry a flags byte. FLAG_ENCRYPTED is reserved for a
 future AEAD envelope (planned: libsodium XChaCha20-Poly1305 + Argon2id).
@@ -13,6 +15,9 @@ This build rejects encrypted frames with LzransError.
 from ._lzrans import (
     BLOCK_SIZE,
     FLAG_ENCRYPTED,
+    FLAG_SIZE,
+    Compressor,
+    Decompressor,
     FORMAT_VERSION,
     ChecksumError,
     LzransError,
@@ -23,8 +28,8 @@ from ._lzrans import (
 )
 
 __all__ = [
-    "compress", "decompress", "crc32", "frame_info",
+    "compress", "decompress", "Compressor", "Decompressor", "crc32", "frame_info",
     "LzransError", "ChecksumError",
-    "BLOCK_SIZE", "FLAG_ENCRYPTED", "FORMAT_VERSION",
+    "BLOCK_SIZE", "FLAG_ENCRYPTED", "FLAG_SIZE", "FORMAT_VERSION",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0.dev0"

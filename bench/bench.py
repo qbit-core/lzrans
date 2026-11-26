@@ -1,10 +1,12 @@
-"""Simple benchmark: lzrans vs zlib (ratio, compress MB/s, decompress MB/s).
+"""Benchmark: lzrans vs zlib, xz (lzma) and zstd (if installed).
+Reports ratio, compress MB/s and decompress MB/s (single thread).
 
 Usage:  python bench/bench.py [file ...]
 Without arguments it uses built-in corpora (Python stdlib source, a binary,
 synthetic text, zeros, random).
 """
 import glob
+import lzma
 import os
 import sys
 import sysconfig
@@ -23,7 +25,7 @@ def corpora():
     yield "random 4MB", os.urandom(4 << 20)
 
 
-def best_time(fn, arg, min_total=0.5):
+def best_time(fn, arg, min_total=0.3):
     best, total, out = float("inf"), 0.0, None
     while total < min_total:
         t = time.perf_counter()
@@ -36,8 +38,16 @@ def best_time(fn, arg, min_total=0.5):
 def run(name, data):
     mb = len(data) / 1e6
     rows = []
-    codecs = [(f"lzrans -{lv}", lambda d, lv=lv: lzrans.compress(d, lv), lzrans.decompress) for lv in (1, 5, 9)]
-    codecs += [(f"zlib -{lv}", lambda d, lv=lv: zlib.compress(d, lv), zlib.decompress) for lv in (1, 6, 9)]
+    codecs = [(f"lzrans -{lv}", lambda d, lv=lv: lzrans.compress(d, lv), lzrans.decompress) for lv in (1, 6, 9)]
+    codecs += [("zlib -9", lambda d: zlib.compress(d, 9), zlib.decompress)]
+    codecs += [(f"xz -{lv}", lambda d, lv=lv: lzma.compress(d, preset=lv), lzma.decompress) for lv in (6, 9)]
+    try:
+        import zstandard  # optional: pip install zstandard
+        dz = zstandard.ZstdDecompressor()
+        codecs += [(f"zstd -{lv}", lambda d, lv=lv: zstandard.ZstdCompressor(level=lv).compress(d), dz.decompress)
+                   for lv in (19, 22)]
+    except ImportError:
+        pass
     for label, comp, decomp in codecs:
         tc, c = best_time(comp, data)
         td, d = best_time(decomp, c)

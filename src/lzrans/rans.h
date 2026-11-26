@@ -1,40 +1,33 @@
+/*
+ * rans.h - static-model byte-wise rANS, 32-bit state, 12-bit scale,
+ * two interleaved states per stream (independent dependency chains give
+ * the CPU instruction-level parallelism when decoding).
+ *
+ * A "stream" is n symbols (n known to the decoder) coded in one of:
+ *   mode 0  raw bytes
+ *   mode 1  run: every symbol is the same (1 byte)
+ *   mode 2  rANS: freq table | u32 payload length | payload
+ */
 #ifndef LZRANS_RANS_H
 #define LZRANS_RANS_H
 #include "common.h"
 
-/*
- * Byte-wise rANS with a 32-bit state and 12-bit frequency scale (M = 4096).
- * Each of the three token streams is coded independently with its own
- * static frequency table (stored in the block header).
- */
+/* Decode slot: sym | freq << 8 | bias << 20  (freq, bias < 4096). */
+typedef uint32_t rans_dslot;
 
-/* Decoder slot entry: x' = freq * (x >> 12) + bias, where bias = slot - cum. */
-typedef struct {
-    uint16_t sym;
-    uint16_t freq;
-    uint16_t bias;
-    uint16_t pad;
-} rans_slot;
+/* Upper bound on an encoded stream (header + payload) of n symbols. */
+static inline size_t stream_bound(size_t n, unsigned alphabet)
+{
+    return 1 + (size_t)alphabet * 3 + 8 + 2 * n + 16;
+}
 
-/* Count + normalise symbol frequencies so that they sum to RANS_M.
- * Every symbol that occurs gets freq >= 1. */
-void rans_build_freqs(const uint16_t *syms, size_t n, unsigned alphabet, uint32_t *freq);
+/* Encode syms[0..n) as a stream at `out`. `scratch` must hold
+ * 2*n + 16 bytes. Returns bytes written (0 if n == 0). */
+size_t stream_encode(uint8_t *out, const uint8_t *syms, size_t n, unsigned alphabet, uint8_t *scratch);
 
-/* Serialise a frequency table (zero-run + varint). Returns bytes written. */
-size_t rans_write_freqs(uint8_t *out, const uint32_t *freq, unsigned alphabet);
-
-/* Parse a frequency table and build the O(1) decode slot table.
- * Returns bytes consumed, or 0 on malformed input. */
-size_t rans_read_freqs(const uint8_t *in, size_t avail, unsigned alphabet, rans_slot *slots);
-
-/* Upper bound on encoded size for n symbols. */
-static inline size_t rans_bound(size_t n) { return 2 * n + 8; }
-
-/* Encode syms[0..n) and write the payload to `out`. Returns size. */
-size_t rans_encode(const uint16_t *syms, size_t n, const uint32_t *freq, unsigned alphabet,
-                   uint8_t *scratch, size_t scratch_cap, uint8_t *out);
-
-/* Max serialised frequency table size. */
-#define RANS_FREQ_MAX(alphabet) ((size_t)(alphabet) * 3 + 8)
+/* Decode a stream of exactly n symbols into out[]. `tbl` is a work area of
+ * RANS_M slots. Returns bytes consumed, or 0 on malformed input (n > 0). */
+size_t stream_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, unsigned alphabet,
+                     rans_dslot *tbl);
 
 #endif

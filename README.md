@@ -1,49 +1,72 @@
 # lzrans
 
-LZ77 (64 KB hash-chain) + 3-stream rANS compressor. The core is C; Python
-uses it through a CPython native extension.
+Streaming LZ77 + rANS compressor. The core is C; Python uses it through a
+CPython native extension.
+
+**Goal:** a better ratio than xz/LZMA with faster compression *and*
+decompression, usable on streams. Status: v0.2 phase 1 (see Roadmap).
 
 ```python
 import lzrans
-blob = lzrans.compress(data, level=5)   # level 1 (fast) .. 9 (best)
-assert lzrans.decompress(blob) == data  # raises ChecksumError on CRC mismatch
+
+blob = lzrans.compress(data, level=6)          # level 1 (fast) .. 9 (best)
+assert lzrans.decompress(blob) == data         # ChecksumError on CRC mismatch
+
+# streaming, bounded memory
+c = lzrans.Compressor(level=6)
+out = b"".join(c.compress(chunk) for chunk in chunks) + c.flush()
+
+d = lzrans.Decompressor()
+for chunk in compressed_chunks:
+    sink.write(d.decompress(chunk))
+assert d.eof
 ```
 
 ## Build and test
 
 ```sh
 pip install -e .[test]
-pytest                   # Python round-trip and corruption tests
+pytest                   # round-trip, streaming and corruption tests
 make -C tests/c run      # C core under ASan/UBSan, incl. mutated-input fuzzing
-python bench/bench.py    # vs zlib
+python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 ```
 
-## Pipeline
+## Design
 
 | Stage | Implementation (`src/lzrans/`) |
 |---|---|
-| Match finding | `lz77.c`: 4-byte multiplicative hash (`HASH_BITS=16`), hash chains, 64 KB window, 32-bit word compares, one-step lazy matching at level >= 4. Matches are 4..259 bytes. |
-| Tokens | Stream 1: literal/length symbols 0..511 (0-255 literal, 256-511 = match length 4..259). Stream 2: distance high byte. Stream 3: distance low byte. |
-| Entropy coding | `rans.c`: byte-wise rANS, 32-bit state, 12-bit scale (M = 4096), one static frequency table per stream per 1 MB block. |
-| Decoding | `frame.c`: 4096-entry slot table gives (symbol, freq, bias) in one lookup; literals and matches are copied sequentially with `memcpy` (overlapping matches are copied by doubling the period). |
-| Integrity | `crc32.c`: slice-by-8 CRC-32, identical to `zlib.crc32`, verified after decompression. Each rANS stream must also end exactly at its initial state, which catches most corruption before the CRC. |
+| Match finding | `enc.c`: hash chains over a 1-32 MB window (by level), 5-byte hash, 8-byte compares, 3 repeat offsets probed first, lazy matching (depth 0-2) scored by length vs. offset cost. |
+| Tokens | Sequences of (literal run, match length, offset). Offset code 0-2 = repeat offset, else a log-bucket code. Lengths/offsets use log-bucket codes (62 codes) + raw extra bits. |
+| Entropy coding | `rans.c`: 4 rANS streams per 256 KB block (literals, LL codes, ML codes, offset codes), 12-bit static model per block, 2 interleaved states, raw/run fallbacks. |
+| Decoding | `dec.c`: streams decoded into arrays with one table lookup per symbol, then a sequence loop with 16-byte wildcopy for literals and matches. |
+| Streaming | Input is consumed and output produced block by block. Encoder memory is about 2x window + chain table; decoder memory is about 2x window. |
+| Integrity | CRC-32 (`crc32.c`, identical to `zlib.crc32`) in the end block, plus structural checks: every rANS stream must end at its initial state. |
 
-Incompressible blocks are stored raw, so output is at most `20 + 5 * blocks` bytes larger than the input.
-
-## Frame format (v1, little-endian)
+## Frame format v2 (little-endian)
 
 ```
-"LZRN" | version u8 | flags u8 | level u8 | reserved u8 | original_size u64 | crc32 u32
-block*:  type u8 (0 = stored, 1 = lz+rans) | raw_len u32 | payload
-  type 1: nsym u32 | nmatch u32 | 3 x [freq table | len u32 | rANS bytes]
+"LZRN" | version u8 = 2 | flags u8 | window_log u8 | reserved u8 | [content_size u64]
+block*: type u8 | raw_len u32 | comp_len u32 | payload
+  type 0 stored      payload = raw bytes
+  type 1 compressed  nseq u32 | nlit u32 | literals | ll | ml | of streams | extra_len u32 | extra bits
+  type 2 end         payload = CRC32 of the whole content
 ```
 
-Decoders reject unknown versions and unknown flag bits.
+`flags`: bit 0 = encrypted (reserved), bit 1 = content size present
+(set by one-shot `compress`). Decoders reject unknown versions and flags.
 
 ## Encryption hook (not implemented yet)
 
-`flags` bit 0 (`lzrans.FLAG_ENCRYPTED`) is reserved. The plan is to wrap
-the compressed frame in an AEAD envelope (libsodium XChaCha20-Poly1305 with
-an Argon2id-derived key), so: compress, then encrypt; decrypt and verify the
-tag, then decompress. This build raises `LzransError` on frames with that
-flag set.
+Flag bit 0 (`lzrans.FLAG_ENCRYPTED`) is reserved for an AEAD envelope
+(planned: libsodium XChaCha20-Poly1305, Argon2id key derivation): compress,
+then encrypt per block; verify, then decompress. Frames with the flag set
+are rejected for now.
+
+## Roadmap
+
+| Phase | Change | Status |
+|---|---|---|
+| P1 | Streaming frame, large window, sequence tokens, repeat offsets | done |
+| P2 | Binary-tree match finder + price-based optimal parsing | next |
+| P3 | Context-modelled entropy coding (literal contexts, match-byte context) | planned |
+| P4 | Decoder speed (more interleaved states, branchless refill), x86 filter | planned |

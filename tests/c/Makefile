@@ -1,8 +1,8 @@
 # Sanitizer stress test for the C core:  make -C tests/c run
 SRC = ../../src/lzrans
 CFLAGS = -O1 -g -std=c11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all
-fuzz_roundtrip: fuzz_roundtrip.c $(SRC)/frame.c $(SRC)/lz77.c $(SRC)/rans.c $(SRC)/crc32.c
-	$(CC) $(CFLAGS) -o $@ $^
+fuzz_roundtrip: fuzz_roundtrip.c $(SRC)/enc.c $(SRC)/dec.c $(SRC)/rans.c $(SRC)/crc32.c
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 run: fuzz_roundtrip
 	./fuzz_roundtrip 300
 clean:
