@@ -176,63 +176,134 @@ static int decode_block(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *d
 }
 
 /* Block type 4: one range-coded token stream (arc.h), decoded straight
- * into the history. */
+ * into the history. The coder state lives in locals (range, code, ip) so
+ * it stays in registers; the macros mirror arce_bit() and the trees in
+ * arc.h. */
+#define RC_NORM() do { if (range < ARC_TOP) { range <<= 8; code = (code << 8) | *ip++; } } while (0)
+#define RC_BIT(pr, b) do {                                                     \
+        arc_p *pp_ = (pr);                                                     \
+        uint32_t p_ = *pp_, bound_ = (range >> ARC_PBITS) * p_;                \
+        if (code < bound_) { range = bound_; *pp_ = (arc_p)(p_ + ((ARC_ONE - p_) >> ARC_SHIFT)); b = 0; } \
+        else { range -= bound_; code -= bound_; *pp_ = (arc_p)(p_ - (p_ >> ARC_SHIFT)); b = 1; } \
+        RC_NORM();                                                             \
+    } while (0)
+#define RC_TREE(probs, nbits, out) do {                                        \
+        unsigned m_ = 1, b_;                                                   \
+        for (unsigned i_ = 0; i_ < (nbits); i_++) { RC_BIT(&(probs)[m_], b_); m_ = (m_ << 1) | b_; } \
+        out = m_ - (1u << (nbits));                                            \
+    } while (0)
+#define RC_RTREE(probs, nbits, out) do {                                       \
+        unsigned m_ = 1, b_, v_ = 0;                                           \
+        for (unsigned i_ = 0; i_ < (nbits); i_++) { RC_BIT(&(probs)[m_], b_); m_ = (m_ << 1) | b_; v_ |= b_ << i_; } \
+        out = v_;                                                              \
+    } while (0)
+#define RC_LEN(l, ps, out) do {                                                \
+        unsigned b0_, v0_;                                                     \
+        RC_BIT(&(l)->choice, b0_);                                             \
+        if (!b0_) { RC_TREE((l)->low[ps], 3, v0_); out = 2 + v0_; break; }   \
+        RC_BIT(&(l)->choice2, b0_);                                            \
+        if (!b0_) { RC_TREE((l)->mid[ps], 3, v0_); out = 10 + v0_; break; }  \
+        RC_TREE((l)->high, 8, v0_); out = 18 + v0_;                            \
+    } while (0)
+
 static int decode_tokens(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
     arc_dec r;
-    arcd_init(&r, in, avail);
+    if (arcd_init(&r, in, avail)) return LZR_ERR_CORRUPT;
+    uint32_t range = r.range, code = r.code;
+    const uint8_t *ip = r.p, *const iend = r.end;
     tok_model *m = &d->tm;
     unsigned s = m->state;
-    uint32_t *reps = d->reps;
+    uint32_t rep0 = d->reps[0], rep1 = d->reps[1], rep2 = d->reps[2];
     const uint8_t *hist = d->hist;
+    const size_t wsize = d->wsize;
     uint8_t *o = dst, *const oend = dst + raw;
+    int err = 0;
     while (o < oend) {
-        unsigned ps = (unsigned)(o - dst) & (TOK_POS - 1);
-        if (!arcd_bit(&r, &m->is_match[s][ps])) {
+        unsigned ps = (unsigned)(o - dst) & (TOK_POS - 1), bit;
+        if (ip > iend) { err = 1; break; }
+        RC_BIT(&m->is_match[s][ps], bit);
+        if (!bit) {
             arc_p *probs = m->lit[(o > hist ? o[-1] : 0) >> 5];
+            unsigned v = 1;
             if (s >= 7) {
-                if (reps[0] > (size_t)(o - hist)) return LZR_ERR_CORRUPT;
-                *o = (uint8_t)arcd_literal_matched(&r, probs, o[-(ptrdiff_t)reps[0]]);
-            } else {
-                *o = (uint8_t)arcd_tree(&r, probs, 8);
+                if (rep0 > (size_t)(o - hist)) { err = 1; break; }
+                unsigned mbyte = o[-(ptrdiff_t)rep0];
+                for (int i = 7; i >= 0; i--) {
+                    unsigned mb = (mbyte >> i) & 1;
+                    RC_BIT(&probs[256 + (mb << 8) + v], bit);
+                    v = (v << 1) | bit;
+                    if (bit != mb) break;
+                }
             }
-            o++;
+            while (v < 256) { RC_BIT(&probs[v], bit); v = (v << 1) | bit; }
+            *o++ = (uint8_t)v;
             s = tok_after_lit(s);
             continue;
         }
         size_t len;
         uint32_t dist;
-        if (!arcd_bit(&r, &m->is_rep[s])) {
-            len = arcd_len(&r, &m->mlen, ps);
-            uint32_t d0 = arcd_dist(&r, m, (unsigned)len);
-            if (d0 >= d->wsize) return LZR_ERR_CORRUPT;
+        RC_BIT(&m->is_rep[s], bit);
+        if (!bit) {
+            unsigned l, slot;
+            RC_LEN(&m->mlen, ps, l);
+            len = l;
+            unsigned lctx = l - 2 < 3 ? l - 2 : 3;
+            RC_TREE(m->slot[lctx], 6, slot);
+            uint32_t d0 = slot;
+            if (slot >= 4) {
+                unsigned nb = (slot >> 1) - 1, v;
+                d0 = (2u | (slot & 1)) << nb;
+                if (slot < TOK_END_SPEC) {
+                    RC_RTREE(m->spec[slot], nb, v);
+                    d0 += v;
+                } else {
+                    uint32_t hi = 0;
+                    for (unsigned k = nb - 4; k; k--) {
+                        range >>= 1;
+                        uint32_t t = code >= range;
+                        code -= range & (0u - t);
+                        hi = (hi << 1) | t;
+                        RC_NORM();
+                    }
+                    RC_RTREE(m->align, 4, v);
+                    d0 += (hi << 4) + v;
+                }
+            }
+            if (d0 >= wsize) { err = 1; break; }
             dist = d0 + 1;
-            reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = dist;
+            rep2 = rep1; rep1 = rep0; rep0 = dist;
             s = tok_after_match(s);
         } else {
-            if (!arcd_bit(&r, &m->is_rep0[s])) {
-                dist = reps[0];
-                if (!arcd_bit(&r, &m->is_rep0_long[s][ps])) {   /* short rep */
-                    if (dist > (size_t)(o - hist)) return LZR_ERR_CORRUPT;
+            RC_BIT(&m->is_rep0[s], bit);
+            if (!bit) {
+                dist = rep0;
+                RC_BIT(&m->is_rep0_long[s][ps], bit);
+                if (!bit) {   /* short rep */
+                    if (dist > (size_t)(o - hist)) { err = 1; break; }
                     *o = o[-(ptrdiff_t)dist];
                     o++;
                     s = tok_after_short(s);
                     continue;
                 }
-            } else if (!arcd_bit(&r, &m->is_rep1[s])) {
-                dist = reps[1]; reps[1] = reps[0]; reps[0] = dist;
             } else {
-                dist = reps[2]; reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = dist;
+                RC_BIT(&m->is_rep1[s], bit);
+                if (!bit) { dist = rep1; rep1 = rep0; }
+                else { dist = rep2; rep2 = rep1; rep1 = rep0; }
+                rep0 = dist;
             }
-            len = arcd_len(&r, &m->rlen, ps);
+            unsigned l;
+            RC_LEN(&m->rlen, ps, l);
+            len = l;
             s = tok_after_rep(s);
         }
-        if (len > (size_t)(oend - o) || dist > (size_t)(o - hist) || dist > d->wsize) return LZR_ERR_CORRUPT;
+        if (len > (size_t)(oend - o) || dist > (size_t)(o - hist) || dist > wsize) { err = 1; break; }
         copy_match(o, dist, len);
         o += len;
     }
     m->state = (uint8_t)s;
-    if (r.err || r.p != r.end) return LZR_ERR_CORRUPT;
+    d->reps[0] = rep0; d->reps[1] = rep1; d->reps[2] = rep2;
+    if (err || ip != iend) return LZR_ERR_CORRUPT;
     return LZR_OK;
 }
 
@@ -321,7 +392,9 @@ int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size
 {
     if (consumed) *consumed = 0;
     if (d->state == ST_DONE) return 1;
-    if (n && buf_append(&d->in, src, n)) return LZR_ERR_NOMEM;
+    /* Keep ARC_SLACK readable bytes after the input (see arc.h). */
+    if (n && (buf_reserve(&d->in, n + ARC_SLACK) || buf_append(&d->in, src, n))) return LZR_ERR_NOMEM;
+    if (n) memset(d->in.p + d->in.len, 0, ARC_SLACK);
 
     int r;
     while ((r = step(d, out)) == 1) {}

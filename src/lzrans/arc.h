@@ -250,110 +250,31 @@ static inline unsigned tok_piece(size_t ml)
     return ml - TOK_MAXLEN < 2 ? TOK_MAXLEN - 2 : TOK_MAXLEN;
 }
 
-/* ---------------- decoder ---------------- */
+/* ---------------- decoder ----------------
+ * Reads are not bounds-checked per byte: one token reads at most
+ * ARC_TOKEN_MAX bytes, so the caller checks p <= end after every token and
+ * keeps ARC_SLACK readable bytes after the payload. */
+#define ARC_TOKEN_MAX 64
+#define ARC_SLACK (2 * ARC_TOKEN_MAX)
+
 typedef struct {
     uint32_t range, code;
     const uint8_t *p, *end;   /* a valid stream ends with p == end */
-    int err;
 } arc_dec;
 
-static inline uint8_t arcd_byte(arc_dec *d)
+static inline uint8_t arcd_byte(arc_dec *d) { return *d->p++; }
+
+/* Returns 0, or -1 if the payload cannot be a stream. */
+static inline int arcd_init(arc_dec *d, const uint8_t *in, size_t n)
 {
-    if (d->p < d->end) return *d->p++;
-    d->err = 1;
+    d->p = in; d->end = in + n;
+    d->range = 0xFFFFFFFFu; d->code = 0;
+    if (n < 5 || arcd_byte(d) != 0) return -1;
+    for (int i = 0; i < 4; i++) d->code = (d->code << 8) | arcd_byte(d);
     return 0;
 }
 
-static inline void arcd_init(arc_dec *d, const uint8_t *in, size_t n)
-{
-    d->p = in; d->end = in + n; d->err = 0;
-    d->range = 0xFFFFFFFFu; d->code = 0;
-    if (arcd_byte(d) != 0) d->err = 1;
-    for (int i = 0; i < 4; i++) d->code = (d->code << 8) | arcd_byte(d);
-}
-
-static inline unsigned arcd_bit(arc_dec *d, arc_p *pr)
-{
-    uint32_t p = *pr;
-    uint32_t bound = (d->range >> ARC_PBITS) * p;
-    unsigned bit;
-    if (d->code < bound) {
-        d->range = bound;
-        *pr = (arc_p)(p + ((ARC_ONE - p) >> ARC_SHIFT));
-        bit = 0;
-    } else {
-        d->code -= bound;
-        d->range -= bound;
-        *pr = (arc_p)(p - (p >> ARC_SHIFT));
-        bit = 1;
-    }
-    if (d->range < ARC_TOP) { d->range <<= 8; d->code = (d->code << 8) | arcd_byte(d); }
-    return bit;
-}
-
-static inline uint32_t arcd_direct(arc_dec *d, unsigned nb)
-{
-    uint32_t v = 0;
-    while (nb--) {
-        d->range >>= 1;
-        uint32_t t = d->code >= d->range;
-        d->code -= d->range & (0u - t);
-        v = (v << 1) | t;
-        if (d->range < ARC_TOP) { d->range <<= 8; d->code = (d->code << 8) | arcd_byte(d); }
-    }
-    return v;
-}
-
-static inline unsigned arcd_tree(arc_dec *d, arc_p *probs, unsigned nbits)
-{
-    unsigned m = 1;
-    for (unsigned i = 0; i < nbits; i++) m = (m << 1) | arcd_bit(d, &probs[m]);
-    return m - (1u << nbits);
-}
-
-static inline unsigned arcd_rtree(arc_dec *d, arc_p *probs, unsigned nbits)
-{
-    unsigned m = 1, v = 0;
-    for (unsigned i = 0; i < nbits; i++) {
-        unsigned b = arcd_bit(d, &probs[m]);
-        m = (m << 1) | b;
-        v |= b << i;
-    }
-    return v;
-}
-
-static inline unsigned arcd_literal_matched(arc_dec *d, arc_p *probs, unsigned mbyte)
-{
-    unsigned m = 1;
-    for (int i = 7; i >= 0; i--) {
-        unsigned mb = (mbyte >> i) & 1;
-        unsigned b = arcd_bit(d, &probs[256 + (mb << 8) + m]);
-        m = (m << 1) | b;
-        if (b != mb) {
-            while (m < 256) m = (m << 1) | arcd_bit(d, &probs[m]);
-            break;
-        }
-    }
-    return m & 0xFF;
-}
-
-static inline unsigned arcd_len(arc_dec *d, tok_len *l, unsigned ps)
-{
-    if (!arcd_bit(d, &l->choice)) return 2 + arcd_tree(d, l->low[ps], 3);
-    if (!arcd_bit(d, &l->choice2)) return 10 + arcd_tree(d, l->mid[ps], 3);
-    return 18 + arcd_tree(d, l->high, 8);
-}
-
-static inline uint32_t arcd_dist(arc_dec *d, tok_model *m, unsigned len)
-{
-    unsigned lctx = len - 2 < 3 ? len - 2 : 3;
-    unsigned slot = arcd_tree(d, m->slot[lctx], 6);
-    if (slot < 4) return slot;
-    unsigned nb = (slot >> 1) - 1;
-    uint32_t base = (2u | (slot & 1)) << nb;
-    if (slot < TOK_END_SPEC) return base + arcd_rtree(d, m->spec[slot], nb);
-    uint32_t hi = arcd_direct(d, nb - 4);
-    return base + (hi << 4) + arcd_rtree(d, m->align, 4);
-}
+/* The token decoder itself is in dec.c (decode_tokens), with the coder
+ * state in locals. */
 
 #endif
