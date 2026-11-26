@@ -44,6 +44,20 @@ static inline unsigned ml_code(uint32_t v, unsigned *nbits, uint32_t *extra)
     return ML_DIRECT + (nb - ML_DLOG) * 2 + ((v >> (nb - 1)) & 1);
 }
 
+/* Branch-free versions for the encoder (lengths and offsets are not
+ * predictable): d = number of direct codes (16 or ML_DIRECT), dlog = log2 d.
+ * Same results as val_code / ml_code. */
+static inline unsigned code_bf(uint32_t v, unsigned dlog, unsigned *nbits, uint32_t *extra)
+{
+    unsigned nb = highbit32(v | 1);
+    int big = v >> dlog != 0;
+    unsigned n = big ? nb - 1 : 0;
+    *nbits = n;
+    *extra = v & ((1u << n) - 1);
+    unsigned cb = (1u << dlog) + (nb - dlog) * 2 + ((v >> ((nb - 1) & 31)) & 1);   /* used if big */
+    return big ? cb : v;
+}
+
 typedef struct { uint32_t base; uint8_t bits; } code_info;
 
 static inline void ml_table_init(code_info *t)

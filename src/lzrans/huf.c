@@ -129,8 +129,16 @@ static inline void hbw_flush(hbw *w)
 size_t huf_encode(uint8_t *out, const uint8_t *lits, size_t n, huf_table *prev)
 {
     if (!n) return 0;
-    uint32_t cnt[256] = {0};
-    for (size_t i = 0; i < n; i++) cnt[lits[i]]++;
+    /* 4 histograms: consecutive equal bytes do not wait on each other */
+    uint32_t cnt[256], c4[3][256];
+    memset(cnt, 0, sizeof(cnt));
+    memset(c4, 0, sizeof(c4));
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        cnt[lits[i]]++; c4[0][lits[i + 1]]++; c4[1][lits[i + 2]]++; c4[2][lits[i + 3]]++;
+    }
+    for (; i < n; i++) cnt[lits[i]]++;
+    for (unsigned s = 0; s < 256; s++) cnt[s] += c4[0][s] + c4[1][s] + c4[2][s];
     unsigned distinct = 0, last = 0;
     for (unsigned s = 0; s < 256; s++) if (cnt[s]) { distinct++; last = s; }
     if (distinct == 1) { out[0] = 1; out[1] = lits[0]; return 2; }
@@ -164,16 +172,39 @@ size_t huf_encode(uint8_t *out, const uint8_t *lits, size_t n, huf_table *prev)
             out[k++] = (uint8_t)(nt.len[s] | (s + 1 <= last ? nt.len[s + 1] << 4 : 0));
         huf_codes(&nt);
         nt.valid = 1;
-        *prev = nt;       /* the decoder builds the same table */
-        huf_build_dt(prev);
+        /* the decoder builds the same table (the encoder needs no dt) */
+        memcpy(prev->len, nt.len, sizeof(nt.len));
+        memcpy(prev->code, nt.code, sizeof(nt.code));
+        prev->valid = 1;
         t = prev;
     }
+    uint32_t ce[256];   /* code << 4 | length */
+    for (unsigned s = 0; s < 256; s++) ce[s] = (uint32_t)t->code[s] << 4 | t->len[s];
     size_t q = (n + 3) / 4, szpos = k;
     k += 12;
     for (unsigned st = 0; st < 4; st++) {
         size_t a = st * q < n ? st * q : n, b = (st + 1) * q < n ? (st + 1) * q : n;
-        hbw w = {0, 0, out + k};
-        for (size_t i = a; i < b; i++) hbw_put(&w, t->code[lits[i]], t->len[lits[i]]);
+        /* branch-free: 8-byte writes, 4 codes (<= 44 bits) per flush; the
+         * bytes are those of hbw_put (bytes past the end are zero, then
+         * overwritten by the next stream; out has huf_bound slack) */
+        uint64_t acc = 0;
+        unsigned nb = 0;
+        uint8_t *p = out + k;
+        size_t i = a;
+        for (; i + 4 <= b; i += 4) {
+            uint32_t e0 = ce[lits[i]], e1 = ce[lits[i + 1]], e2 = ce[lits[i + 2]], e3 = ce[lits[i + 3]];
+            acc |= (uint64_t)(e0 >> 4) << nb; nb += e0 & 15;
+            acc |= (uint64_t)(e1 >> 4) << nb; nb += e1 & 15;
+            acc |= (uint64_t)(e2 >> 4) << nb; nb += e2 & 15;
+            acc |= (uint64_t)(e3 >> 4) << nb; nb += e3 & 15;
+            wr64le(p, acc);
+            unsigned by = nb >> 3;
+            p += by;
+            acc = (acc >> (by * 4)) >> (by * 4);
+            nb &= 7;
+        }
+        hbw w = {acc, nb, p};
+        for (; i < b; i++) hbw_put(&w, t->code[lits[i]], t->len[lits[i]]);
         hbw_flush(&w);
         size_t sz = (size_t)(w.p - (out + k));
         if (st < 3) wr32le(out + szpos + 4 * st, (uint32_t)sz);

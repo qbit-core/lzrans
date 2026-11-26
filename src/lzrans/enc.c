@@ -569,12 +569,14 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     /* codes, and the extra bits in the order they are written: ll and ml
      * together (<= 16 + 16 bits, block size 2^18), then the offset */
     for (size_t i = 0; i < ns; i++) {
-        unsigned nl, nm, no = 0;
-        uint32_t el, em, eo = 0;
-        c->llc[i] = (uint8_t)val_code(c->seq_ll[i], &nl, &el);
-        c->mlc[i] = (uint8_t)ml_code(c->seq_ml[i] - LZR_ML_BASE, &nm, &em);
+        unsigned nl, nm, no;
+        uint32_t el, em, eo;
+        c->llc[i] = (uint8_t)code_bf(c->seq_ll[i], 4, &nl, &el);
+        c->mlc[i] = (uint8_t)code_bf(c->seq_ml[i] - LZR_ML_BASE, ML_DLOG, &nm, &em);
         uint32_t off = c->seq_dist[i];
-        c->ofc[i] = (uint8_t)(off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &no, &eo));
+        int rep = off < LZR_NUM_REPS;
+        unsigned oc = code_bf(rep ? 0 : off - LZR_NUM_REPS, 4, &no, &eo);
+        c->ofc[i] = (uint8_t)(rep ? off : LZR_NUM_REPS + oc);
         c->xlm[i] = el | em << nl;
         c->nlm[i] = (uint8_t)(nl + nm);
         c->xof[i] = eo;
@@ -608,14 +610,18 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
         /* common case: the three state transitions in one write (<= 27 bits) */
         const fse_table *T0 = &c->fse[0], *T1 = &c->fse[1], *T2 = &c->fse[2];
         uint32_t x0 = x[0], x1 = x[1], x2 = x[2];
+        /* branch-free flushes: n <= 7 + 27, then <= 7 + 32 + 24 (offsets
+         * < 2^27) bits between them */
         for (size_t i = ns; i-- > 0;) {
             unsigned n2, n1, n0;
             uint32_t b2 = fse_step(T2, &x2, c->ofc[i], &n2);
             uint32_t b1 = fse_step(T1, &x1, c->mlc[i], &n1);
             uint32_t b0 = fse_step(T0, &x0, c->llc[i], &n0);
-            fbw_put(&w, b2 | b1 << n2 | (uint64_t)b0 << (n2 + n1), n2 + n1 + n0);
-            fbw_put(&w, c->xlm[i], c->nlm[i]);
-            fbw_put(&w, c->xof[i], c->nof[i]);
+            fbw_add(&w, b2 | b1 << n2 | (uint64_t)b0 << (n2 + n1), n2 + n1 + n0);
+            fbw_flush8(&w);
+            fbw_add(&w, c->xlm[i], c->nlm[i]);
+            fbw_add(&w, c->xof[i], c->nof[i]);
+            fbw_flush8(&w);
         }
         x[0] = x0; x[1] = x1; x[2] = x2;
     } else {
