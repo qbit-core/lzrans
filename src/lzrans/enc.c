@@ -14,41 +14,18 @@
 #include "codes.h"
 #include "crc32.h"
 
-typedef struct {
-    uint8_t wlog, hlog, lazy;
-    uint16_t chain;   /* max hash-chain steps per search                    */
-    uint16_t nice;    /* stop searching once a match this long is found     */
-} level_params;
+#include "enc_internal.h"
 
-/* Window grows with level; chain depth and nice length trade speed/ratio. */
+/* Levels 1-6: hash chains + lazy parsing (window, hash bits, lazy depth,
+ * chain steps, nice length). Levels 7-9: binary tree + optimal parsing
+ * (chain = tree depth, opt = number of parsing passes). */
 static const level_params LEVELS[LZR_LEVEL_MAX + 1] = {
-    {0, 0, 0, 0, 0},
-    {20, 16, 0, 4, 16},     {21, 17, 1, 8, 24},     {22, 18, 1, 16, 32},
-    {22, 19, 1, 24, 48},    {23, 20, 2, 32, 64},    {23, 20, 2, 64, 96},
-    {24, 21, 2, 96, 128},   {24, 22, 2, 160, 192},  {25, 22, 2, 256, 273},
+    {0, 0, 0, 0, 0, 0},
+    {20, 16, 0, 4, 16, 0},    {21, 17, 1, 8, 24, 0},    {22, 18, 1, 16, 32, 0},
+    {22, 19, 1, 24, 48, 0},   {23, 20, 2, 32, 64, 0},   {23, 20, 2, 64, 96, 0},
+    {23, 20, 0, 16, 64, 1},   {24, 21, 0, 32, 128, 2},  {24, 22, 0, 48, 273, 2},
 };
 
-struct lzr_cctx {
-    level_params lp;
-    size_t wsize, wmask;
-    uint8_t *buf;          /* input history + pending data              */
-    size_t cap;            /* 2*wsize + block                            */
-    size_t pos;            /* first byte not yet compressed              */
-    size_t end;            /* bytes filled                               */
-    size_t ins;            /* next position to insert into the chains    */
-    uint32_t *head, *prev; /* stored as buffer index + 1, 0 = empty      */
-    uint32_t reps[LZR_NUM_REPS];
-    uint32_t crc;
-    uint64_t total_in;
-    int64_t content_size;
-    int header_done, finished;
-
-    /* per-block scratch */
-    uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
-    uint8_t *lits, *llc, *mlc, *ofc, *extra, *scratch, *blk;
-};
-
-#define MAX_SEQ (LZR_BLOCK_SIZE / LZR_MIN_MATCH + 1)
 
 lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 {
@@ -60,6 +37,12 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
         if (window_log < LZR_WLOG_MIN || window_log > LZR_WLOG_MAX) { free(c); return NULL; }
         c->lp.wlog = (uint8_t)window_log;
     }
+#ifdef LZR_TUNE   /* developer builds only: override level parameters */
+    if (getenv("LZR_DEPTH")) c->lp.chain = (uint16_t)atoi(getenv("LZR_DEPTH"));
+    if (getenv("LZR_NICE")) c->lp.nice = (uint16_t)atoi(getenv("LZR_NICE"));
+    if (getenv("LZR_PASSES")) c->lp.opt = (uint8_t)atoi(getenv("LZR_PASSES"));
+    if (getenv("LZR_WLOG")) c->lp.wlog = (uint8_t)atoi(getenv("LZR_WLOG"));
+#endif
     /* A window larger than the known input only wastes memory. */
     while (content_size >= 0 && c->lp.wlog > LZR_WLOG_MIN && ((uint64_t)1 << (c->lp.wlog - 1)) >= (uint64_t)content_size)
         c->lp.wlog--;
@@ -72,7 +55,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 
     c->buf = (uint8_t *)malloc(c->cap + LZR_SLACK);
     c->head = (uint32_t *)calloc((size_t)1 << c->lp.hlog, sizeof(uint32_t));
-    c->prev = (uint32_t *)calloc(c->wsize, sizeof(uint32_t));
+    if (!c->lp.opt) c->prev = (uint32_t *)calloc(c->wsize, sizeof(uint32_t));   /* chains: lazy levels only */
     c->seq_ll = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_ml = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_dist = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
@@ -83,7 +66,8 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->extra = (uint8_t *)malloc(MAX_SEQ * 8 + 16);
     c->scratch = (uint8_t *)malloc(2 * LZR_BLOCK_SIZE + 16);
     c->blk = (uint8_t *)malloc(64 + stream_bound(LZR_BLOCK_SIZE, ALPHA_LIT) + 3 * stream_bound(MAX_SEQ, ALPHA_CODE) + MAX_SEQ * 8 + 16);
-    if (!c->buf || !c->head || !c->prev || !c->seq_ll || !c->seq_ml || !c->seq_dist || !c->lits ||
+    if (c->lp.opt && opt_init(c)) { lzr_cctx_free(c); return NULL; }
+    if (!c->buf || !c->head || (!c->prev && !c->lp.opt) || !c->seq_ll || !c->seq_ml || !c->seq_dist || !c->lits ||
         !c->llc || !c->mlc || !c->ofc || !c->extra || !c->scratch || !c->blk) {
         lzr_cctx_free(c);
         return NULL;
@@ -94,6 +78,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 void lzr_cctx_free(lzr_cctx *c)
 {
     if (!c) return;
+    opt_free(c);
     free(c->buf); free(c->head); free(c->prev);
     free(c->seq_ll); free(c->seq_ml); free(c->seq_dist);
     free(c->lits); free(c->llc); free(c->mlc); free(c->ofc);
@@ -102,20 +87,6 @@ void lzr_cctx_free(lzr_cctx *c)
 }
 
 /* ---------------- match finding ---------------- */
-
-#ifndef LZR_HASH_LEN
-#define LZR_HASH_LEN 5
-#endif
-/* Hash of the next LZR_HASH_LEN bytes (reads 8; the extra bytes are shifted
- * out, and the buffer has slack so the read stays in bounds). Hashing more
- * than MIN_MATCH bytes keeps chains free of short, useless candidates;
- * 4-byte matches are still found through the repeat offsets. */
-static inline uint32_t hash4(const uint8_t *p, unsigned hlog)
-{
-    uint64_t v;
-    memcpy(&v, p, 8);
-    return (uint32_t)(((v << (64 - 8 * LZR_HASH_LEN)) * 0xCF1BBCDCB7A56463ull) >> (64 - hlog));
-}
 
 /* Insert positions [c->ins, upto) into the hash chains. */
 static inline void insert_upto(lzr_cctx *c, size_t upto)
@@ -129,20 +100,6 @@ static inline void insert_upto(lzr_cctx *c, size_t upto)
         c->head[h] = (uint32_t)(i + 1);
     }
     if (upto > c->ins) c->ins = upto;
-}
-
-static inline size_t match_len(const uint8_t *a, const uint8_t *b, size_t maxlen)
-{
-    size_t len = 0;
-    while (len + 8 <= maxlen) {
-        uint64_t x, y;
-        memcpy(&x, a + len, 8);
-        memcpy(&y, b + len, 8);
-        if (x != y) return len + ((size_t)__builtin_ctzll(x ^ y) >> 3);
-        len += 8;
-    }
-    while (len < maxlen && a[len] == b[len]) len++;
-    return len;
 }
 
 typedef struct { uint32_t len, off; int gain; } match_t;  /* off: 0..2 rep idx, else dist + 2 */
@@ -193,17 +150,6 @@ static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *r
         cand = next;
     }
     return best;
-}
-
-/* Map a chosen match to its offset code and update the repeat history. */
-static uint32_t commit_offset(uint32_t *reps, uint32_t off)
-{
-    uint32_t dist = off < LZR_NUM_REPS ? reps[off] : off - 2;
-    if (dist == reps[0]) return 0;
-    if (dist == reps[1]) { reps[1] = reps[0]; reps[0] = dist; return 1; }
-    if (dist == reps[2]) { reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = dist; return 2; }
-    reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = dist;
-    return dist + 2;
 }
 
 /* Lazy parse of buf[bs, be). Returns number of sequences; *nlit literals. */
@@ -267,7 +213,8 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
     memcpy(saved_reps, c->reps, sizeof(saved_reps));
 
     size_t nlit;
-    size_t ns = parse_block(c, bs, be, &nlit);
+    size_t ns = c->lp.opt ? opt_parse_block(c, bs, be, &nlit) : parse_block(c, bs, be, &nlit);
+    if (ns == (size_t)-1) return LZR_ERR_NOMEM;
 
     /* Sequences -> code symbols + raw extra bits (LL, ML, OF order). */
     bitw bw = {0, 0, c->extra};
@@ -330,7 +277,8 @@ static void slide(lzr_cctx *c)
     const uint32_t d = (uint32_t)delta;
     size_t hs = (size_t)1 << c->lp.hlog;
     for (size_t i = 0; i < hs; i++) c->head[i] = c->head[i] > d ? c->head[i] - d : 0;
-    for (size_t i = 0; i < c->wsize; i++) c->prev[i] = c->prev[i] > d ? c->prev[i] - d : 0;
+    if (c->prev) for (size_t i = 0; i < c->wsize; i++) c->prev[i] = c->prev[i] > d ? c->prev[i] - d : 0;
+    if (c->lp.opt) opt_slide(c, d);
 }
 
 int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
@@ -348,9 +296,10 @@ int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
         memset(c->buf + c->end, 0, 8);   /* deterministic hashing past the end */
         src += take;
         n -= take;
-        /* Compress full blocks, but keep 8 bytes of look-ahead so hashing
-         * at a block's last positions sees real data. */
-        while (c->end - c->pos >= LZR_BLOCK_SIZE + 8) {
+        /* Compress full blocks, but keep LZR_LOOKAHEAD bytes after the block
+         * so hashing and tree comparisons at its last positions see real
+         * data (and the output does not depend on input chunking). */
+        while (c->end - c->pos >= LZR_BLOCK_SIZE + LZR_LOOKAHEAD) {
             int r = emit_block(c, c->pos, c->pos + LZR_BLOCK_SIZE, out);
             if (r) return r;
             c->pos += LZR_BLOCK_SIZE;
