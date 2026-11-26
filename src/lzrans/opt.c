@@ -58,7 +58,7 @@ typedef struct {
 } onode;
 
 typedef struct {
-    uint32_t lit[256], llc[VAL_CODES], mlc[VAL_CODES], ofc[OF_CODES];
+    uint32_t lit[256], llc[VAL_CODES], mlc[ML_CODES], ofc[OF_CODES];
 } prices_t;
 
 #ifndef LZR_OPT_FULL
@@ -114,6 +114,15 @@ typedef struct {
     uint32_t *last2, *last3, *sh2, *sh3;
 } opt_state;
 #define SH3_LOG 16
+#ifndef COMBOS
+#define COMBOS 1
+#endif
+#ifndef SH_STATIC_MIN
+#define SH_STATIC_MIN 3
+#endif
+#ifndef SH_ON
+#define SH_ON 1
+#endif
 #ifndef SH2_MAXD
 #define SH2_MAXD 256
 #endif
@@ -495,7 +504,8 @@ static void prices_from_counts(uint32_t *price, const uint32_t *cnt, unsigned n)
 static void default_prices(prices_t *pr)
 {
     for (unsigned s = 0; s < 256; s++) pr->lit[s] = 6 * BITCOST;
-    for (unsigned s = 0; s < VAL_CODES; s++) { pr->llc[s] = 3 * BITCOST; pr->mlc[s] = 4 * BITCOST; }
+    for (unsigned s = 0; s < VAL_CODES; s++) pr->llc[s] = 3 * BITCOST;
+    for (unsigned s = 0; s < ML_CODES; s++) pr->mlc[s] = 4 * BITCOST;
     pr->llc[0] = 2 * BITCOST;
     pr->ofc[0] = 2 * BITCOST; pr->ofc[1] = 3 * BITCOST; pr->ofc[2] = 3 * BITCOST;
     for (unsigned s = LZR_NUM_REPS; s < OF_CODES; s++) pr->ofc[s] = 6 * BITCOST;
@@ -504,19 +514,19 @@ static void default_prices(prices_t *pr)
 /* Statistics of the sequences currently in c->seq_* / c->lits. */
 static void prices_from_parse(lzr_cctx *c, prices_t *pr, size_t ns, size_t nlit)
 {
-    uint32_t lit[256] = {0}, llc[VAL_CODES] = {0}, mlc[VAL_CODES] = {0}, ofc[OF_CODES] = {0};
+    uint32_t lit[256] = {0}, llc[VAL_CODES] = {0}, mlc[ML_CODES] = {0}, ofc[OF_CODES] = {0};
     unsigned nb;
     uint32_t ex;
     for (size_t i = 0; i < nlit; i++) lit[c->lits[i]]++;
     for (size_t i = 0; i < ns; i++) {
         llc[val_code(c->seq_ll[i], &nb, &ex)]++;
-        if (c->seq_ml[i] >= LZR_ML_BASE) mlc[val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex)]++;   /* type 4: may be 1 */
+        if (c->seq_ml[i] >= LZR_ML_BASE) mlc[ml_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex)]++;   /* type 4: may be 1 */
         uint32_t off = c->seq_dist[i];
         ofc[off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &nb, &ex)]++;
     }
     prices_from_counts(pr->lit, lit, 256);
     prices_from_counts(pr->llc, llc, VAL_CODES);
-    prices_from_counts(pr->mlc, mlc, VAL_CODES);
+    prices_from_counts(pr->mlc, mlc, ML_CODES);
     prices_from_counts(pr->ofc, ofc, OF_CODES);
 }
 
@@ -539,7 +549,7 @@ static void build_tables(opt_state *st)
 {
     for (uint32_t L = LZR_ML_BASE; L < ML_TABLE; L++) {
         unsigned nb; uint32_t ex;
-        unsigned mc = val_code(L - LZR_ML_BASE, &nb, &ex);
+        unsigned mc = ml_code(L - LZR_ML_BASE, &nb, &ex);
         st->ml_p[L] = (int32_t)(st->pr.mlc[mc] + nb * BITCOST);
     }
     for (uint32_t L = 0; L < LL_TABLE; L++) st->ll_p[L] = ll_price(&st->pr, L);
@@ -654,13 +664,14 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             }
             /* literal + rep0, for when the literal is not the cheapest way
              * to i + 1 */
-            if (adaptive && cur + 3 <= be && n->reps[0] < cur + 1 &&
+            if (COMBOS && cur + 3 <= be && n->reps[0] < cur + 1 &&
                 cp[1] == cp[1 - (ptrdiff_t)n->reps[0]] && cp[2] == cp[2 - (ptrdiff_t)n->reps[0]]) {
                 uint32_t d = n->reps[0], lim = (uint32_t)(be - cur - 1), len2;
                 if (lim > TOK_MAXLEN) lim = TOK_MAXLEN;
                 len2 = (uint32_t)match_len(cp + 1 - d, cp + 1, lim);
                 unsigned s2 = tok_after_lit(s), ps2 = (ps + 1) & (TOK_POS - 1);
-                int32_t price = lp + arc_bit_price(st, pm->is_match[s2][ps2], 1) + arc_bit_price(st, pm->is_rep[s2], 1) +
+                int32_t price = !adaptive ? lp + st->ll_p[0] + of_price(pr, 0) + st->ml_p[len2] :
+                                lp + arc_bit_price(st, pm->is_match[s2][ps2], 1) + arc_bit_price(st, pm->is_rep[s2], 1) +
                                 arc_bit_price(st, pm->is_rep0[s2], 0) + arc_bit_price(st, pm->is_rep0_long[s2][ps2], 1) +
                                 st->lenp[1][ps2][len2];
                 size_t t = i + 1 + len2;
@@ -694,7 +705,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 if (len > best_len) { best_len = len; best_off = r; }
             }
             uint32_t prevlen = LZR_MIN_MATCH - 1;
-            if (adaptive) {        /* 2- and 3-byte matches (tree finds >= 4) */
+            if (SH_ON) {        /* 2- and 3-byte matches (tree finds >= 4) */
                 uint32_t d2 = st->sh2[cur - bs], d3 = st->sh3[cur - bs];
                 for (unsigned t = 0; t < 2; t++) {
                     uint32_t d = t ? d3 : d2;
@@ -705,6 +716,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                     /* short lengths only at short distances: a far 2-byte
                      * match rarely pays and evicts a repeat offset */
                     uint32_t len = (uint32_t)match_len(cp - d, cp, maxlen), lmin = d <= SH2_MAXD ? 2 : d <= SH3_MAXD ? 3 : 4;
+                    if (!adaptive && lmin < SH_STATIC_MIN) lmin = SH_STATIC_MIN;
                     if (len < lmin) continue;
                     cl[nc] = len; co[nc] = off; cmin[nc] = lmin; nc++;
                     if (len > best_len) { best_len = len; best_off = off; }
@@ -767,7 +779,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 }
                 /* match + literal + rep0 (the literal breaks the match, the
                  * same distance continues after it) */
-                if (adaptive && Lmax <= TOK_MAXLEN && Lmax + 3 <= maxlen) {
+                if (COMBOS && Lmax <= TOK_MAXLEN && Lmax + 3 <= maxlen) {
                     uint32_t d = co[k] < LZR_NUM_REPS ? n->reps[co[k]] : co[k] - 2;
                     const uint8_t *q = cp + Lmax + 1;
                     if (q[0] == q[-(ptrdiff_t)d] && q[1] == q[1 - (ptrdiff_t)d]) {
@@ -777,7 +789,8 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                         unsigned s1 = co[k] < LZR_NUM_REPS ? tok_after_rep(s) : tok_after_match(s);
                         unsigned ps1 = (ps + Lmax) & (TOK_POS - 1), ps2 = (ps1 + 1) & (TOK_POS - 1);
                         unsigned s2 = tok_after_lit(s1);
-                        int32_t price = full + arc_bit_price(st, pm->is_match[s1][ps1], 0) +
+                        int32_t price = !adaptive ? full + (int32_t)pr->lit[q[-1]] + llp(st, 1) + of_price(pr, 0) + st->ml_p[len2] :
+                                        full + arc_bit_price(st, pm->is_match[s1][ps1], 0) +
                                         matched_price(st, pm->lit[q[-2] >> 5], q[-1], q[-1 - (ptrdiff_t)d]) +
                                         arc_bit_price(st, pm->is_match[s2][ps2], 1) + arc_bit_price(st, pm->is_rep[s2], 1) +
                                         arc_bit_price(st, pm->is_rep0[s2], 0) + arc_bit_price(st, pm->is_rep0_long[s2][ps2], 1) +
@@ -889,7 +902,7 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
         if (pthread_create(&st->pend_tid, NULL, gather_async, st) == 0) st->pending = 1;
     }
 #endif
-    if (c->adaptive) short_matches(c, st, bs, be);
+    short_matches(c, st, bs, be);
     TACC(lzr_t_gather);
     if (!c->have_stats) default_prices(&st->pr);
 

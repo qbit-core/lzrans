@@ -40,7 +40,7 @@ struct lzr_dctx {
     uint64_t total_out;
     int64_t content_size;
     uint8_t *lits;     /* type 5 literals of the current block */
-    code_info ct[VAL_CODES];
+    code_info ct[VAL_CODES], mt[ML_CODES];
     tok_model tm;      /* block type 4 model, persists across blocks */
     huf_table huf;     /* block type 5 tables, kept for the repeat modes */
     fse_table fse[3];
@@ -59,6 +59,7 @@ lzr_dctx *lzr_dctx_new(void)
     d->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE + LZR_SLACK);
     if (!d->lits) { lzr_dctx_free(d); return NULL; }
     code_table_init(d->ct);
+    ml_table_init(d->mt);
     tok_model_init(&d->tm);
     return d;
 }
@@ -271,7 +272,7 @@ static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
         memcpy(o, lp, nlit);
         return LZR_OK;
     }
-    const unsigned alpha[3] = {VAL_CODES, VAL_CODES, OF_CODES};
+    const unsigned alpha[3] = {VAL_CODES, ML_CODES, OF_CODES};
     unsigned rsym[3] = {0, 0, 0};
     int rle[3];
     for (int t = 0; t < 3; t++) {
@@ -308,7 +309,8 @@ static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
             seq_dent *e = &tb[t][u];
             e->nb = rle[t] ? 0 : T->dt[u].nb;
             e->next = rle[t] ? 0 : T->dt[u].base;
-            if (t < 2) { e->base = d->ct[sym].base + (t == 1 ? LZR_ML_BASE : 0); e->xb = d->ct[sym].bits; }
+            if (t == 0) { e->base = d->ct[sym].base; e->xb = d->ct[sym].bits; }
+            else if (t == 1) { e->base = d->mt[sym].base + LZR_ML_BASE; e->xb = d->mt[sym].bits; }
             else if (sym < LZR_NUM_REPS) { e->base = sym; e->xb = 0; }
             else { e->base = d->ct[sym - LZR_NUM_REPS].base + 1 + 3; e->xb = d->ct[sym - LZR_NUM_REPS].bits; }
         }
@@ -323,6 +325,7 @@ static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
     unsigned used = (unsigned)__builtin_clzll(bc) + 1;
     int berr = 0;
 #define BGET(nb) ((uint32_t)(((bc << (used & 63)) >> 1) >> (63 - (nb))))
+#define BGET64(nb) (((bc << (used & 63)) >> 1) >> (63 - (nb)))
 #define BRELOAD()                                                              \
     do {                                                                       \
         if (bp >= bstart + 8) { bp -= used >> 3; used &= 7; }                  \
@@ -348,19 +351,25 @@ static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
 #define DECODE_SEQ(LL, ML, DIST)                                               \
     do {                                                                       \
         const seq_dent el_ = dll[sll], em_ = dml[sml], eo_ = dof[sof];         \
-        uint32_t ov_ = eo_.base + BGET(eo_.xb);                                \
-        used += eo_.xb;                                                        \
+        /* all extra bits in one read: ll, ml, of were written in that order; \
+         * at most 25 + 31 bits (ll + ml <= block size), so one reload */      \
+        const unsigned xl_ = el_.xb, xm_ = em_.xb, xo_ = eo_.xb;               \
+        uint64_t v_ = BGET64(xl_ + xm_ + xo_); used += xl_ + xm_ + xo_;        \
+        LL = el_.base + (uint32_t)(v_ & ((1u << xl_) - 1));                    \
+        ML = em_.base + (uint32_t)((v_ >> xl_) & ((1u << xm_) - 1));           \
+        uint32_t ov_ = eo_.base + (uint32_t)(v_ >> (xl_ + xm_));               \
         if (ov_ >= LZR_NUM_REPS) { DIST = ov_ - 3; rep2 = rep1; rep1 = rep0; rep0 = DIST; } \
         else if (ov_ == 0) { DIST = rep0; }                                    \
         else if (ov_ == 1) { DIST = rep1; rep1 = rep0; rep0 = DIST; }          \
         else { DIST = rep2; rep2 = rep1; rep1 = rep0; rep0 = DIST; }           \
         BRELOAD();                                                             \
-        ML = em_.base + BGET(em_.xb); used += em_.xb;                          \
-        LL = el_.base + BGET(el_.xb); used += el_.xb;                          \
-        BRELOAD();                                                             \
-        sll = el_.next + BGET(el_.nb); used += el_.nb;                         \
-        sml = em_.next + BGET(em_.nb); used += em_.nb;                         \
-        sof = eo_.next + BGET(eo_.nb); used += eo_.nb;                         \
+        {   /* the three state updates in one read (of, ml, ll written) */     \
+            const unsigned no_ = eo_.nb, nm_ = em_.nb, nl_ = el_.nb;           \
+            uint32_t v_ = BGET(no_ + nm_ + nl_); used += no_ + nm_ + nl_;      \
+            sof = eo_.next + (v_ & ((1u << no_) - 1));                         \
+            sml = em_.next + ((v_ >> no_) & ((1u << nm_) - 1));                \
+            sll = el_.next + (v_ >> (no_ + nm_));                              \
+        }                                                                      \
         BRELOAD();                                                             \
     } while (0)
     /* Execute it: literal run, then the match (checked here). */

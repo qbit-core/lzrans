@@ -27,7 +27,34 @@ static inline unsigned val_code(uint32_t v, unsigned *nbits, uint32_t *extra)
     return 16 + (nb - 4) * 2 + ((v >> (nb - 1)) & 1);
 }
 
+/* Match lengths: values 0..ML_DIRECT-1 are their own code (finer steps
+ * where lengths are common), then two codes per power of two as above. */
+#ifndef ML_DLOG
+#define ML_DLOG 5
+#endif
+#define ML_DIRECT (1u << ML_DLOG)
+#define ML_CODES (ML_DIRECT + 2 * (LZR_BLOCK_LOG - ML_DLOG))   /* ml - 2 < 2^18 */
+
+static inline unsigned ml_code(uint32_t v, unsigned *nbits, uint32_t *extra)
+{
+    if (v < ML_DIRECT) { *nbits = 0; *extra = 0; return v; }
+    unsigned nb = highbit32(v);
+    *nbits = nb - 1;
+    *extra = v & ((1u << (nb - 1)) - 1);
+    return ML_DIRECT + (nb - ML_DLOG) * 2 + ((v >> (nb - 1)) & 1);
+}
+
 typedef struct { uint32_t base; uint8_t bits; } code_info;
+
+static inline void ml_table_init(code_info *t)
+{
+    for (unsigned c = 0; c < ML_CODES; c++) {
+        if (c < ML_DIRECT) { t[c].base = c; t[c].bits = 0; continue; }
+        unsigned k = c - ML_DIRECT, nb = ML_DLOG + k / 2, hb = k & 1;
+        t[c].base = (1u << nb) | (hb << (nb - 1));
+        t[c].bits = (uint8_t)(nb - 1);
+    }
+}
 
 /* Fill table for codes 0..VAL_CODES-1. */
 static inline void code_table_init(code_info *t)

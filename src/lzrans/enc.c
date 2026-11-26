@@ -285,14 +285,14 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     if (!ns) return k;
 
     uint8_t *codes[3] = {c->llc, c->mlc, c->ofc};
-    const unsigned alpha[3] = {VAL_CODES, VAL_CODES, OF_CODES};
+    const unsigned alpha[3] = {VAL_CODES, ML_CODES, OF_CODES};
     uint32_t cnt[3][FSE_MAXSYM];
     memset(cnt, 0, sizeof(cnt));
     for (size_t i = 0; i < ns; i++) {
         unsigned nb;
         uint32_t ex;
         c->llc[i] = (uint8_t)val_code(c->seq_ll[i], &nb, &ex);
-        c->mlc[i] = (uint8_t)val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
+        c->mlc[i] = (uint8_t)ml_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
         uint32_t off = c->seq_dist[i];
         c->ofc[i] = (uint8_t)(off < LZR_NUM_REPS ? off : LZR_NUM_REPS + val_code(off - 3, &nb, &ex));
         cnt[0][c->llc[i]]++; cnt[1][c->mlc[i]]++; cnt[2][c->ofc[i]]++;
@@ -327,7 +327,7 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
         uint32_t ex;
         val_code(c->seq_ll[i], &nb, &ex);
         fbw_put(&w, ex, nb);
-        val_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
+        ml_code(c->seq_ml[i] - LZR_ML_BASE, &nb, &ex);
         fbw_put(&w, ex, nb);
         uint32_t off = c->seq_dist[i];
         if (off >= LZR_NUM_REPS) { val_code(off - 3, &nb, &ex); fbw_put(&w, ex, nb); }
