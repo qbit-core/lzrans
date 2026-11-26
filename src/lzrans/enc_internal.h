@@ -17,6 +17,7 @@ typedef struct {
     uint16_t chain;   /* hash-chain steps (lazy) or tree depth (opt) per search */
     uint16_t nice;    /* stop searching once a match this long is found          */
     uint8_t opt;      /* 0 = lazy parser, N = optimal parser with N passes        */
+    uint8_t row;      /* lazy levels: log2 of the row size (row match finder)    */
 } level_params;
 
 
@@ -28,7 +29,11 @@ struct lzr_cctx {
     size_t pos;            /* first byte not yet compressed              */
     size_t end;            /* bytes filled                               */
     size_t ins;            /* next position to insert into the chains    */
-    uint32_t *head, *prev; /* stored as buffer index + 1, 0 = empty      */
+    uint32_t *head;        /* levels 7-9: buffer index + 1; levels 1-6 (row
+                            * slots): base + buffer index + 1 (see slide()); 0 = empty */
+    size_t base;           /* levels 1-6: bytes slid out since the last rebase */
+    uint8_t *rtag, *rhead; /* row finder: 8-bit tags (head[] holds the
+                            * positions) and each row's newest slot       */
     uint32_t reps[LZR_NUM_REPS];
     xxh64_state xs;        /* checksum of the original content */
     uint64_t total_in;
@@ -53,6 +58,8 @@ struct lzr_cctx {
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
     uint8_t *lits, *llc, *mlc, *ofc, *blk;
+    uint32_t *xlm, *xof;   /* type 5: extra bits (ll | ml << n, offset)     */
+    uint8_t *nlm, *nof;    /* and their bit counts                          */
 };
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
@@ -72,16 +79,10 @@ struct lzr_cctx {
 #ifndef LZR_HASH_LEN
 #define LZR_HASH_LEN 5
 #endif
-/* Hash of the next LZR_HASH_LEN bytes (reads 8; the extra bytes are shifted
- * out, and the buffer has slack so the read stays in bounds). Hashing more
- * than MIN_MATCH bytes keeps chains free of short, useless candidates;
- * 4-byte matches are still found through the repeat offsets. */
-static inline uint32_t hash4(const uint8_t *p, unsigned hlog)
-{
-    uint64_t v;
-    memcpy(&v, p, 8);
-    return (uint32_t)(((v << (64 - 8 * LZR_HASH_LEN)) * 0xCF1BBCDCB7A56463ull) >> (64 - hlog));
-}
+/* The lazy levels hash the next LZR_HASH_LEN bytes (enc.c row_hash): more
+ * than MIN_MATCH keeps rows free of short, useless candidates; 4-byte
+ * matches are still found through the repeat offsets. Hashes read 8
+ * bytes; the buffer has slack so the read stays in bounds. */
 
 static inline size_t match_len(const uint8_t *a, const uint8_t *b, size_t maxlen)
 {
