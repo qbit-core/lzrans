@@ -271,11 +271,11 @@ def test_threads_validated():
         lzrans.Compressor(threads=99)
 
 
-@pytest.mark.parametrize("level", [6, 9])
+@pytest.mark.parametrize("level", [3, 8, 9])
 def test_adaptive_model_survives_stored_blocks(level):
-    # Levels 6-9 carry an adaptive token model (and its state) across
-    # blocks; incompressible blocks are stored and must leave it untouched
-    # on both sides.
+    # Blocks carry state across blocks (type 5: Huffman / tANS tables for
+    # the repeat modes; type 4: the adaptive token model); incompressible
+    # blocks are stored and must leave it untouched on both sides.
     rnd = random.Random(7)
     parts = []
     for i in range(6):
@@ -300,10 +300,10 @@ def _block_types(blob):
             return types
 
 
-@pytest.mark.parametrize("level,btype", [(1, 1), (5, 1), (6, 4), (9, 4)])
+@pytest.mark.parametrize("level,btype", [(1, 5), (6, 5), (8, 5), (9, 4)])
 def test_block_type_by_level(level, btype):
     blob = lzrans.compress(_text(3 * BS), level=level)
-    assert blob[4] == 4                              # format version
+    assert blob[4] == 5                              # format version
     assert set(_block_types(blob)) == {btype, 2}
 
 

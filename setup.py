@@ -14,8 +14,9 @@ setup(
                 "src/lzrans/enc.c",
                 "src/lzrans/dec.c",
                 "src/lzrans/opt.c",
-                "src/lzrans/rans.c",
                 "src/lzrans/crc32.c",
+                "src/lzrans/huf.c",
+                "src/lzrans/fse.c",
             ],
             depends=sorted(glob.glob("src/lzrans/*.h")),   # rebuild when a header changes
             include_dirs=["src/lzrans"],

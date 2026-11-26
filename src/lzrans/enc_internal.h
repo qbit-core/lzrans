@@ -8,6 +8,9 @@
 #include "codes.h"
 #include "arc.h"
 #include "x86.h"
+#include "huf.h"
+#include "fse.h"
+#include "xxh64.h"
 
 typedef struct {
     uint8_t wlog, hlog, lazy;
@@ -27,7 +30,7 @@ struct lzr_cctx {
     size_t ins;            /* next position to insert into the chains    */
     uint32_t *head, *prev; /* stored as buffer index + 1, 0 = empty      */
     uint32_t reps[LZR_NUM_REPS];
-    uint32_t crc;
+    xxh64_state xs;        /* checksum of the original content */
     uint64_t total_in;
     int64_t content_size;
     int header_done, finished;
@@ -40,18 +43,22 @@ struct lzr_cctx {
     size_t bt_maxdist;     /* farthest tree node followed (see opt_init)   */
     int adaptive;          /* emit block type 4 (token range coding)        */
     tok_model *tm;         /* [0] = live model, [1] = copy for rollback     */
+    /* block type 5: tables the decoder holds (repeat modes), and copies
+     * for the stored-block rollback */
+    huf_table *huf;        /* [0] live, [1] rollback                        */
+    fse_table *fse;        /* [0..2] ll/ml/of live, [3..5] rollback         */
     lzr_x86 x86;           /* x86 filter state (if x86tmp)                 */
     uint8_t *x86tmp;       /* x86 filter work buffer, NULL = no filter     */
 
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
-    uint8_t *lits, *llc, *mlc, *ofc, *extra, *scratch, *blk;
+    uint8_t *lits, *llc, *mlc, *ofc, *blk;
 };
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define LZR_MAX_THREADS 16
 #ifndef LZR_ADAPTIVE_LEVEL
-#define LZR_ADAPTIVE_LEVEL 6   /* levels >= this use block type 4 */
+#define LZR_ADAPTIVE_LEVEL 9   /* levels >= this use block type 4 */
 #endif
 #ifndef LZR_HAVE_THREADS
 #if defined(_WIN32)

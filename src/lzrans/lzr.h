@@ -27,7 +27,7 @@
 #include "common.h"
 
 #define LZR_MAGIC          "LZRN"
-#define LZR_VERSION        4
+#define LZR_VERSION        5
 #define LZR_FLAG_ENCRYPTED 0x01u   /* reserved: future AEAD envelope       */
 #define LZR_FLAG_SIZE      0x02u   /* header carries the content size       */
 #define LZR_FLAG_X86       0x04u   /* content passed the x86 filter (x86.h) */
@@ -65,6 +65,11 @@ void lzr_dctx_free(lzr_dctx *d);
  * After the end, *consumed (if given) tells how many bytes of src belonged
  * to the frame. */
 int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size_t *consumed);
+/* One-buffer mode: the caller passes this same `out` to every write and
+ * leaves it alone until the end. Output is then decoded in place (the
+ * output is the history): no copy, no history allocation. Call before the
+ * first write. Ignored for x86-filtered frames. */
+int lzr_dctx_set_output(lzr_dctx *d, lzr_buf *out);
 
 /* Parse the frame header only. Returns header length, or LZR_ERR_*. */
 int lzr_frame_header(const uint8_t *src, size_t n, int *window_log, uint8_t *flags, int64_t *content_size);

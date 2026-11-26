@@ -28,15 +28,6 @@ static inline unsigned highbit32(uint32_t v) { return 31u - (unsigned)__builtin_
 #define LZR_NUM_REPS    3
 #define LZR_SLACK       32                     /* over-allocation for wildcopy   */
 
-/* ---- rANS parameters ---- */
-#define RANS_SCALE_BITS 12
-#define RANS_M          (1u << RANS_SCALE_BITS)   /* 4096 */
-#define RANS_L          (1u << 23)                /* lower state bound */
-
-/* Alphabets: literal bytes, and the three sequence code streams. */
-#define ALPHA_LIT   256
-#define ALPHA_CODE  72
-
 /* ---- error codes ---- */
 enum {
     LZR_OK = 0,

@@ -140,7 +140,8 @@ static PyObject *py_decompress(PyObject *self, PyObject *arg)
     else {
         /* Pre-size the output when the header carries the content size. */
         r = (hr > 0 && csize > 0 && (uint64_t)csize <= (uint64_t)in.len * 4096u + (1u << 20))
-                ? buf_reserve(&out, (size_t)csize) : LZR_OK;
+                ? buf_reserve(&out, (size_t)csize + 64) : LZR_OK;
+        if (!r) r = lzr_dctx_set_output(d, &out);
         if (!r) r = lzr_dctx_write(d, (const uint8_t *)in.buf, (size_t)in.len, &out, &used);
         lzr_dctx_free(d);
     }

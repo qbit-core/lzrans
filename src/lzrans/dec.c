@@ -2,40 +2,49 @@
  * dec.c - streaming decoder.
  *
  * Input is buffered until a whole block is available (its header gives
- * comp_len). Each compressed block is decoded in two phases:
- *   1. the four rANS streams (literals, ll/ml/of codes) are decoded into
- *      flat arrays with tight table-lookup loops;
- *   2. the sequence loop reads code + extra bits, copies the literal run
- *      and the match into the history buffer (16-byte wildcopy where safe).
- * The history buffer keeps the last 2^window_log bytes so matches can
- * reach into previous blocks.
+ * comp_len). Block type 5: the Huffman literals are decoded into an array
+ * first; then one loop decodes each sequence from the tANS bit stream
+ * (a few sequences ahead, prefetching the match source) and copies its
+ * literal run and match with fixed-size chunks. Block type 4: one range
+ * decoder loop. Output goes to a history buffer that keeps the last
+ * 2^window_log bytes, or, in one-buffer mode, straight into the output.
  */
 #include "lzr.h"
-#include "rans.h"
 #include "codes.h"
-#include "crc32.h"
+#include "xxh64.h"
 #include "arc.h"
 #include "x86.h"
+#include "huf.h"
+#include "fse.h"
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define MAX_COMP (2 * LZR_BLOCK_SIZE + 65536)   /* sanity cap on comp_len */
 
 enum { ST_HEADER, ST_BLOCKS, ST_DONE };
 
+typedef struct {
+    uint32_t base;   /* value without its extra bits                 */
+    uint16_t next;   /* tANS: next state = next + (nb bits)          */
+    uint8_t nb, xb;  /* tANS bits, extra bits                        */
+} seq_dent;
+
 struct lzr_dctx {
     int state;
     lzr_buf in;
     size_t ipos;
-    uint8_t *hist;
+    uint8_t *hist;     /* history: own buffer, or the output (direct mode) */
+    lzr_buf *direct;   /* lzr_dctx_set_output(): decode into this buffer   */
     size_t hcap, wsize, op;
     uint32_t reps[LZR_NUM_REPS];
-    uint32_t crc;
+    xxh64_state xs;    /* checksum of the decoded content */
     uint64_t total_out;
     int64_t content_size;
-    uint8_t *lits, *llc, *mlc, *ofc;
-    rans_dslot *tbl;
+    uint8_t *lits;     /* type 5 literals of the current block */
     code_info ct[VAL_CODES];
     tok_model tm;      /* block type 4 model, persists across blocks */
+    huf_table huf;     /* block type 5 tables, kept for the repeat modes */
+    fse_table fse[3];
+    seq_dent sq[3][FSE_L];   /* per-block sequence decoding tables */
     lzr_x86 x86;
     uint8_t *x86tmp;   /* x86 filter work buffer, NULL = no filter */
 };
@@ -43,15 +52,12 @@ struct lzr_dctx {
 lzr_dctx *lzr_dctx_new(void)
 {
     lzr_dctx *d = (lzr_dctx *)calloc(1, sizeof(*d));
+    if (d) xxh64_init(&d->xs);
     if (!d) return NULL;
     d->reps[0] = 1; d->reps[1] = 4; d->reps[2] = 8;
     d->content_size = -1;
     d->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE + LZR_SLACK);
-    d->llc = (uint8_t *)malloc(MAX_SEQ);
-    d->mlc = (uint8_t *)malloc(MAX_SEQ);
-    d->ofc = (uint8_t *)malloc(MAX_SEQ);
-    d->tbl = (rans_dslot *)malloc(RANS_M * sizeof(rans_dslot));
-    if (!d->lits || !d->llc || !d->mlc || !d->ofc || !d->tbl) { lzr_dctx_free(d); return NULL; }
+    if (!d->lits) { lzr_dctx_free(d); return NULL; }
     code_table_init(d->ct);
     tok_model_init(&d->tm);
     return d;
@@ -60,9 +66,10 @@ lzr_dctx *lzr_dctx_new(void)
 void lzr_dctx_free(lzr_dctx *d)
 {
     if (!d) return;
-    free(d->in.p); free(d->hist);
+    free(d->in.p);
+    if (!d->direct) free(d->hist);
     free(d->x86tmp);
-    free(d->lits); free(d->llc); free(d->mlc); free(d->ofc); free(d->tbl);
+    free(d->lits);
     free(d);
 }
 
@@ -87,92 +94,29 @@ int lzr_frame_header(const uint8_t *src, size_t n, int *window_log, uint8_t *fla
 }
 
 /* Copy len bytes from op - dist to op; regions may overlap (dist < len).
- * May write up to 15 bytes past op + len (buffer has LZR_SLACK). */
+ * Fixed-size chunks only (no library calls); may write up to 15 bytes
+ * past op + len (buffers have LZR_SLACK). */
 static inline void copy_match(uint8_t *op, size_t dist, size_t len)
 {
     const uint8_t *src = op - dist;
     if (dist >= 16) {
         for (size_t k = 0; k < len; k += 16) memcpy(op + k, src + k, 16);
-    } else if (dist == 1) {
-        memset(op, *src, len);
+    } else if (dist >= 8) {
+        for (size_t k = 0; k < len; k += 8) memcpy(op + k, src + k, 8);
     } else {
-        /* Short period: replicate one period, then double the span. */
-        size_t k = 0;
-        while (k < len && k < dist) { op[k] = src[k]; k++; }
-        while (k < len) {
-            size_t chunk = k < len - k ? k : len - k;
-            memcpy(op + k, op, chunk);
-            k += chunk;
-        }
+        /* one period byte by byte, then 8-byte chunks from a whole number
+         * of periods back (8 <= period * m <= 14) */
+        for (size_t k = 0; k < 8; k++) op[k] = src[k];
+        size_t back = dist * ((8 + dist - 1) / dist);
+        for (size_t k = 8; k < len; k += 8) memcpy(op + k, op + k - back, 8);
     }
 }
 
-/* Block type 1: rANS streams + extra bits. */
-static int decode_block(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+/* Literal run: 16-byte chunks (source and destination have slack). */
+static inline void copy_lits(uint8_t *o, const uint8_t *lp, size_t ll)
 {
-    if (avail < 8) return LZR_ERR_CORRUPT;
-    size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8, c;
-    if (nlit > raw || ns > MAX_SEQ || ns * LZR_ML_BASE + nlit > raw) return LZR_ERR_CORRUPT;
-
-    c = stream_decode(in + k, avail - k, d->lits, nlit, ALPHA_LIT, d->tbl);
-    if (nlit && !c) return LZR_ERR_CORRUPT;
-    k += c;
-    uint8_t *codes[3] = {d->llc, d->mlc, d->ofc};
-    for (int s = 0; s < 3; s++) {
-        c = stream_decode(in + k, avail - k, codes[s], ns, ALPHA_CODE, d->tbl);
-        if (ns && !c) return LZR_ERR_CORRUPT;
-        k += c;
-    }
-    if (avail - k < 4) return LZR_ERR_CORRUPT;
-    size_t xlen = rd32le(in + k);
-    k += 4;
-    if (xlen != avail - k) return LZR_ERR_CORRUPT;
-    bitr br = {0, 0, in + k, in + k + xlen, 0};
-
-    const code_info *ct = d->ct;
-    const uint8_t *lp = d->lits, *lend = d->lits + nlit;
-    uint8_t *o = dst, *const oend = dst + raw;
-    uint32_t *reps = d->reps;
-
-    for (size_t i = 0; i <= ns; i++) {
-        size_t ll, ml = 0;
-        unsigned mc = 0, oc = 0;
-        if (i < ns) {
-            unsigned lc = d->llc[i];
-            mc = d->mlc[i]; oc = d->ofc[i];
-            if (lc >= VAL_CODES || mc >= VAL_CODES || oc >= OF_CODES) return LZR_ERR_CORRUPT;
-            ll = ct[lc].base + br_get(&br, ct[lc].bits);
-            ml = ct[mc].base + br_get(&br, ct[mc].bits) + LZR_ML_BASE;
-        } else {
-            ll = (size_t)(oend - o);   /* trailing literals */
-        }
-        size_t plain = ll;
-        if (plain > (size_t)(lend - lp) || ll + ml > (size_t)(oend - o)) return LZR_ERR_CORRUPT;
-        if (i == ns && plain != (size_t)(lend - lp)) return LZR_ERR_CORRUPT;
-
-        /* literal run (lits buffer and history both have slack) */
-        if (plain <= 16) memcpy(o, lp, 16);
-        else memcpy(o, lp, plain);
-        o += plain;
-        lp += plain;
-        if (i == ns) break;
-
-        uint32_t dist;
-        if (oc >= LZR_NUM_REPS) {
-            const code_info *e = &ct[oc - LZR_NUM_REPS];
-            dist = e->base + br_get(&br, e->bits) + 1;
-            reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = dist;
-        } else {
-            dist = reps[oc];
-            if (oc == 1) { reps[1] = reps[0]; reps[0] = dist; }
-            else if (oc == 2) { reps[2] = reps[1]; reps[1] = reps[0]; reps[0] = dist; }
-        }
-        if (dist > (size_t)(o - d->hist) || dist > d->wsize) return LZR_ERR_CORRUPT;
-        copy_match(o, dist, ml);
-        o += ml;
-    }
-    if (br.err || br.p != br.end) return LZR_ERR_CORRUPT;
-    return LZR_OK;
+    memcpy(o, lp, 16);
+    for (size_t k = 16; k < ll; k += 16) memcpy(o + k, lp + k, 16);
 }
 
 /* Block type 4: one range-coded token stream (arc.h), decoded straight
@@ -307,6 +251,175 @@ static int decode_tokens(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *
     return LZR_OK;
 }
 
+/* Block type 5 (see emit_seqs5 in enc.c): Huffman literals into d->lits,
+ * then one loop that decodes each sequence from the tANS bit stream and
+ * executes it at once. */
+static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    if (avail < 8) return LZR_ERR_CORRUPT;
+    size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8;
+    if (nlit > raw || ns > MAX_SEQ || ns * LZR_ML_BASE + nlit > raw) return LZR_ERR_CORRUPT;
+    if (nlit) {
+        size_t c = huf_decode(in + k, avail - k, d->lits, nlit, &d->huf);
+        if (!c) return LZR_ERR_CORRUPT;
+        k += c;
+    }
+    const uint8_t *lp = d->lits, *const lend = d->lits + nlit;
+    uint8_t *o = dst, *const oend = dst + raw;
+    if (!ns) {
+        if (k != avail || nlit != raw) return LZR_ERR_CORRUPT;
+        memcpy(o, lp, nlit);
+        return LZR_OK;
+    }
+    const unsigned alpha[3] = {VAL_CODES, VAL_CODES, OF_CODES};
+    unsigned rsym[3] = {0, 0, 0};
+    int rle[3];
+    for (int t = 0; t < 3; t++) {
+        if (k >= avail) return LZR_ERR_CORRUPT;
+        unsigned mode = in[k++];
+        fse_table *T = &d->fse[t];
+        rle[t] = mode == 2;
+        if (mode == 2) {
+            if (k >= avail || in[k] >= alpha[t]) return LZR_ERR_CORRUPT;
+            rsym[t] = in[k++];
+        } else if (mode == 1) {
+            if (!T->valid || T->alphabet != alpha[t]) return LZR_ERR_CORRUPT;
+        } else if (mode == 0) {
+            size_t c = fse_read_norm(in + k, avail - k, T->norm, alpha[t]);
+            T->valid = 0;
+            T->alphabet = alpha[t];
+            if (!c || fse_build(T)) return LZR_ERR_CORRUPT;
+            k += c;
+        } else {
+            return LZR_ERR_CORRUPT;
+        }
+    }
+    /* Sequence tables: the tANS state step plus the code's base value and
+     * extra-bit count in one entry. Offsets: value < 3 is a repeat index,
+     * else distance + 3. A single-symbol stream is a one-state table. */
+    seq_dent *tb[3] = {d->sq[0], d->sq[1], d->sq[2]};
+    unsigned tlog[3];
+    for (int t = 0; t < 3; t++) {
+        const fse_table *T = &d->fse[t];
+        unsigned n = rle[t] ? 1 : FSE_L;
+        tlog[t] = rle[t] ? 0 : FSE_LOG;
+        for (unsigned u = 0; u < n; u++) {
+            unsigned sym = rle[t] ? rsym[t] : T->dt[u].sym;
+            seq_dent *e = &tb[t][u];
+            e->nb = rle[t] ? 0 : T->dt[u].nb;
+            e->next = rle[t] ? 0 : T->dt[u].base;
+            if (t < 2) { e->base = d->ct[sym].base + (t == 1 ? LZR_ML_BASE : 0); e->xb = d->ct[sym].bits; }
+            else if (sym < LZR_NUM_REPS) { e->base = sym; e->xb = 0; }
+            else { e->base = d->ct[sym - LZR_NUM_REPS].base + 1 + 3; e->xb = d->ct[sym - LZR_NUM_REPS].bits; }
+        }
+    }
+
+    /* backward bit reader in locals (see fse.h) */
+    const uint8_t *const bstart = in + k;
+    const size_t bsize = avail - k;
+    if (!bsize || !bstart[bsize - 1]) return LZR_ERR_CORRUPT;
+    const uint8_t *bp = bstart + bsize - 8;
+    uint64_t bc = fse_ld64(bp);
+    unsigned used = (unsigned)__builtin_clzll(bc) + 1;
+    int berr = 0;
+#define BGET(nb) ((uint32_t)(((bc << (used & 63)) >> 1) >> (63 - (nb))))
+#define BRELOAD()                                                              \
+    do {                                                                       \
+        if (bp >= bstart + 8) { bp -= used >> 3; used &= 7; }                  \
+        else {                                                                 \
+            size_t nby_ = used >> 3, room_ = bp > bstart ? (size_t)(bp - bstart) : 0; \
+            if (nby_ > room_) nby_ = room_;                                    \
+            bp -= nby_; used -= (unsigned)nby_ * 8;                            \
+            if (used > 64) { berr = 1; used = 64; }                            \
+        }                                                                      \
+        bc = fse_ld64(bp);                                                     \
+    } while (0)
+
+    unsigned sll = BGET(tlog[0]); used += tlog[0];
+    unsigned sml = BGET(tlog[1]); used += tlog[1];
+    unsigned sof = BGET(tlog[2]); used += tlog[2];
+    BRELOAD();
+    const seq_dent *dll = tb[0], *dml = tb[1], *dof = tb[2];
+    uint32_t rep0 = d->reps[0], rep1 = d->reps[1], rep2 = d->reps[2];
+    const uint8_t *hist = d->hist;
+    const size_t wsize = d->wsize;
+
+    /* Decode a sequence (ll, ml, dist), advancing the bit stream. */
+#define DECODE_SEQ(LL, ML, DIST)                                               \
+    do {                                                                       \
+        const seq_dent el_ = dll[sll], em_ = dml[sml], eo_ = dof[sof];         \
+        uint32_t ov_ = eo_.base + BGET(eo_.xb);                                \
+        used += eo_.xb;                                                        \
+        if (ov_ >= LZR_NUM_REPS) { DIST = ov_ - 3; rep2 = rep1; rep1 = rep0; rep0 = DIST; } \
+        else if (ov_ == 0) { DIST = rep0; }                                    \
+        else if (ov_ == 1) { DIST = rep1; rep1 = rep0; rep0 = DIST; }          \
+        else { DIST = rep2; rep2 = rep1; rep1 = rep0; rep0 = DIST; }           \
+        BRELOAD();                                                             \
+        ML = em_.base + BGET(em_.xb); used += em_.xb;                          \
+        LL = el_.base + BGET(el_.xb); used += el_.xb;                          \
+        BRELOAD();                                                             \
+        sll = el_.next + BGET(el_.nb); used += el_.nb;                         \
+        sml = em_.next + BGET(em_.nb); used += em_.nb;                         \
+        sof = eo_.next + BGET(eo_.nb); used += eo_.nb;                         \
+        BRELOAD();                                                             \
+    } while (0)
+    /* Execute it: literal run, then the match (checked here). */
+#define EXEC_SEQ(LL, ML, DIST)                                                 \
+    do {                                                                       \
+        if ((LL) > (size_t)(lend - lp) || (LL) + (ML) > (size_t)(oend - o)) { berr = 1; goto done; } \
+        copy_lits(o, lp, LL);                                                  \
+        o += LL;                                                               \
+        lp += LL;                                                              \
+        if ((DIST) > (size_t)(o - hist) || (DIST) > wsize) { berr = 1; goto done; } \
+        copy_match(o, DIST, ML);                                               \
+        o += ML;                                                               \
+    } while (0)
+
+    /* Sequences are decoded SEQ_AHEAD ahead of execution, and the source of
+     * each match is prefetched meanwhile: far matches miss the cache. */
+    enum { SEQ_AHEAD = 8 };
+    size_t rll[SEQ_AHEAD], rml[SEQ_AHEAD];
+    uint32_t rdist[SEQ_AHEAD];
+    size_t ahead = (size_t)(o - hist);   /* history position after the decoded sequences */
+    size_t i = 0, lead = ns < SEQ_AHEAD ? ns : SEQ_AHEAD;
+    for (; i < lead; i++) {
+        size_t ll, ml;
+        uint32_t dist;
+        DECODE_SEQ(ll, ml, dist);
+        ahead += ll;
+        if (dist <= ahead) __builtin_prefetch(hist + ahead - dist);
+        ahead += ml;
+        rll[i] = ll; rml[i] = ml; rdist[i] = dist;
+    }
+    for (; i < ns; i++) {
+        size_t ll, ml;
+        uint32_t dist;
+        DECODE_SEQ(ll, ml, dist);
+        ahead += ll;
+        if (dist <= ahead) __builtin_prefetch(hist + ahead - dist);
+        ahead += ml;
+        const size_t j = i % SEQ_AHEAD;
+        EXEC_SEQ(rll[j], rml[j], rdist[j]);
+        rll[j] = ll; rml[j] = ml; rdist[j] = dist;
+    }
+    for (size_t e = ns - lead; e < ns; e++) {
+        const size_t j = e % SEQ_AHEAD;
+        EXEC_SEQ(rll[j], rml[j], rdist[j]);
+    }
+done:
+#undef DECODE_SEQ
+#undef EXEC_SEQ
+#undef BGET
+#undef BRELOAD
+    d->reps[0] = rep0; d->reps[1] = rep1; d->reps[2] = rep2;
+    /* all bits consumed, exactly */
+    if (berr || (size_t)(bstart + bsize - (bp + 8)) * 8 + used != bsize * 8) return LZR_ERR_CORRUPT;
+    size_t tail = (size_t)(lend - lp);
+    if (tail != (size_t)(oend - o)) return LZR_ERR_CORRUPT;
+    memcpy(o, lp, tail);
+    return LZR_OK;
+}
+
 static int init_history(lzr_dctx *d, int wlog)
 {
     d->wsize = (size_t)1 << wlog;
@@ -321,7 +434,7 @@ typedef struct { lzr_dctx *d; lzr_buf *out; } out_ctx;
 static int emit_out(void *ctx, const uint8_t *p, size_t n)
 {
     out_ctx *s = (out_ctx *)ctx;
-    s->d->crc = lzr_crc32(s->d->crc, p, n);
+    xxh64_update(&s->d->xs, p, n);
     return buf_append(s->out, p, n);
 }
 
@@ -337,7 +450,9 @@ static int step(lzr_dctx *d, lzr_buf *out)
         uint8_t flags;
         int r = lzr_frame_header(p, avail, &wlog, &flags, &d->content_size);
         if (r <= 0) return r;
-        if (init_history(d, wlog)) return LZR_ERR_NOMEM;
+        if (flags & LZR_FLAG_X86) d->direct = NULL;   /* history must hold filtered bytes */
+        if (d->direct) d->wsize = (size_t)1 << wlog;
+        else if (init_history(d, wlog)) return LZR_ERR_NOMEM;
         if ((flags & LZR_FLAG_X86) && !(d->x86tmp = (uint8_t *)malloc(X86_CHUNK + 4))) return LZR_ERR_NOMEM;
         d->ipos += (size_t)r;
         d->state = ST_BLOCKS;
@@ -347,10 +462,10 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (avail < LZR_BLOCK_HDR) return 0;
     uint8_t type = p[0];
     size_t raw = rd32le(p + 1), comp = rd32le(p + 5);
-    if (type > 4 || type == 3 || raw > LZR_BLOCK_SIZE || comp > MAX_COMP) return LZR_ERR_CORRUPT;
+    if (type > 5 || type == 1 || type == 3 || raw > LZR_BLOCK_SIZE || comp > MAX_COMP) return LZR_ERR_CORRUPT;
     if (type == 0 && comp != raw) return LZR_ERR_CORRUPT;
     if (type == 2 && (raw != 0 || comp != 4)) return LZR_ERR_CORRUPT;
-    if ((type == 1 || type == 4) && raw == 0) return LZR_ERR_CORRUPT;
+    if (type >= 4 && raw == 0) return LZR_ERR_CORRUPT;
     if (avail - LZR_BLOCK_HDR < comp) return 0;
     const uint8_t *payload = p + LZR_BLOCK_HDR;
 
@@ -362,12 +477,16 @@ static int step(lzr_dctx *d, lzr_buf *out)
         }
         d->ipos += LZR_BLOCK_HDR + comp;
         d->state = ST_DONE;
-        return rd32le(payload) == d->crc ? 2 : LZR_ERR_CHECKSUM;
+        return rd32le(payload) == (uint32_t)xxh64_digest(&d->xs) ? 2 : LZR_ERR_CHECKSUM;
     }
     if (d->content_size >= 0 && d->total_out + raw > (uint64_t)d->content_size) return LZR_ERR_CORRUPT;
 
-    /* Make room: keep exactly the last wsize bytes of history. */
-    if (d->op + raw > d->hcap) {
+    if (d->direct) {   /* the output itself is the history: no copy */
+        if (out != d->direct) return LZR_ERR_PARAM;
+        if (buf_reserve(out, raw + LZR_SLACK)) return LZR_ERR_NOMEM;
+        d->hist = out->p;
+        d->op = out->len;
+    } else if (d->op + raw > d->hcap) {   /* make room: keep the last wsize bytes */
         size_t delta = d->op - d->wsize;
         memmove(d->hist, d->hist + delta, d->wsize);
         d->op = d->wsize;
@@ -376,16 +495,28 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (type == 0) {
         memcpy(dst, payload, raw);
     } else {
-        int r = type == 4 ? decode_tokens(d, payload, comp, dst, raw) : decode_block(d, payload, comp, dst, raw);
+        int r = type == 4 ? decode_tokens(d, payload, comp, dst, raw) : decode_block5(d, payload, comp, dst, raw);
         if (r) return r;
     }
     d->op += raw;
     d->total_out += raw;
     d->ipos += LZR_BLOCK_HDR + comp;
+    if (d->direct) {
+        xxh64_update(&d->xs, dst, raw);
+        out->len += raw;
+        return 1;
+    }
     out_ctx s = {d, out};
     /* history keeps the filtered bytes (matches refer to them) */
     int r = d->x86tmp ? x86_run(&d->x86, dst, raw, 1, d->x86tmp, emit_out, &s) : emit_out(&s, dst, raw);
     return r ? LZR_ERR_NOMEM : 1;
+}
+
+int lzr_dctx_set_output(lzr_dctx *d, lzr_buf *out)
+{
+    if (d->state != ST_HEADER || d->in.len) return LZR_ERR_PARAM;
+    d->direct = out;
+    return LZR_OK;
 }
 
 int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size_t *consumed)
