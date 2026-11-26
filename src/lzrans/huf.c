@@ -3,11 +3,19 @@
  * (format in huf.h).
  */
 #include "huf.h"
+#include <stdlib.h>
+#include <string.h>
 
 /* ---- code construction ------------------------------------------- */
 
 /* Code lengths (<= HUF_MAXLEN) for the counts; absent symbols get 0. At
  * least one symbol must be present. */
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
 void huf_lengths(const uint32_t *cnt, uint8_t *len)
 {
     uint16_t sym[256];
@@ -15,12 +23,13 @@ void huf_lengths(const uint32_t *cnt, uint8_t *len)
     memset(len, 0, 256);
     for (unsigned s = 0; s < 256; s++) if (cnt[s]) sym[n++] = (uint16_t)s;
     if (n == 1) { len[sym[0]] = 1; return; }
-    /* sort by count ascending (insertion sort: n <= 256, once per block) */
-    for (unsigned i = 1; i < n; i++) {
-        uint16_t v = sym[i];
-        unsigned j = i;
-        while (j && cnt[sym[j - 1]] > cnt[v]) { sym[j] = sym[j - 1]; j--; }
-        sym[j] = v;
+    /* sort by count ascending, ties by symbol: keys count << 8 | symbol
+     * are distinct, so any sort gives this order */
+    {
+        uint64_t key[256];
+        for (unsigned i = 0; i < n; i++) key[i] = (uint64_t)cnt[sym[i]] << 8 | sym[i];
+        qsort(key, n, sizeof(key[0]), cmp_u64);
+        for (unsigned i = 0; i < n; i++) sym[i] = (uint16_t)(key[i] & 255);
     }
     /* two-queue Huffman: leaves 0..n-1 (sorted), internal nodes n.. */
     uint64_t w[512];

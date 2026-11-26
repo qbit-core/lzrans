@@ -5,7 +5,8 @@
  *   lzr_cctx          sliding input buffer (2*window + block), hash-chain
  *                     tables, repeat offsets, running XXH64
  *   find_best()       repeat-offset probes + hash-chain walk, scored by gain
- *   parse_block()     lazy parse (depth 0..2) into sequences + literals
+ *   parse_block()     lazy parse (depth 0..2) into sequences + literals;
+ *                     level 0: parse_block_fast(), double-hash greedy
  *   emit_block()      sequences -> block type 5 (Huffman literals + tANS
  *                     sequences) or type 4 (range-coded tokens, level 9)
  *   slide()           drops history older than the window, rebases tables
@@ -24,19 +25,31 @@
 #include <stdio.h>
 #endif
 
-/* Levels 1-6: lazy parsing (window, hash bits, lazy depth, search steps,
+/* Level 0: double-hash greedy finder (window, hash bits; see
+ * parse_block_fast). Levels 1-6: lazy parsing (window, hash bits, lazy depth, search steps,
  * nice length) over rows of 2^row recent positions (hash bits = log2 of
  * all row entries; replaced hash chains in v0.6: 2-5x faster). Levels
  * 7-9: binary tree + optimal parsing (chain = tree depth, opt = number of
  * parsing passes; a second pass gained <0.5% ratio for ~40% more time, so
  * all use one). */
 static const level_params LEVELS[LZR_LEVEL_MAX + 1] = {
-    {0, 0, 0, 0, 0, 0, 0},
+    {22, 16, 0, 0, 0, 0, 0},
     {20, 20, 0, 4, 16, 0, 4}, {21, 21, 1, 8, 24, 0, 4}, {22, 21, 1, 16, 32, 0, 4},
     {22, 22, 1, 32, 48, 0, 5}, {23, 23, 2, 48, 64, 0, 6}, {24, 23, 2, 64, 96, 0, 6},
     {23, 20, 0, 16, 128, 1, 0}, {24, 21, 0, 24, 273, 1, 0}, {24, 22, 0, 48, 273, 1, 0},
 };
 
+
+/* Match table entries: one per hash; level 0 (lp.row == 0) has a long-
+ * and a short-hash table of that size. Row tables (rtag, rhead) are used
+ * by levels 1-6 only (level 0 gets a small unused placeholder). */
+static size_t head_entries(const level_params *lp)
+{
+    size_t n = (size_t)1 << lp->hlog;
+    return !lp->opt && !lp->row ? 2 * n : n;
+}
+static size_t rtag_size(const level_params *lp) { return lp->row ? (size_t)1 << lp->hlog : 64; }
+static size_t rhead_size(const level_params *lp) { return lp->row ? (size_t)1 << (lp->hlog - lp->row) : 64; }
 
 lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 {
@@ -76,15 +89,15 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     for (int k = 0; k < 8; k++) c->hcpos[k] = SIZE_MAX;
 
     c->buf = (uint8_t *)big_alloc(c->cap + LZR_SLACK, 0);
-    c->head = (uint32_t *)big_alloc(((size_t)1 << c->lp.hlog) * sizeof(uint32_t), 1);
+    c->head = (uint32_t *)big_alloc(head_entries(&c->lp) * sizeof(uint32_t), 1);
     if (!c->lp.opt) {   /* row finder (lazy levels) */
-        c->rtag = (uint8_t *)big_alloc((size_t)1 << c->lp.hlog, 1);
-        c->rhead = (uint8_t *)big_alloc((size_t)1 << (c->lp.hlog - c->lp.row), 1);
+        c->rtag = (uint8_t *)big_alloc(rtag_size(&c->lp), 1);
+        c->rhead = (uint8_t *)big_alloc(rhead_size(&c->lp), 1);
     }
     c->seq_ll = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_ml = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_dist = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
-    c->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE);
+    c->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE + 32);
     c->llc = (uint8_t *)malloc(MAX_SEQ);
     c->mlc = (uint8_t *)malloc(MAX_SEQ);
     c->ofc = (uint8_t *)malloc(MAX_SEQ);
@@ -187,9 +200,11 @@ static inline uint64_t row_match_mask(const uint8_t *tags, uint8_t tag, unsigned
 #endif
 }
 
-static inline void row_insert_upto(lzr_cctx *c, size_t upto)
+#define LZR_AINLINE inline __attribute__((always_inline))
+/* rlog is a constant in each specialized copy (parse_block_r4/5/6) */
+static LZR_AINLINE void row_insert_upto_(lzr_cctx *c, size_t upto, const unsigned rlog)
 {
-    const unsigned rlog = c->lp.row, bits = c->lp.hlog - rlog + 8, rmask = (1u << rlog) - 1;
+    const unsigned bits = c->lp.hlog - rlog + 8, rmask = (1u << rlog) - 1;
     const size_t base = c->base, end = c->end;
     size_t limit = end >= LZR_HASH_LEN ? end - LZR_HASH_LEN + 1 : 0;
     if (upto > limit) upto = limit;
@@ -199,15 +214,21 @@ static inline void row_insert_upto(lzr_cctx *c, size_t upto)
     uint32_t *restrict head = c->head, *restrict hc = c->hc;
     size_t *restrict hcpos = c->hcpos;
     for (size_t i = c->ins; i < upto; i++) {
-        uint32_t h = hcpos[i & 7] == i ? hc[i & 7] : row_hash(buf + i, bits), row = h >> 8;
+        /* the hash of i is normally cached (computed 8 positions earlier);
+         * a real branch, so the miss path costs nothing in the common case */
+        uint32_t h;
+        if (__builtin_expect(hcpos[i & 7] == i, 1)) h = hc[i & 7];
+        else h = row_hash(buf + i, bits);
+        const uint32_t row = h >> 8;
         const size_t ia = i + 8;   /* (takes the slot of i: read it first) */
-        if (ia + LZR_HASH_LEN <= end) {
+        if (__builtin_expect(ia < limit, 1)) {   /* ia + LZR_HASH_LEN <= end */
             /* hash a position 8 ahead (real bytes only, so the result does
              * not depend on how input arrives), keep it, prefetch its row */
             uint32_t ha = row_hash(buf + ia, bits);
             hc[ia & 7] = ha; hcpos[ia & 7] = ia;
             __builtin_prefetch(rtag + ((size_t)(ha >> 8) << rlog));
             __builtin_prefetch(head + ((size_t)(ha >> 8) << rlog));
+            __builtin_prefetch(rhead + (ha >> 8));
         }
         unsigned slot = (rhead[row] - 1) & rmask;
         rhead[row] = (uint8_t)slot;
@@ -218,25 +239,34 @@ static inline void row_insert_upto(lzr_cctx *c, size_t upto)
     if (upto > c->ins) c->ins = upto;
 }
 
+static void row_insert_upto(lzr_cctx *c, size_t upto) { row_insert_upto_(c, upto, c->lp.row); }
+
 /* Insert positions [c->ins, upto). */
-static inline void insert_upto(lzr_cctx *c, size_t upto) { row_insert_upto(c, upto); }
+#define insert_upto(c, upto) row_insert_upto_(c, upto, rlog)
 
 typedef struct { uint32_t len, off; int gain; } match_t;  /* off: 0..2 rep idx, else dist + 2 */
 
 /* Score in quarter-bits: each matched byte is worth ~4, the offset costs its log2. */
 static inline int gain_of(uint32_t len, uint32_t off) { return (int)len * 4 - (int)highbit32(off + 1); }
 
-static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *reps)
+static LZR_AINLINE match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *reps, const unsigned rlog)
 {
     match_t best = {0, 0, 0};
     const uint8_t *cur = c->buf + p;
     const uint32_t first = rd32(cur);
 
-    /* 1) repeat offsets: cheapest to code, try them first */
+    /* 1) repeat offsets: cheapest to code, try them first. The three
+     * 4-byte probes are made without branches (an unusable offset probes
+     * cur itself and is masked out); only hits take the loop. */
+    unsigned hits = 0;
     for (uint32_t r = 0; r < LZR_NUM_REPS; r++) {
         uint32_t d = reps[r];
-        if (!d || d > p || d > c->wsize) continue;   /* 0: unknown (job start) */
-        if (rd32(cur - d) != first) continue;
+        unsigned ok = d && d <= p && d <= c->wsize;   /* d 0: unknown (job start) */
+        size_t dd = ok ? d : 0;
+        hits |= (unsigned)(ok & (rd32(cur - dd) == first)) << r;
+    }
+    for (; hits; hits &= hits - 1) {
+        uint32_t r = (uint32_t)__builtin_ctz(hits), d = reps[r];
         uint32_t len = (uint32_t)match_len(cur - d, cur, maxlen);
         int g = gain_of(len, r);
         if (len >= LZR_MIN_MATCH && g > best.gain) { best.len = len; best.off = r; best.gain = g; }
@@ -245,7 +275,7 @@ static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *r
     if (best.len == maxlen || best.len >= c->lp.nice) return best;
 
     /* 2) row finder: tag-matching slots, newest first */
-    const unsigned rlog = c->lp.row, R = 1u << rlog;
+    const unsigned R = 1u << rlog;
     const uint32_t h = row_hash_at(c, p, c->lp.hlog - rlog + 8), row = h >> 8;
     const size_t r0 = (size_t)row << rlog;
     const unsigned hd = c->rhead[row];
@@ -260,9 +290,11 @@ static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *r
     {   /* start loading the data of the first candidates: those loads
          * miss the cache and would otherwise run one after another */
         uint64_t q = m;
-        for (int n = 0; q && n < 4; n++, q &= q - 1) {
-            size_t cq = (size_t)rpos[(hd + (unsigned)__builtin_ctzll(q)) & (R - 1)] - 1 - base;
-            if (cq < p) __builtin_prefetch(buf + cq);
+        for (int n = 0; n < 2; n++, q &= q - 1) {
+            /* no branches: an empty mask or a dead slot only prefetches a
+             * harmless address (prefetches never fault) */
+            size_t cq = (size_t)rpos[(hd + (unsigned)__builtin_ctzll(q | 1ull << 63)) & (R - 1)] - 1 - base;
+            __builtin_prefetch(buf + (cq < p ? cq : p));
         }
     }
     while (m && tries--) {
@@ -292,20 +324,20 @@ static match_t find_best(lzr_cctx *c, size_t p, size_t maxlen, const uint32_t *r
 }
 
 /* Lazy parse of buf[bs, be). Returns number of sequences; *nlit literals. */
-static size_t parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
+static LZR_AINLINE size_t parse_block_(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out, const unsigned rlog)
 {
     size_t p = bs, lit_start = bs, ns = 0, nlit = 0;
     uint32_t *reps = c->reps;
 
     while (p + LZR_MIN_MATCH <= be) {
         insert_upto(c, p);
-        match_t m = find_best(c, p, be - p, reps);
+        match_t m = find_best(c, p, be - p, reps, rlog);
         if (!m.len) { p++; continue; }
 
         /* Lazy evaluation: would starting 1 byte later be clearly better? */
         for (unsigned depth = 1; depth <= c->lp.lazy && m.len < c->lp.nice && p + 1 + LZR_MIN_MATCH <= be; depth++) {
             insert_upto(c, p + 1);
-            match_t m2 = find_best(c, p + 1, be - p - 1, reps);
+            match_t m2 = find_best(c, p + 1, be - p - 1, reps, rlog);
             int threshold = m.gain + (depth == 1 ? 4 : 7);
             if (m2.len && m2.gain > threshold) { m = m2; p++; }
             else break;
@@ -327,6 +359,140 @@ static size_t parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
     nlit += be - lit_start;
     *nlit_out = nlit;
     return ns;
+}
+
+#undef insert_upto
+static __attribute__((noinline)) size_t parse_block_r4(lzr_cctx *c, size_t bs, size_t be, size_t *n) { return parse_block_(c, bs, be, n, 4); }
+static __attribute__((noinline)) size_t parse_block_r5(lzr_cctx *c, size_t bs, size_t be, size_t *n) { return parse_block_(c, bs, be, n, 5); }
+static __attribute__((noinline)) size_t parse_block_r6(lzr_cctx *c, size_t bs, size_t be, size_t *n) { return parse_block_(c, bs, be, n, 6); }
+
+/* ---- level 0: double-hash finder (zstd "dfast"-like) ----
+ * Two direct-mapped tables of the newest position per hash: 8-byte
+ * hashes (head[0, 2^hlog)) find long matches, 5-byte hashes (the next
+ * 2^hlog entries) short ones. Repeat offsets never exceed the window
+ * (they were all once explicit distances), so they need no window check. Only searched positions and a few per
+ * match are indexed, and long literal runs are crossed with a growing
+ * step, so the search does a fixed small amount of work per position. */
+static inline uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static inline uint32_t hash8(uint64_t v, unsigned bits) { return (uint32_t)((v * 0xCF1BBCDCB7A56463ull) >> (64 - bits)); }
+static inline uint32_t hash5(uint64_t v, unsigned bits) { return (uint32_t)(((v << 24) * 0x9FB21C651E98DF25ull) >> (64 - bits)); }
+#define FAST_STEP_LOG 8   /* step + 1 every 256 literals */
+
+static inline void fast_put(lzr_cctx *c, size_t i)
+{
+    const unsigned hl = c->lp.hlog;
+    uint64_t v = rd64(c->buf + i);
+    c->head[hash8(v, hl)] = (uint32_t)(c->base + i + 1);
+    c->head[((size_t)1 << hl) + hash5(v, hl)] = (uint32_t)(c->base + i + 1);
+}
+
+/* Index [from, upto) (job history); positions need 8 real bytes. */
+static void fast_fill(lzr_cctx *c, size_t from, size_t upto)
+{
+    size_t lim = c->end >= 8 ? c->end - 7 : 0;
+    if (upto > lim) upto = lim;
+    /* every third position (as zstd fills its tables from a dictionary):
+     * the history only seeds matches, a third of the work */
+    for (size_t i = from; i < upto; i += 3) fast_put(c, i);
+}
+
+static __attribute__((noinline)) size_t parse_block_fast(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
+{
+    const unsigned hl = c->lp.hlog;
+    uint32_t *const tl = c->head, *const ts = c->head + ((size_t)1 << hl);
+    const uint8_t *const buf = c->buf;
+    const size_t base = c->base, wsize = c->wsize;
+    uint32_t *reps = c->reps;
+    size_t p = bs, anchor = bs, ns = 0, nlit = 0;
+    /* searched positions read 8 bytes (+1 for the next position's long
+     * hash); stay inside the block so the result does not depend on how
+     * the input arrives */
+    const size_t ilimit = be >= bs + 9 ? be - 9 : bs;
+
+    while (p < ilimit) {
+        const uint64_t v = rd64(buf + p);
+        const uint32_t h8 = hash8(v, hl), h5 = hash5(v, hl);
+        const size_t cl = (size_t)tl[h8] - 1 - base, cs = (size_t)ts[h5] - 1 - base;
+        tl[h8] = ts[h5] = (uint32_t)(base + p + 1);
+        size_t mstart, mlen, cand;
+        uint32_t off;
+        const uint32_t d0 = reps[0];
+        if ((size_t)d0 - 1 < p + 1 && rd32(buf + p + 1 - d0) == rd32(buf + p + 1)) {
+            /* repeat offset at p + 1 */
+            mstart = p + 1;
+            mlen = 4 + match_len(buf + mstart - d0 + 4, buf + mstart + 4, be - mstart - 4);
+            cand = mstart - d0;
+            off = 0;
+        } else if (cl < p && p - cl <= wsize && rd64(buf + cl) == v) {
+            mstart = p; cand = cl;
+            mlen = 8 + match_len(buf + cl + 8, buf + p + 8, be - p - 8);
+            off = (uint32_t)(p - cl) + 2;
+        } else if (cs < p && p - cs <= wsize && rd32(buf + cs) == (uint32_t)v) {
+            /* short match: a long match one byte later is usually better */
+            const uint64_t v1 = rd64(buf + p + 1);
+            const uint32_t h1 = hash8(v1, hl);
+            const size_t c1 = (size_t)tl[h1] - 1 - base;
+            tl[h1] = (uint32_t)(base + p + 2);
+            if (c1 <= p && p + 1 - c1 <= wsize && rd64(buf + c1) == v1) {
+                mstart = p + 1; cand = c1;
+                mlen = 8 + match_len(buf + c1 + 8, buf + p + 9, be - p - 9);
+            } else {
+                mstart = p; cand = cs;
+                mlen = 4 + match_len(buf + cs + 4, buf + p + 4, be - p - 4);
+            }
+            off = (uint32_t)(mstart - cand) + 2;
+        } else {
+            p += ((p - anchor) >> FAST_STEP_LOG) + 1;
+            continue;
+        }
+        /* extend backwards over the pending literals */
+        while (mstart > anchor && cand > 0 && buf[mstart - 1] == buf[cand - 1]) {
+            mstart--; cand--; mlen++;
+        }
+        size_t ll = mstart - anchor;
+        for (size_t k = 0; k < ll; k += 16) memcpy(c->lits + nlit + k, buf + anchor + k, 16);   /* lits has slack */
+        nlit += ll;
+        c->seq_ll[ns] = (uint32_t)ll;
+        c->seq_ml[ns] = (uint32_t)mlen;
+        c->seq_dist[ns] = commit_offset(reps, off);
+        ns++;
+        p = mstart + mlen;
+        anchor = p;
+        /* index a few positions of the match */
+        if (p < ilimit + 2) {
+            fast_put(c, mstart + 2);
+            fast_put(c, p - 2);
+            ts[hash5(rd64(buf + p - 1), hl)] = (uint32_t)(base + p);
+        }
+        /* repeat offset 1 right after the match (literal length 0) */
+        while (p < ilimit) {
+            const uint32_t d1 = reps[1];
+            if (!((size_t)d1 - 1 < p && rd32(buf + p - d1) == rd32(buf + p))) break;
+            size_t l = 4 + match_len(buf + p - d1 + 4, buf + p + 4, be - p - 4);
+            c->seq_ll[ns] = 0;
+            c->seq_ml[ns] = (uint32_t)l;
+            c->seq_dist[ns] = commit_offset(reps, 1);
+            ns++;
+            fast_put(c, p);
+            p += l;
+            anchor = p;
+        }
+    }
+    memcpy(c->lits + nlit, buf + anchor, be - anchor);
+    nlit += be - anchor;
+    *nlit_out = nlit;
+    return ns;
+}
+
+static size_t parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *n)
+{
+    switch (c->lp.row) {
+    case 0: return parse_block_fast(c, bs, be, n);
+    case 4: return parse_block_r4(c, bs, be, n);
+    case 5: return parse_block_r5(c, bs, be, n);
+    case 6: return parse_block_r6(c, bs, be, n);
+    default: return parse_block_(c, bs, be, n, c->lp.row);   /* LZR_TUNE row sizes */
+    }
 }
 
 /* ---------------- block emission ---------------- */
@@ -522,7 +688,7 @@ static void slide(lzr_cctx *c)
     c->end -= delta;
     c->ins = c->ins > delta ? c->ins - delta : 0;
     hash_cache_clear(c);   /* positions moved */
-    size_t hs = (size_t)1 << c->lp.hlog;
+    size_t hs = head_entries(&c->lp);
     if (!c->lp.opt) {
         /* Levels 1-6 store base + index, so sliding only moves the base
          * (row slots do not depend on positions).
@@ -565,13 +731,13 @@ static lzr_cctx *worker_new(const lzr_cctx *c)
     w->lp = c->lp;
     w->wsize = c->wsize; w->wmask = c->wmask; w->cap = c->cap;
     w->threads = 1;
-    w->head = (uint32_t *)big_alloc(((size_t)1 << w->lp.hlog) * sizeof(uint32_t), 1);
-    w->rtag = (uint8_t *)big_alloc((size_t)1 << w->lp.hlog, 1);
-    w->rhead = (uint8_t *)big_alloc((size_t)1 << (w->lp.hlog - w->lp.row), 1);
+    w->head = (uint32_t *)big_alloc(head_entries(&w->lp) * sizeof(uint32_t), 1);
+    w->rtag = (uint8_t *)big_alloc(rtag_size(&w->lp), 1);
+    w->rhead = (uint8_t *)big_alloc(rhead_size(&w->lp), 1);
     w->seq_ll = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     w->seq_ml = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     w->seq_dist = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
-    w->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE);
+    w->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE + 32);
     w->llc = (uint8_t *)malloc(MAX_SEQ);
     w->mlc = (uint8_t *)malloc(MAX_SEQ);
     w->ofc = (uint8_t *)malloc(MAX_SEQ);
@@ -643,13 +809,14 @@ static void job_compress(job_arg *a, lzr_cctx *w, lzr_buf *out)
      * read as "slid out" (rows keep their slots, the search stops there) */
     w->base += c->cap + 1;
     if (w->base + c->cap >= LZR_REBASE_AT) {
-        memset(w->head, 0, ((size_t)1 << w->lp.hlog) * sizeof(uint32_t));
+        memset(w->head, 0, head_entries(&w->lp) * sizeof(uint32_t));
         w->base = 0;
     }
     w->end = a->je;
     w->ins = a->js > c->jover ? a->js - c->jover : 0;
     hash_cache_clear(w);
-    row_insert_upto(w, a->js);
+    if (w->lp.row) row_insert_upto(w, a->js);
+    else fast_fill(w, w->ins, a->js);
     w->reps[0] = w->reps[1] = w->reps[2] = 0;
     w->huf[0].valid = 0;
     w->fse[0].valid = w->fse[1].valid = w->fse[2].valid = 0;

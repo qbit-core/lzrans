@@ -40,7 +40,7 @@ CASES = {
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
-@pytest.mark.parametrize("level", [1, 4, 7, 9])
+@pytest.mark.parametrize("level", [0, 1, 4, 7, 9])
 def test_roundtrip(name, level):
     data = CASES[name]
     comp = lzrans.compress(data, level=level)
@@ -96,7 +96,7 @@ def test_crc32_matches_zlib(data):
 
 def test_invalid_level():
     with pytest.raises(ValueError):
-        lzrans.compress(b"x", level=0)
+        lzrans.compress(b"x", level=-1)
     with pytest.raises(ValueError):
         lzrans.compress(b"x", level=10)
     with pytest.raises(ValueError):
@@ -202,7 +202,7 @@ def test_streaming_output_is_incremental():
     assert not d.eof
 
 
-@pytest.mark.parametrize("level", [5, 9])
+@pytest.mark.parametrize("level", [0, 5, 9])
 def test_streaming_matches_one_shot_chunking_independent(level):
     data = _text(700_000, 4)
     outs = set()
@@ -264,7 +264,7 @@ def test_threads_identical_on_window_sized_input():
     assert lzrans.decompress(c1) == data
 
 
-@pytest.mark.parametrize("level", [1, 3, 6])
+@pytest.mark.parametrize("level", [0, 1, 3, 6])
 def test_job_mode_levels_1_6(level):
     # Levels 1-6 with threads > 1 compress independent 4 MB jobs: the
     # output is the same for any thread count > 1 and any input chunking,
@@ -321,7 +321,7 @@ def _block_types(blob):
             return types
 
 
-@pytest.mark.parametrize("level,btype", [(1, 5), (6, 5), (8, 5), (9, 4)])
+@pytest.mark.parametrize("level,btype", [(0, 5), (1, 5), (6, 5), (8, 5), (9, 4)])
 def test_block_type_by_level(level, btype):
     blob = lzrans.compress(_text(3 * BS), level=level)
     assert blob[4] == 5                              # format version
@@ -352,7 +352,7 @@ def _x86_like(n, seed=3):
     return bytes(out[:n]) + b"\xe8\x01\x02"
 
 
-@pytest.mark.parametrize("level", [1, 6, 9])
+@pytest.mark.parametrize("level", [0, 1, 6, 9])
 def test_x86_filter_roundtrip(level):
     data = _x86_like(700_000)
     blob = lzrans.compress(data, level=level, filter="x86")
