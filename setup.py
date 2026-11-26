@@ -10,13 +10,14 @@ setup(
             "lzrans._lzrans",
             sources=[
                 "src/lzrans/module.c",
-                "src/lzrans/frame.c",
-                "src/lzrans/lz77.c",
+                "src/lzrans/enc.c",
+                "src/lzrans/dec.c",
                 "src/lzrans/rans.c",
                 "src/lzrans/crc32.c",
             ],
             include_dirs=["src/lzrans"],
             extra_compile_args=extra,
+            libraries=[] if sys.platform == "win32" else ["m"],
         )
     ],
 )
