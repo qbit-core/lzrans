@@ -18,6 +18,7 @@ typedef struct {
     uint16_t nice;    /* stop searching once a match this long is found          */
     uint8_t opt;      /* 0 = lazy parser, N = optimal parser with N passes        */
     uint8_t row;      /* lazy levels: log2 of the row size (row match finder)    */
+    uint8_t accel;    /* negative levels: single-hash fast finder, base step     */
 } level_params;
 
 
@@ -29,6 +30,8 @@ struct lzr_cctx {
     size_t pos;            /* first byte not yet compressed              */
     size_t end;            /* bytes filled                               */
     size_t ins;            /* next position to insert into the chains    */
+    size_t lo;             /* job mode: start of the job's history (backward
+                              match extension stops there), else 0       */
     uint32_t *head;        /* levels 7-9: buffer index + 1; levels 1-6 (row
                             * slots): base + buffer index + 1 (see slide()); 0 = empty */
     size_t base;           /* levels 1-6: bytes slid out since the last rebase */
