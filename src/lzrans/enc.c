@@ -25,14 +25,17 @@
 #include <stdio.h>
 #endif
 
-/* Level 0: double-hash greedy finder (window, hash bits; see
- * parse_block_fast). Levels 1-6: lazy parsing (window, hash bits, lazy depth, search steps,
+/* Levels -3..-1: single-hash greedy finder (window, hash bits, accel;
+ * see parse_block_fast1). Level 0: double-hash greedy finder (window,
+ * hash bits; see parse_block_fast). Levels 1-6: lazy parsing (window, hash bits, lazy depth, search steps,
  * nice length) over rows of 2^row recent positions (hash bits = log2 of
  * all row entries; replaced hash chains in v0.6: 2-5x faster). Levels
  * 7-9: binary tree + optimal parsing (chain = tree depth, opt = number of
  * parsing passes; a second pass gained <0.5% ratio for ~40% more time, so
  * all use one). */
-static const level_params LEVELS[LZR_LEVEL_MAX + 1] = {
+static const level_params LEVELS[LZR_LEVEL_MAX - LZR_LEVEL_MIN + 1] = {
+    /* levels -3 .. -1: single-hash fast finder (window, hash bits, accel) */
+    {19, 13, 0, 0, 0, 0, 0, 4}, {20, 14, 0, 0, 0, 0, 0, 2}, {20, 14, 0, 0, 0, 0, 0, 1},
     {22, 16, 0, 0, 0, 0, 0},
     {20, 20, 0, 4, 16, 0, 4}, {21, 21, 1, 8, 24, 0, 4}, {22, 21, 1, 16, 32, 0, 4},
     {22, 22, 1, 32, 48, 0, 5}, {23, 23, 2, 48, 64, 0, 6}, {24, 23, 2, 64, 96, 0, 6},
@@ -46,7 +49,7 @@ static const level_params LEVELS[LZR_LEVEL_MAX + 1] = {
 static size_t head_entries(const level_params *lp)
 {
     size_t n = (size_t)1 << lp->hlog;
-    return !lp->opt && !lp->row ? 2 * n : n;
+    return !lp->opt && !lp->row && !lp->accel ? 2 * n : n;
 }
 static size_t rtag_size(const level_params *lp) { return lp->row ? (size_t)1 << lp->hlog : 64; }
 static size_t rhead_size(const level_params *lp) { return lp->row ? (size_t)1 << (lp->hlog - lp->row) : 64; }
@@ -57,7 +60,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     lzr_cctx *c = (lzr_cctx *)calloc(1, sizeof(*c));
     if (c) xxh64_init(&c->xs);
     if (!c) return NULL;
-    c->lp = LEVELS[level];
+    c->lp = LEVELS[level - LZR_LEVEL_MIN];
     if (window_log) {
         if (window_log < LZR_WLOG_MIN || window_log > LZR_WLOG_MAX) { free(c); return NULL; }
         c->lp.wlog = (uint8_t)window_log;
@@ -70,6 +73,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     if (getenv("LZR_HLOG")) c->lp.hlog = (uint8_t)atoi(getenv("LZR_HLOG"));
     if (getenv("LZR_ROW")) c->lp.row = (uint8_t)atoi(getenv("LZR_ROW"));
     if (getenv("LZR_LAZY")) c->lp.lazy = (uint8_t)atoi(getenv("LZR_LAZY"));
+    if (getenv("LZR_ACCEL")) c->lp.accel = (uint8_t)atoi(getenv("LZR_ACCEL"));
     if (getenv("LZR_THREADS")) c->threads = atoi(getenv("LZR_THREADS"));
 #endif
     /* A window larger than the known input only wastes memory. */
@@ -401,10 +405,12 @@ static void fast_fill(lzr_cctx *c, size_t from, size_t upto)
 
 static __attribute__((noinline)) size_t parse_block_fast(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
 {
+    uint32_t *restrict sll = c->seq_ll, *restrict sml = c->seq_ml, *restrict sdi = c->seq_dist;
+    uint8_t *restrict lits = c->lits;
     const unsigned hl = c->lp.hlog;
     uint32_t *const tl = c->head, *const ts = c->head + ((size_t)1 << hl);
     const uint8_t *const buf = c->buf;
-    const size_t base = c->base, wsize = c->wsize;
+    const size_t base = c->base, wsize = c->wsize, lo = c->lo;
     uint32_t *reps = c->reps;
     size_t p = bs, anchor = bs, ns = 0, nlit = 0;
     /* searched positions read 8 bytes (+1 for the next position's long
@@ -449,15 +455,15 @@ static __attribute__((noinline)) size_t parse_block_fast(lzr_cctx *c, size_t bs,
             continue;
         }
         /* extend backwards over the pending literals */
-        while (mstart > anchor && cand > 0 && buf[mstart - 1] == buf[cand - 1]) {
+        while (mstart > anchor && cand > lo && buf[mstart - 1] == buf[cand - 1]) {
             mstart--; cand--; mlen++;
         }
         size_t ll = mstart - anchor;
-        for (size_t k = 0; k < ll; k += 16) memcpy(c->lits + nlit + k, buf + anchor + k, 16);   /* lits has slack */
+        for (size_t k = 0; k < ll; k += 16) memcpy(lits + nlit + k, buf + anchor + k, 16);   /* lits has slack */
         nlit += ll;
-        c->seq_ll[ns] = (uint32_t)ll;
-        c->seq_ml[ns] = (uint32_t)mlen;
-        c->seq_dist[ns] = commit_offset(reps, off);
+        sll[ns] = (uint32_t)ll;
+        sml[ns] = (uint32_t)mlen;
+        sdi[ns] = commit_offset(reps, off);
         ns++;
         p = mstart + mlen;
         anchor = p;
@@ -472,16 +478,116 @@ static __attribute__((noinline)) size_t parse_block_fast(lzr_cctx *c, size_t bs,
             const uint32_t d1 = reps[1];
             if (!((size_t)d1 - 1 < p && rd32(buf + p - d1) == rd32(buf + p))) break;
             size_t l = 4 + match_len(buf + p - d1 + 4, buf + p + 4, be - p - 4);
-            c->seq_ll[ns] = 0;
-            c->seq_ml[ns] = (uint32_t)l;
-            c->seq_dist[ns] = commit_offset(reps, 1);
+            sll[ns] = 0;
+            sml[ns] = (uint32_t)l;
+            sdi[ns] = commit_offset(reps, 1);
             ns++;
             fast_put(c, p);
             p += l;
             anchor = p;
         }
     }
-    memcpy(c->lits + nlit, buf + anchor, be - anchor);
+    memcpy(lits + nlit, buf + anchor, be - anchor);
+    nlit += be - anchor;
+    *nlit_out = nlit;
+    return ns;
+}
+
+/* ---- levels -1 .. -3: single-hash finder (zstd "fast"-like) ----
+ * One direct-mapped table of the newest position per 6-byte hash
+ * (2^hlog entries, small enough to stay in L1/L2). A miss advances by
+ * accel + (literals so far >> 8), so incompressible data is crossed
+ * quickly; matches are indexed at two positions. */
+static inline uint32_t hash6(uint64_t v, unsigned bits) { return (uint32_t)(((v << 16) * 0xCF1BBCDCB7A56463ull) >> (64 - bits)); }
+
+static inline void fast1_put(lzr_cctx *c, size_t i)
+{
+    c->head[hash6(rd64(c->buf + i), c->lp.hlog)] = (uint32_t)(c->base + i + 1);
+}
+
+/* Index [from, upto) (job history), every third position. */
+static void fast1_fill(lzr_cctx *c, size_t from, size_t upto)
+{
+    size_t lim = c->end >= 8 ? c->end - 7 : 0;
+    if (upto > lim) upto = lim;
+    for (size_t i = from; i < upto; i += 3) fast1_put(c, i);
+}
+
+static __attribute__((noinline)) size_t parse_block_fast1(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
+{
+    uint32_t *restrict sll = c->seq_ll, *restrict sml = c->seq_ml, *restrict sdi = c->seq_dist;
+    uint8_t *restrict lits = c->lits;
+    const unsigned hl = c->lp.hlog;
+    const size_t accel = c->lp.accel;
+    uint32_t *const t = c->head;
+    const uint8_t *const buf = c->buf;
+    const size_t base = c->base, wsize = c->wsize, lo = c->lo;
+    uint32_t *reps = c->reps;
+    size_t p = bs, anchor = bs, ns = 0, nlit = 0;
+    const size_t ilimit = be >= bs + 9 ? be - 9 : bs;   /* as parse_block_fast */
+
+    /* Two-stage pipeline: the table slot of the next position (and the
+     * bytes of its candidate) are loaded before the current position is
+     * resolved, so table and window loads overlap instead of queueing. */
+    size_t ip = p;
+    uint32_t h = hash6(rd64(buf + ip), hl), idx = t[h];
+    while (ip < ilimit) {
+        const size_t nip = ip + accel + ((ip - anchor) >> FAST_STEP_LOG);
+        const size_t hp = nip < ilimit ? nip : ip;   /* stay in the block */
+        const uint32_t nh = hash6(rd64(buf + hp), hl), nidx = t[nh];
+        __builtin_prefetch(buf + (((size_t)nidx - 1 - base) < hp ? (size_t)nidx - 1 - base : hp));
+        const uint32_t v = rd32(buf + ip);
+        t[h] = (uint32_t)(base + ip + 1);
+        const size_t cand0 = (size_t)idx - 1 - base;
+        const int valid = cand0 < ip && ip - cand0 <= wsize;
+        const int hit = valid & (rd32(buf + (valid ? cand0 : ip)) == v);
+        size_t mstart, mlen, cand;
+        uint32_t off;
+        const uint32_t d0 = reps[0];
+        if ((size_t)d0 - 1 < ip + 1 && rd32(buf + ip + 1 - d0) == rd32(buf + ip + 1)) {
+            mstart = ip + 1;
+            mlen = 4 + match_len(buf + mstart - d0 + 4, buf + mstart + 4, be - mstart - 4);
+            cand = mstart - d0;
+            off = 0;
+        } else if (hit) {
+            mstart = ip; cand = cand0;
+            mlen = 4 + match_len(buf + cand + 4, buf + ip + 4, be - ip - 4);
+            off = (uint32_t)(ip - cand) + 2;
+        } else {
+            ip = nip; h = nh; idx = nidx;
+            continue;
+        }
+        while (mstart > anchor && cand > lo && buf[mstart - 1] == buf[cand - 1]) {
+            mstart--; cand--; mlen++;
+        }
+        size_t ll = mstart - anchor;
+        for (size_t k = 0; k < ll; k += 16) memcpy(lits + nlit + k, buf + anchor + k, 16);   /* lits has slack */
+        nlit += ll;
+        sll[ns] = (uint32_t)ll;
+        sml[ns] = (uint32_t)mlen;
+        sdi[ns] = commit_offset(reps, off);
+        ns++;
+        ip = mstart + mlen;
+        anchor = ip;
+        if (ip < ilimit + 2) {
+            fast1_put(c, mstart + 2);
+            fast1_put(c, ip - 2);
+        }
+        while (ip < ilimit) {
+            const uint32_t d1 = reps[1];
+            if (!((size_t)d1 - 1 < ip && rd32(buf + ip - d1) == rd32(buf + ip))) break;
+            size_t l = 4 + match_len(buf + ip - d1 + 4, buf + ip + 4, be - ip - 4);
+            sll[ns] = 0;
+            sml[ns] = (uint32_t)l;
+            sdi[ns] = commit_offset(reps, 1);
+            ns++;
+            fast1_put(c, ip);
+            ip += l;
+            anchor = ip;
+        }
+        if (ip < ilimit) { h = hash6(rd64(buf + ip), hl); idx = t[h]; }
+    }
+    memcpy(lits + nlit, buf + anchor, be - anchor);
     nlit += be - anchor;
     *nlit_out = nlit;
     return ns;
@@ -490,7 +596,7 @@ static __attribute__((noinline)) size_t parse_block_fast(lzr_cctx *c, size_t bs,
 static size_t parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *n)
 {
     switch (c->lp.row) {
-    case 0: return parse_block_fast(c, bs, be, n);
+    case 0: return c->lp.accel ? parse_block_fast1(c, bs, be, n) : parse_block_fast(c, bs, be, n);
     case 4: return parse_block_r4(c, bs, be, n);
     case 5: return parse_block_r5(c, bs, be, n);
     case 6: return parse_block_r6(c, bs, be, n);
@@ -567,21 +673,30 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     uint32_t cnt[3][FSE_MAXSYM];
     memset(cnt, 0, sizeof(cnt));
     /* codes, and the extra bits in the order they are written: ll and ml
-     * together (<= 16 + 16 bits, block size 2^18), then the offset */
-    for (size_t i = 0; i < ns; i++) {
-        unsigned nl, nm, no;
-        uint32_t el, em, eo;
-        c->llc[i] = (uint8_t)code_bf(c->seq_ll[i], 4, &nl, &el);
-        c->mlc[i] = (uint8_t)code_bf(c->seq_ml[i] - LZR_ML_BASE, ML_DLOG, &nm, &em);
-        uint32_t off = c->seq_dist[i];
-        int rep = off < LZR_NUM_REPS;
-        unsigned oc = code_bf(rep ? 0 : off - LZR_NUM_REPS, 4, &no, &eo);
-        c->ofc[i] = (uint8_t)(rep ? off : LZR_NUM_REPS + oc);
-        c->xlm[i] = el | em << nl;
-        c->nlm[i] = (uint8_t)(nl + nm);
-        c->xof[i] = eo;
-        c->nof[i] = (uint8_t)no;
-        cnt[0][c->llc[i]]++; cnt[1][c->mlc[i]]++; cnt[2][c->ofc[i]]++;
+     * together (<= 16 + 16 bits, block size 2^18), then the offset.
+     * Arrays in restrict locals: byte stores would otherwise make the
+     * compiler reload every c->... pointer after each one. */
+    {
+        const uint32_t *restrict sll = c->seq_ll, *restrict sml = c->seq_ml, *restrict sdi = c->seq_dist;
+        uint8_t *restrict llc = c->llc, *restrict mlc = c->mlc, *restrict ofc = c->ofc;
+        uint8_t *restrict nlm = c->nlm, *restrict nof = c->nof;
+        uint32_t *restrict xlm = c->xlm, *restrict xof = c->xof;
+        for (size_t i = 0; i < ns; i++) {
+            unsigned nl, nm, no;
+            uint32_t el, em, eo;
+            const unsigned lc = code_bf(sll[i], 4, &nl, &el);
+            const unsigned mc = code_bf(sml[i] - LZR_ML_BASE, ML_DLOG, &nm, &em);
+            const uint32_t off = sdi[i];
+            const int rep = off < LZR_NUM_REPS;
+            const unsigned oc0 = code_bf(rep ? 0 : off - LZR_NUM_REPS, 4, &no, &eo);
+            const unsigned oc = rep ? off : LZR_NUM_REPS + oc0;
+            llc[i] = (uint8_t)lc; mlc[i] = (uint8_t)mc; ofc[i] = (uint8_t)oc;
+            xlm[i] = el | em << nl;
+            nlm[i] = (uint8_t)(nl + nm);
+            xof[i] = eo;
+            nof[i] = (uint8_t)no;
+            cnt[0][lc]++; cnt[1][mc]++; cnt[2][oc]++;
+        }
     }
     int rle[3];
     for (int t = 0; t < 3; t++) {
@@ -609,20 +724,25 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     if (!rle[0] && !rle[1] && !rle[2]) {
         /* common case: the three state transitions in one write (<= 27 bits) */
         const fse_table *T0 = &c->fse[0], *T1 = &c->fse[1], *T2 = &c->fse[2];
+        const uint8_t *restrict llc = c->llc, *restrict mlc = c->mlc, *restrict ofc = c->ofc;
+        const uint8_t *restrict nlm = c->nlm, *restrict nof = c->nof;
+        const uint32_t *restrict xlm = c->xlm, *restrict xof = c->xof;
         uint32_t x0 = x[0], x1 = x[1], x2 = x[2];
+        fbw wl = w;   /* a local writer: its stores cannot alias the arrays */
         /* branch-free flushes: n <= 7 + 27, then <= 7 + 32 + 24 (offsets
          * < 2^27) bits between them */
         for (size_t i = ns; i-- > 0;) {
             unsigned n2, n1, n0;
-            uint32_t b2 = fse_step(T2, &x2, c->ofc[i], &n2);
-            uint32_t b1 = fse_step(T1, &x1, c->mlc[i], &n1);
-            uint32_t b0 = fse_step(T0, &x0, c->llc[i], &n0);
-            fbw_add(&w, b2 | b1 << n2 | (uint64_t)b0 << (n2 + n1), n2 + n1 + n0);
-            fbw_flush8(&w);
-            fbw_add(&w, c->xlm[i], c->nlm[i]);
-            fbw_add(&w, c->xof[i], c->nof[i]);
-            fbw_flush8(&w);
+            uint32_t b2 = fse_step(T2, &x2, ofc[i], &n2);
+            uint32_t b1 = fse_step(T1, &x1, mlc[i], &n1);
+            uint32_t b0 = fse_step(T0, &x0, llc[i], &n0);
+            fbw_add(&wl, b2 | b1 << n2 | (uint64_t)b0 << (n2 + n1), n2 + n1 + n0);
+            fbw_flush8(&wl);
+            fbw_add(&wl, xlm[i], nlm[i]);
+            fbw_add(&wl, xof[i], nof[i]);
+            fbw_flush8(&wl);
         }
+        w = wl;
         x[0] = x0; x[1] = x1; x[2] = x2;
     } else {
         for (size_t i = ns; i-- > 0;) {
@@ -733,7 +853,7 @@ static void slide(lzr_cctx *c)
 #include <pthread.h>
 #endif
 
-typedef struct { lzr_cctx *c; size_t js, je; int r; } job_arg;
+typedef struct { lzr_cctx *c; const uint8_t *buf; size_t span, js, je; int r; } job_arg;   /* buf[js, je), positions < span */
 
 /* A batch: up to c->jobs jobs over buf[pos, cap). Jobs are queued as soon
  * as their input is buffered (batch_feed), and helper threads start on
@@ -842,18 +962,20 @@ static void job_compress(job_arg *a, lzr_cctx *w, lzr_buf *out)
 {
     lzr_cctx *c = a->c;
     out->len = 0;
-    w->buf = c->buf;
+    w->buf = (uint8_t *)a->buf;   /* only read */
     /* forget everything from earlier jobs: positions below the new base
      * read as "slid out" (rows keep their slots, the search stops there) */
-    w->base += c->cap + 1;
-    if (w->base + c->cap >= LZR_REBASE_AT) {
+    w->base += a->span + 1;
+    if (w->base + a->span >= LZR_REBASE_AT) {
         memset(w->head, 0, head_entries(&w->lp) * sizeof(uint32_t));
         w->base = 0;
     }
     w->end = a->je;
     w->ins = a->js > c->jover ? a->js - c->jover : 0;
+    w->lo = w->ins;   /* the same bound wherever the job's bytes are */
     hash_cache_clear(w);
     if (w->lp.row) row_insert_upto(w, a->js);
+    else if (w->lp.accel) fast1_fill(w, w->ins, a->js);
     else fast_fill(w, w->ins, a->js);
     w->reps[0] = w->reps[1] = w->reps[2] = 0;
     w->huf[0].valid = 0;
@@ -910,11 +1032,11 @@ static void batch_free(struct lzr_batch *b)
 }
 
 /* Queue job buf[js, je); the first job of a batch starts the helpers. */
-static void batch_add(lzr_cctx *c, size_t js, size_t je)
+static void batch_add_in(lzr_cctx *c, const uint8_t *buf, size_t span, size_t js, size_t je)
 {
     struct lzr_batch *b = c->bt;
     job_arg *a = &b->a[b->nready];
-    a->c = c; a->js = js; a->je = je; a->r = LZR_OK;
+    a->c = c; a->buf = buf; a->span = span; a->js = js; a->je = je; a->r = LZR_OK;
 #if LZR_HAVE_THREADS
     pthread_mutex_lock(&b->mu);
     b->nready++;
@@ -934,6 +1056,8 @@ static void batch_add(lzr_cctx *c, size_t js, size_t je)
 #endif
 }
 
+static void batch_add(lzr_cctx *c, size_t js, size_t je) { batch_add_in(c, c->buf, c->cap, js, je); }
+
 /* Queue every full job that is now buffered. */
 static void batch_feed(lzr_cctx *c)
 {
@@ -948,12 +1072,32 @@ static void batch_feed(lzr_cctx *c)
 /* Queue the rest of buf[pos, end) (the last job may be short), run the
  * batch to the end, append the jobs in order and keep jover bytes of
  * history. */
+static int batch_run(lzr_cctx *c, lzr_buf *out);
 static int batch_finish(lzr_cctx *c, lzr_buf *out)
 {
     struct lzr_batch *b = c->bt;
     batch_feed(c);
     size_t js = c->pos + (size_t)b->nready * c->jsize;
     if (b->nready < c->jobs && js < c->end) batch_add(c, js, c->end);
+    int n = b->nready;
+    int r = batch_run(c, out);
+    if (r) return r;
+    if (n) c->pos = b->a[n - 1].je;
+    /* keep jover bytes of history */
+    size_t keep_from = c->pos > c->jover ? c->pos - c->jover : 0;
+    if (keep_from) {
+        memmove(c->buf, c->buf + keep_from, c->end - keep_from);
+        c->pos -= keep_from;
+        c->end -= keep_from;
+    }
+    return LZR_OK;
+}
+
+/* Close the batch, work on it until it is done and append the jobs'
+ * output in order. */
+static int batch_run(lzr_cctx *c, lzr_buf *out)
+{
+    struct lzr_batch *b = c->bt;
     int n = b->nready;
 #if LZR_HAVE_THREADS
     pthread_mutex_lock(&b->mu);
@@ -971,16 +1115,7 @@ static int batch_finish(lzr_cctx *c, lzr_buf *out)
         r = b->a[j].r;
         if (!r && buf_append(out, c->wout[j].p, c->wout[j].len)) r = LZR_ERR_NOMEM;
     }
-    if (r) return r;
-    if (n) c->pos = b->a[n - 1].je;
-    /* keep jover bytes of history */
-    size_t keep_from = c->pos > c->jover ? c->pos - c->jover : 0;
-    if (keep_from) {
-        memmove(c->buf, c->buf + keep_from, c->end - keep_from);
-        c->pos -= keep_from;
-        c->end -= keep_from;
-    }
-    return LZR_OK;
+    return r;
 }
 
 typedef struct { lzr_cctx *c; lzr_buf *out; int hash; } sink_ctx;   /* hash: src is the original content */
@@ -1051,6 +1186,50 @@ int lzr_cctx_set_filter(lzr_cctx *c, int filter)
     return LZR_OK;
 }
 
+/* One-shot input (the whole content in the first write, size known) in
+ * job mode: the jobs read the caller's buffer instead of a copy, and the
+ * caller hashes it while the helpers compress. Jobs are the same as when
+ * copied (the same boundaries, history and bounds: see job_compress), so
+ * the output is too. The last jobs, which read a little past their last
+ * byte, are copied with their history into the job buffer and run in the
+ * same final batch. Returns 1 if the input was taken (all of it). */
+static int jobs_borrow(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out, int *err)
+{
+    size_t m = 0;
+    while (m + c->jsize + 64 <= n) m += c->jsize;
+    const size_t rest = n - m;   /* < 2 jobs + 64 */
+    const int tail_jobs = (int)((rest + c->jsize - 1) / c->jsize);
+    const size_t h = m < c->jover ? m : c->jover;
+    if (!m || c->jobs < tail_jobs + 1 || h + rest > c->cap) return 0;
+    int hashed = 0;
+    size_t js = 0;
+    for (;;) {
+        /* borrowed jobs; the batch with the last of them has room for the
+         * tail jobs too (c->jobs > tail_jobs, so a next batch always does) */
+        const int R = (int)((m - js) / c->jsize), room = c->jobs;
+        const int k = R + tail_jobs <= room ? R : (R - 1 < room ? R - 1 : room);
+        for (int i = 0; i < k; i++) {
+            batch_add_in(c, src, n, js, js + c->jsize);
+            js += c->jsize;
+        }
+        if (js == m) {
+            /* the tail: history and rest copied, as batch_finish keeps them */
+            memcpy(c->buf, src + m - h, h + rest);
+            c->pos = h;
+            c->end = h + rest;
+            memset(c->buf + c->end, 0, 8);
+            for (size_t t = c->pos; t < c->end; t += c->jsize)
+                batch_add(c, t, c->end - t > c->jsize ? t + c->jsize : c->end);
+        }
+        if (!hashed) { xxh64_update(&c->xs, src, n); hashed = 1; }
+        int r = batch_run(c, out);
+        if (r) { *err = r; return 0; }
+        if (js == m) break;
+    }
+    c->pos = c->end;
+    return 1;
+}
+
 int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
 {
     if (c->finished) return LZR_ERR_PARAM;
@@ -1060,6 +1239,11 @@ int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
     /* the checksum is of the original content: hashed here before the
      * filter, else by write_raw piece by piece as it is copied */
     sink_ctx s = {c, out, !c->x86tmp};
+    if (c->jobs && !c->x86tmp && c->end == 0 && c->total_in == n && c->content_size == (int64_t)n &&
+        n < ((size_t)1 << 30)) {
+        int err = 0;
+        if (jobs_borrow(c, src, n, out, &err) || err) return err;
+    }
     if (c->x86tmp) {
         xxh64_update(&c->xs, src, n);
         return x86_run(&c->x86, src, n, 0, c->x86tmp, write_raw, &s);

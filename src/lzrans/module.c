@@ -73,7 +73,7 @@ static int resolve_threads(int threads)
 static int check_level(int level, int wlog)
 {
     if (level < LZR_LEVEL_MIN || level > LZR_LEVEL_MAX) {
-        PyErr_SetString(PyExc_ValueError, "level must be between 0 and 9");
+        PyErr_SetString(PyExc_ValueError, "level must be between -3 and 9");
         return -1;
     }
     if (wlog && (wlog < LZR_WLOG_MIN || wlog > LZR_WLOG_MAX)) {

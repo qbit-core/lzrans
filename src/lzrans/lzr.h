@@ -38,7 +38,7 @@
 #define LZR_FILTER_NONE    0
 #define LZR_FILTER_X86     1
 #define LZR_BLOCK_HDR      9
-#define LZR_LEVEL_MIN      0
+#define LZR_LEVEL_MIN     -3
 #define LZR_LEVEL_MAX      9
 
 /* ---- streaming compressor ---- */

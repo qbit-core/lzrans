@@ -40,7 +40,7 @@ CASES = {
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
-@pytest.mark.parametrize("level", [0, 1, 4, 7, 9])
+@pytest.mark.parametrize("level", [-3, -1, 0, 1, 4, 7, 9])
 def test_roundtrip(name, level):
     data = CASES[name]
     comp = lzrans.compress(data, level=level)
@@ -96,7 +96,7 @@ def test_crc32_matches_zlib(data):
 
 def test_invalid_level():
     with pytest.raises(ValueError):
-        lzrans.compress(b"x", level=-1)
+        lzrans.compress(b"x", level=-4)
     with pytest.raises(ValueError):
         lzrans.compress(b"x", level=10)
     with pytest.raises(ValueError):
@@ -264,7 +264,7 @@ def test_threads_identical_on_window_sized_input():
     assert lzrans.decompress(c1) == data
 
 
-@pytest.mark.parametrize("level", [0, 1, 3, 6])
+@pytest.mark.parametrize("level", [-3, -1, 0, 1, 3, 6])
 def test_job_mode_levels_1_6(level):
     # Levels 1-6 with threads > 1 compress independent 4 MB jobs: the
     # output is the same for any thread count > 1 and any input chunking,
@@ -299,6 +299,23 @@ def test_job_mode_freed_mid_stream():
         del c
     c = lzrans.Compressor(level=0, threads=4)
     assert c.compress(data) + c.flush() == ref
+
+
+@pytest.mark.parametrize("level", [-3, -1, 0, 2, 6])
+def test_one_shot_jobs_match_streaming(level):
+    # compress() with threads reads the input in place (no copy) for all
+    # but the last jobs; the blocks must be those of the copying path
+    # (streaming), whose frame differs only by the content size field.
+    rnd = random.Random(level + 10)
+    parts = [_text(300_000, k) for k in range(5)] + [CASES["binary_mix"]]
+    for n in (4 * 2**20 + 63, 4 * 2**20 + 65, 9 * 2**20 + 12345, 13 * 2**20):
+        data = b"".join(rnd.choice(parts)[: rnd.randint(1000, 300_000)] for _ in range(n // 100_000 + 1))[:n]
+        for t in (2, 4):
+            one = lzrans.compress(data, level=level, threads=t)
+            c = lzrans.Compressor(level=level, threads=t)
+            st = c.compress(data) + c.flush()
+            assert one[16:] == st[8:], (n, t)
+            assert lzrans.decompress(one) == data
 
 
 def test_threads_validated():
