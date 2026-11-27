@@ -22,6 +22,7 @@ static void gen(uint8_t *b, size_t n, int kind)
         case 2: b[i] = (uint8_t)("abcabd"[i % 6]); break;             /* short period */
         case 3: b[i] = (uint8_t)(rnd() % 4); break;                   /* low entropy  */
         case 5: b[i] = (rnd() % 6) ? (uint8_t)(rnd() % 3 ? 0 : rnd()) : 0xE8; break;   /* call-dense */
+        case 6: b[i] = (uint8_t)(i ? 32 + (b[i - 1] * 7 + rnd() % 5) % 90 : 32); break;   /* context literals */
         default: /* text-like with copies from near and far back */
             b[i] = (i > 300000 && rnd() % 8) ? b[i - 1 - rnd() % (i > 2000000 ? 2000000 : 300000)]
                                               : (uint8_t)(32 + rnd() % 64);
@@ -75,7 +76,7 @@ int main(int argc, char **argv)
     long fails = 0, rejected = 0;
     for (int it = 0; it < iters; it++) {
         size_t n = (it % 10 == 0) ? (rnd() % maxn) : (rnd() % 5000);
-        int kind = rnd() % 6, level = (int)(rnd() % 15) - 3;   /* LZR_LEVEL_MIN..MAX */
+        int kind = rnd() % 7, level = (int)(rnd() % 15) - 3;   /* LZR_LEVEL_MIN..MAX */
         gen(src, n, kind);
         lzr_buf comp = {0}, dec = {0};
         if (compress_chunked(src, n, level, &comp) || decompress_chunked(comp.p, comp.len, &dec) != 1 ||

@@ -84,6 +84,11 @@ struct lzr_cctx {
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
     uint8_t *lits, *llc, *mlc, *ofc, *blk;
+    /* block type 6 (levels 7-10): the byte before each literal, the
+     * context literal tables (live, rollback), and a scratch section */
+    uint8_t *lctx, *ctmp;
+    hufc_table *hufc;
+    int ctx_try;      /* emit_seqs5 may try type 6 (split5 narrows it) */
     uint32_t *xlm, *xof;   /* type 5: extra bits (ll | ml << n, offset)     */
     uint8_t *nlm, *nof;    /* and their bit counts                          */
 };

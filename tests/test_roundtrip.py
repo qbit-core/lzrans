@@ -359,7 +359,7 @@ def _block_types(blob):
 @pytest.mark.parametrize("level,btype", [(0, 5), (1, 5), (6, 5), (7, 5), (8, 5), (10, 5), (11, 4)])
 def test_block_type_by_level(level, btype):
     blob = lzrans.compress(_text(3 * BS), level=level)
-    assert blob[4] == 5                              # format version
+    assert blob[4] == 6                              # format version
     assert set(_block_types(blob)) == {btype, 2}
 
 
@@ -422,3 +422,49 @@ def test_filter_validated():
         lzrans.compress(b"x", filter="arm")
     with pytest.raises(ValueError):
         lzrans.Compressor(filter=1)
+
+
+def _markov(n, seed=3):
+    # bytes whose distribution depends on the byte before (block type 6)
+    rnd = random.Random(seed)
+    nxt = {a: rnd.sample(range(32, 127), 6) for a in range(256)}
+    out, b = bytearray(), 32
+    for _ in range(n):
+        b = rnd.choice(nxt[b]) if rnd.random() < 0.9 else rnd.randrange(32, 127)
+        out.append(b)
+    return bytes(out)
+
+
+@pytest.mark.parametrize("level", [7, 8, 9, 10])
+def test_context_literals_block_type_6(level):
+    data = _markov(3 * BS)
+    blob = lzrans.compress(data, level=level)
+    assert 6 in _block_types(blob)
+    assert lzrans.decompress(blob) == data
+    d = lzrans.Decompressor()
+    out = b"".join(d.decompress(blob[i:i + 777]) for i in range(0, len(blob), 777))
+    assert out == data and d.eof
+    # corrupted type 6 blocks are rejected or decode to something, never crash
+    rnd = random.Random(level)
+    for _ in range(40):
+        bad = bytearray(blob)
+        for _ in range(3):
+            bad[rnd.randrange(8, len(bad))] ^= 1 << rnd.randrange(8)
+        try:
+            lzrans.decompress(bytes(bad))
+        except lzrans.LzransError:
+            pass
+
+
+def test_version_5_frames_still_decode():
+    data = _text(2 * BS, 3)
+    blob = bytearray(lzrans.compress(data, level=1))   # type 5 blocks only
+    assert blob[4] == 6
+    blob[4] = 5
+    assert lzrans.decompress(bytes(blob)) == data
+    # a type 6 block is not valid in a version 5 frame
+    blob6 = bytearray(lzrans.compress(_markov(2 * BS), level=7))
+    assert 6 in _block_types(blob6)
+    blob6[4] = 5
+    with pytest.raises(lzrans.LzransError):
+        lzrans.decompress(bytes(blob6))

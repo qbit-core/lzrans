@@ -110,6 +110,14 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->seq_ml = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_dist = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE + 32);
+    if (c->lp.opt && level < LZR_ADAPTIVE_LEVEL) {   /* block type 6 */
+        c->lctx = (uint8_t *)malloc(LZR_BLOCK_SIZE + 32);
+        c->ctmp = (uint8_t *)malloc(hufc_bound(LZR_BLOCK_SIZE));
+        c->hufc = (hufc_table *)calloc(2, sizeof(hufc_table));
+        if (c->hufc) c->hufc[0].work = (uint32_t *)malloc(HUFC_WORK * sizeof(uint32_t));
+        c->ctx_try = 1;
+        if (!c->lctx || !c->ctmp || !c->hufc || !c->hufc[0].work) { lzr_cctx_free(c); return NULL; }
+    }
     c->llc = (uint8_t *)malloc(MAX_SEQ);
     c->mlc = (uint8_t *)malloc(MAX_SEQ);
     c->ofc = (uint8_t *)malloc(MAX_SEQ);
@@ -168,6 +176,8 @@ void lzr_cctx_free(lzr_cctx *c)
     free(c->seq_ll); free(c->seq_ml); free(c->seq_dist);
     free(c->lits); free(c->llc); free(c->mlc); free(c->ofc); free(c->xlm); free(c->xof); free(c->nlm); free(c->nof);
     free(c->blk); free(c->tm); free(c->huf); free(c->fse); free(c->x86tmp);
+    if (c->hufc) hufc_free(&c->hufc[0]);
+    free(c->hufc); free(c->lctx); free(c->ctmp);
     free(c);
 }
 
@@ -765,12 +775,45 @@ static size_t encode_tokens(lzr_cctx *c, size_t bs, size_t be, size_t ns, const 
  *   nseq u32 | nlit u32 | literal section (huf.h) |
  *   if nseq: 3 table modes (ll, ml, of: 0 new + counts, 1 previous,
  *   2 single symbol + that symbol) | bit stream (fse.h) to the block end */
-static size_t emit_seqs5(lzr_cctx *c, size_t s0, size_t ns, size_t l0, size_t nlit, uint8_t *b)
+/* Block type 6 only when its literal section is at least this many 1/1000
+ * smaller than type 5's: decoding context literals is slower. */
+#ifndef CTX_MIN_GAIN
+#define CTX_MIN_GAIN 20
+#endif
+#ifndef CTX_MIN_LITS
+#define CTX_MIN_LITS 1024
+#endif
+
+/* Type 5 (or 6, see *btype) block body for sequences [s0, s0 + ns) and
+ * literals [l0, l0 + nlit). */
+static size_t emit_seqs5(lzr_cctx *c, size_t s0, size_t ns, size_t l0, size_t nlit, uint8_t *b, uint8_t *btype)
 {
     size_t k = LZR_BLOCK_HDR;
     wr32le(b + k, (uint32_t)ns); k += 4;
     wr32le(b + k, (uint32_t)nlit); k += 4;
-    k += huf_encode(b + k, c->lits + l0, nlit, &c->huf[0]);
+    *btype = 5;
+    if (c->hufc && c->ctx_try && nlit >= CTX_MIN_LITS) {
+        /* both literal codings; type 6 leaves the type 5 table as it was */
+        hufc_table hs = c->hufc[0];
+        huf_table h5 = c->huf[0];
+        size_t n6 = hufc_encode(c->ctmp, c->lits + l0, c->lctx + l0, nlit, &c->hufc[0]);
+        size_t n5 = huf_encode(b + k, c->lits + l0, nlit, &c->huf[0]);
+#ifdef LZR_STATS
+        fprintf(stderr, "LZRCTX %zu %zu %zu %d %d\n", nlit, n5, n6, n6 ? c->ctmp[0] : -1, b[k]);
+#endif
+        if (n6 && n6 * 1000 < n5 * (1000 - CTX_MIN_GAIN)) {
+            c->huf[0] = h5;
+            memcpy(b + k, c->ctmp, n6);
+            k += n6;
+            *btype = 6;
+        } else {
+            hs.work = c->hufc[0].work;   /* (scratch, allocated once) */
+            c->hufc[0] = hs;
+            k += n5;
+        }
+    } else {
+        k += huf_encode(b + k, c->lits + l0, nlit, &c->huf[0]);
+    }
 #ifdef LZR_STATS
     const size_t st_lit_end = k;
 #endif
@@ -897,9 +940,19 @@ static size_t emit_seqs5(lzr_cctx *c, size_t s0, size_t ns, size_t l0, size_t nl
 #ifndef SPLIT_MIN_SEQ
 #define SPLIT_MIN_SEQ 128
 #endif
-typedef struct { huf_table huf; fse_table fse[3]; } tab_state;
-static void tab_save(const lzr_cctx *c, tab_state *t) { t->huf = c->huf[0]; memcpy(t->fse, c->fse, sizeof(t->fse)); }
-static void tab_load(lzr_cctx *c, const tab_state *t) { c->huf[0] = t->huf; memcpy(c->fse, t->fse, sizeof(t->fse)); }
+typedef struct { huf_table huf; fse_table fse[3]; hufc_table hufc; } tab_state;
+static void tab_save(const lzr_cctx *c, tab_state *t)
+{
+    t->huf = c->huf[0];
+    memcpy(t->fse, c->fse, sizeof(t->fse));
+    if (c->hufc) t->hufc = c->hufc[0];
+}
+static void tab_load(lzr_cctx *c, const tab_state *t)
+{
+    c->huf[0] = t->huf;
+    memcpy(c->fse, t->fse, sizeof(t->fse));
+    if (c->hufc) { uint32_t *w = c->hufc[0].work; c->hufc[0] = t->hufc; c->hufc[0].work = w; }
+}
 
 /* Encode sequences [s0, s1) and literals [l0, l1) (raw bytes [p0, p1)) as
  * type 5 block(s) into dst; returns the size, or (size_t)-1 when a part
@@ -909,10 +962,11 @@ static size_t split5(lzr_cctx *c, size_t s0, size_t s1, size_t l0, size_t l1, si
 {
     tab_state t0, tw;
     tab_save(c, &t0);
-    size_t k = emit_seqs5(c, s0, s1 - s0, l0, l1 - l0, dst);
+    uint8_t bt;
+    size_t k = emit_seqs5(c, s0, s1 - s0, l0, l1 - l0, dst, &bt);
     const size_t raw = p1 - p0;
     if (k - LZR_BLOCK_HDR >= raw) { tab_load(c, &t0); return (size_t)-1; }
-    dst[0] = 5;
+    dst[0] = bt;
     wr32le(dst + 1, (uint32_t)raw);
     wr32le(dst + 5, (uint32_t)(k - LZR_BLOCK_HDR));
     if (!depth || s1 - s0 < 2 * SPLIT_MIN_SEQ) return k;
@@ -927,10 +981,14 @@ static size_t split5(lzr_cctx *c, size_t s0, size_t s1, size_t l0, size_t l1, si
     if (sm - s0 < SPLIT_MIN_SEQ || s1 - sm < SPLIT_MIN_SEQ) return k;
     tab_save(c, &tw);
     tab_load(c, &t0);
-    uint8_t *tmp = (uint8_t *)malloc(2 * (k + 64) + 2 * (3 * (1 + 3 * FSE_MAXSYM) + 64) + huf_bound(raw) + 11 * (s1 - s0));
+    uint8_t *tmp = (uint8_t *)malloc(2 * (k + 64) + 2 * (3 * (1 + 3 * FSE_MAXSYM) + 64) + 2 * hufc_bound(raw) + 11 * (s1 - s0));
     if (!tmp) return (size_t)-2;
+    /* halves only try context literals when the whole part chose them */
+    const int try6 = c->ctx_try;
+    c->ctx_try = try6 && bt == 6;
     size_t a = split5(c, s0, sm, l0, lm, p0, pm, depth - 1, tmp);
     size_t b = a >= (size_t)-2 ? a : split5(c, sm, s1, lm, l1, pm, p1, depth - 1, tmp + a);
+    c->ctx_try = try6;
     if (a == (size_t)-2 || b == (size_t)-2) { free(tmp); return (size_t)-2; }
     if (a != (size_t)-1 && b != (size_t)-1 && a + b < k) {
         memcpy(dst, tmp, a + b);
@@ -980,7 +1038,7 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
         if (n != (size_t)-1) return LZR_OK;
         k = (size_t)-1;   /* stored below */
     } else {
-        k = emit_seqs5(c, 0, ns, 0, nlit, b);
+        k = emit_seqs5(c, 0, ns, 0, nlit, b, &btype);
     }
 
     if (k != (size_t)-1 && k - LZR_BLOCK_HDR < raw) {

@@ -617,11 +617,20 @@ static void short_matches(lzr_cctx *c, opt_state *st, size_t bs, size_t be)
 
 /* ---------------- dynamic programming ---------------- */
 
+/* The byte before each of buf[p, p + n) (0 before the content). */
+static inline void lit_prev(const lzr_cctx *c, uint8_t *dst, size_t p, size_t n)
+{
+    if (!n) return;
+    if (p) memcpy(dst, c->buf + p - 1, n);
+    else { dst[0] = 0; memcpy(dst + 1, c->buf, n - 1); }
+}
+
 static inline void emit_seq(lzr_cctx *c, size_t *ns, size_t *nlit, size_t *lit_start, size_t mpos,
                             uint32_t ml, uint32_t off)
 {
     size_t ll = mpos - *lit_start;
     memcpy(c->lits + *nlit, c->buf + *lit_start, ll);
+    if (c->lctx) lit_prev(c, c->lctx + *nlit, *lit_start, ll);
     *nlit += ll;
     c->seq_ll[*ns] = (uint32_t)ll;
     c->seq_ml[*ns] = ml;
@@ -915,6 +924,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
         }
     }
     memcpy(c->lits + nlit, buf + lit_start, be - lit_start);
+    if (c->lctx) lit_prev(c, c->lctx + nlit, lit_start, be - lit_start);
     nlit += be - lit_start;
     *nlit_out = nlit;
     return ns;
