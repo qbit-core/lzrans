@@ -270,7 +270,9 @@ def test_job_mode_levels_1_6(level):
     # output is the same for any thread count > 1 and any input chunking,
     # within ~1% of the single-thread size, and always decodes.
     rnd = random.Random(level)
-    parts = [_text(200_000, k) for k in range(6)] + [CASES["binary_mix"]]
+    # seeded, not CASES["binary_mix"] (os.urandom): the 1% size bound is
+    # then checked on the same bytes every run
+    parts = [_text(200_000, k) for k in range(6)] + [random.Random(99).randbytes(5000) * 20 + _text(50_000)]
     data = b"".join(rnd.choice(parts)[: rnd.randint(1000, 200_000)] for _ in range(120))
     one = lzrans.compress(data, level=level, threads=1)
     ref = lzrans.compress(data, level=level, threads=2)
