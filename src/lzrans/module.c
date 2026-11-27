@@ -73,7 +73,7 @@ static int resolve_threads(int threads)
 static int check_level(int level, int wlog)
 {
     if (level < LZR_LEVEL_MIN || level > LZR_LEVEL_MAX) {
-        PyErr_SetString(PyExc_ValueError, "level must be between -3 and 9");
+        PyErr_SetString(PyExc_ValueError, "level must be between -3 and 11");
         return -1;
     }
     if (wlog && (wlog < LZR_WLOG_MIN || wlog > LZR_WLOG_MAX)) {
@@ -381,7 +381,7 @@ static PyTypeObject DecompressorType = {
 static PyMethodDef methods[] = {
     {"compress", (PyCFunction)(void (*)(void))py_compress, METH_VARARGS | METH_KEYWORDS,
      "compress(data, level=6, window_log=0, threads=1, filter=None) -> bytes\n"
-     "threads: match-finder threads for levels 7-9 (0 = auto, up to 4). Output is identical for any value.\n"
+     "threads: match-finder threads for levels 9-11 (0 = auto, up to 4). Output is identical for any value.\n"
      "filter: None, or \"x86\" for x86/x86-64 machine code (executables, libraries)."},
     {"decompress", py_decompress, METH_O, "decompress(data) -> bytes"},
     {"crc32", py_crc32, METH_VARARGS, "crc32(data, value=0) -> int (zlib-compatible)"},

@@ -75,7 +75,7 @@ int main(int argc, char **argv)
     long fails = 0, rejected = 0;
     for (int it = 0; it < iters; it++) {
         size_t n = (it % 10 == 0) ? (rnd() % maxn) : (rnd() % 5000);
-        int kind = rnd() % 6, level = (int)(rnd() % 13) - 3;   /* LZR_LEVEL_MIN..MAX */
+        int kind = rnd() % 6, level = (int)(rnd() % 15) - 3;   /* LZR_LEVEL_MIN..MAX */
         gen(src, n, kind);
         lzr_buf comp = {0}, dec = {0};
         if (compress_chunked(src, n, level, &comp) || decompress_chunked(comp.p, comp.len, &dec) != 1 ||

@@ -19,7 +19,18 @@ typedef struct {
     uint8_t opt;      /* 0 = lazy parser, N = optimal parser with N passes        */
     uint8_t row;      /* lazy levels: log2 of the row size (row match finder)    */
     uint8_t accel;    /* negative levels: single-hash fast finder, base step     */
+    uint8_t lite;     /* optimal parser shortcuts (OPT_LITE_* bits)              */
 } level_params;
+
+/* level_params.lite: cheaper optimal parsing for the mid levels */
+#define OPT_LITE_NOCOMBO 1   /* no literal + rep0 / match + literal + rep0 steps */
+#define OPT_LITE_NOSHORT 2   /* no 2- and 3-byte matches                         */
+#define OPT_LITE_CUTLEN  4   /* lengths past OPT_LITE_FULL tried at full length only */
+#ifndef OPT_LITE_FULL
+#define OPT_LITE_FULL 12
+#endif
+
+typedef struct { uint32_t len, dist; } mpair;
 
 
 struct lzr_cctx {
@@ -32,9 +43,9 @@ struct lzr_cctx {
     size_t ins;            /* next position to insert into the chains    */
     size_t lo;             /* job mode: start of the job's history (backward
                               match extension stops there), else 0       */
-    uint32_t *head;        /* levels 7-9: buffer index + 1; levels 1-6 (row
+    uint32_t *head;        /* levels 9-11 (tree): buffer index + 1; levels 1-8 (row
                             * slots): base + buffer index + 1 (see slide()); 0 = empty */
-    size_t base;           /* levels 1-6: bytes slid out since the last rebase */
+    size_t base;           /* levels 1-8: bytes slid out since the last rebase */
     uint8_t *rtag, *rhead; /* row finder: 8-bit tags (head[] holds the
                             * positions) and each row's newest slot       */
     uint32_t hc[8];        /* row hashes of positions hcpos[] (pos & 7);   */
@@ -49,7 +60,7 @@ struct lzr_cctx {
     uint32_t *son;
     void *opt;
     int have_stats;
-    int threads;           /* match-finder threads (levels 7-9)           */
+    int threads;           /* match-finder threads (levels 9-11)          */
     size_t bt_maxdist;     /* farthest tree node followed (see opt_init)   */
     int adaptive;          /* emit block type 4 (token range coding)        */
     tok_model *tm;         /* [0] = live model, [1] = copy for rollback     */
@@ -80,7 +91,7 @@ struct lzr_cctx {
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define LZR_MAX_THREADS 16
 #ifndef LZR_ADAPTIVE_LEVEL
-#define LZR_ADAPTIVE_LEVEL 9   /* levels >= this use block type 4 */
+#define LZR_ADAPTIVE_LEVEL 11  /* levels >= this use block type 4 */
 #endif
 #ifndef LZR_HAVE_THREADS
 #if defined(_WIN32)
@@ -131,5 +142,11 @@ void opt_free(lzr_cctx *c);
 size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out);
 void opt_slide(lzr_cctx *c, uint32_t delta);
 void opt_sync(lzr_cctx *c);
+/* enc.c: the row finder as the optimal parser's match source (mid
+ * levels, opt && row): for each position of [bs, be), candidates of
+ * strictly increasing length into pairs[mstart[p - bs] ..); indexes all
+ * positions up to be. Returns nonzero when out of memory. */
+int row_gather(lzr_cctx *c, size_t bs, size_t be, size_t lim_end, mpair **pairs, size_t *pcap, uint32_t *mstart,
+               unsigned max_cand);
 
 #endif

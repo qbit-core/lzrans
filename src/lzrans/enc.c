@@ -8,7 +8,7 @@
  *   parse_block()     lazy parse (depth 0..2) into sequences + literals;
  *                     level 0: parse_block_fast(), double-hash greedy
  *   emit_block()      sequences -> block type 5 (Huffman literals + tANS
- *                     sequences) or type 4 (range-coded tokens, level 9)
+ *                     sequences) or type 4 (range-coded tokens, level 11)
  *   slide()           drops history older than the window, rebases tables
  */
 #include "lzr.h"
@@ -30,16 +30,23 @@
  * hash bits; see parse_block_fast). Levels 1-6: lazy parsing (window, hash bits, lazy depth, search steps,
  * nice length) over rows of 2^row recent positions (hash bits = log2 of
  * all row entries; replaced hash chains in v0.6: 2-5x faster). Levels
- * 7-9: binary tree + optimal parsing (chain = tree depth, opt = number of
+ * 7-8: the same rows as the optimal parser's match source (chain = row
+ * slots tried per position). Levels 9-11: binary tree + optimal parsing
+ * (chain = tree depth, opt = number of
  * parsing passes; a second pass gained <0.5% ratio for ~40% more time, so
  * all use one). */
 static const level_params LEVELS[LZR_LEVEL_MAX - LZR_LEVEL_MIN + 1] = {
     /* levels -3 .. -1: single-hash fast finder (window, hash bits, accel) */
-    {19, 13, 0, 0, 0, 0, 0, 4}, {20, 14, 0, 0, 0, 0, 0, 2}, {20, 14, 0, 0, 0, 0, 0, 1},
-    {22, 16, 0, 0, 0, 0, 0},
-    {20, 20, 0, 4, 16, 0, 4}, {21, 21, 1, 8, 24, 0, 4}, {22, 21, 1, 16, 32, 0, 4},
-    {22, 22, 1, 32, 48, 0, 5}, {23, 23, 2, 48, 64, 0, 6}, {24, 23, 2, 64, 96, 0, 6},
-    {25, 20, 0, 16, 128, 1, 0}, {26, 21, 0, 24, 273, 1, 0}, {26, 22, 0, 48, 273, 1, 0},
+    {19, 13, 0, 0, 0, 0, 0, 4, 0}, {20, 14, 0, 0, 0, 0, 0, 2, 0}, {20, 14, 0, 0, 0, 0, 0, 1, 0},
+    {22, 16, 0, 0, 0, 0, 0, 0, 0},
+    {20, 20, 0, 4, 16, 0, 4, 0, 0}, {21, 21, 1, 8, 24, 0, 4, 0, 0}, {22, 21, 1, 16, 32, 0, 4, 0, 0},
+    {22, 22, 1, 32, 48, 0, 5, 0, 0}, {23, 23, 2, 48, 64, 0, 6, 0, 0}, {24, 23, 2, 64, 96, 0, 6, 0, 0},
+    /* levels 7-8: row finder + light optimal parsing (lazy = inside-match
+     * length, see row_gather; lite = OPT_LITE_* shortcuts) */
+    {24, 22, 16, 16, 64, 1, 5, 0, OPT_LITE_NOCOMBO | OPT_LITE_NOSHORT | OPT_LITE_CUTLEN},
+    {24, 23, 16, 32, 128, 1, 6, 0, OPT_LITE_NOSHORT | OPT_LITE_CUTLEN},
+    /* levels 9-11: binary tree + optimal parsing */
+    {25, 20, 0, 16, 128, 1, 0, 0, 0}, {26, 21, 0, 24, 273, 1, 0, 0, 0}, {26, 22, 0, 48, 273, 1, 0, 0, 0},
 };
 
 
@@ -74,6 +81,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     if (getenv("LZR_ROW")) c->lp.row = (uint8_t)atoi(getenv("LZR_ROW"));
     if (getenv("LZR_LAZY")) c->lp.lazy = (uint8_t)atoi(getenv("LZR_LAZY"));
     if (getenv("LZR_ACCEL")) c->lp.accel = (uint8_t)atoi(getenv("LZR_ACCEL"));
+    if (getenv("LZR_LITE")) c->lp.lite = (uint8_t)atoi(getenv("LZR_LITE"));
     if (getenv("LZR_THREADS")) c->threads = atoi(getenv("LZR_THREADS"));
 #endif
     /* A window larger than the known input only wastes memory. */
@@ -94,7 +102,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 
     c->buf = (uint8_t *)big_alloc(c->cap + LZR_SLACK, 0);
     c->head = (uint32_t *)big_alloc(head_entries(&c->lp) * sizeof(uint32_t), 1);
-    if (!c->lp.opt) {   /* row finder (lazy levels) */
+    if (!c->lp.opt || c->lp.row) {   /* row finder (lazy and mid levels) */
         c->rtag = (uint8_t *)big_alloc(rtag_size(&c->lp), 1);
         c->rhead = (uint8_t *)big_alloc(rhead_size(&c->lp), 1);
     }
@@ -125,7 +133,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->huf = (huf_table *)calloc(2, sizeof(huf_table));
     c->fse = (fse_table *)calloc(6, sizeof(fse_table));
     if (c->lp.opt && opt_init(c)) { lzr_cctx_free(c); return NULL; }
-    if (!c->buf || !c->head || (!c->lp.opt && (!c->rtag || !c->rhead)) || !c->seq_ll || !c->seq_ml || !c->seq_dist || !c->lits ||
+    if (!c->buf || !c->head || ((!c->lp.opt || c->lp.row) && (!c->rtag || !c->rhead)) || !c->seq_ll || !c->seq_ml || !c->seq_dist || !c->lits ||
         !c->llc || !c->mlc || !c->ofc || !c->xlm || !c->xof || !c->nlm || !c->nof || !c->blk || !c->tm || !c->huf || !c->fse) {
         lzr_cctx_free(c);
         return NULL;
@@ -247,6 +255,103 @@ static LZR_AINLINE void row_insert_upto_(lzr_cctx *c, size_t upto, const unsigne
 }
 
 static void row_insert_upto(lzr_cctx *c, size_t upto) { row_insert_upto_(c, upto, c->lp.row); }
+
+/* ---- mid levels: row finder feeding the optimal parser ----
+ * Candidates at p of strictly increasing length (first above out[0].len
+ * when nonzero), at most `tries` row slots, then p is indexed. */
+static LZR_AINLINE unsigned row_cands_(lzr_cctx *c, size_t p, size_t limit, mpair *out, unsigned max, unsigned tries,
+                                       const unsigned rlog)
+{
+    const unsigned R = 1u << rlog;
+    unsigned n = 0;
+    if (out) {
+        const uint8_t *cur = c->buf + p, *const buf = c->buf;
+        const uint32_t h = row_hash_at(c, p, c->lp.hlog - rlog + 8), row = h >> 8;
+        const size_t r0 = (size_t)row << rlog;
+        const unsigned hd = c->rhead[row];
+        uint64_t m = row_match_mask(c->rtag + r0, (uint8_t)h, R);
+        if (hd) m = (m >> hd | m << (R - hd)) & (R == 64 ? ~0ull : (1ull << R) - 1);
+        const uint32_t *const rpos = c->head + r0;
+        const size_t base = c->base, wsize = c->wsize;
+        const uint32_t first = rd32(cur);
+        size_t best = out[0].len ? out[0].len : LZR_MIN_MATCH - 1;
+        while (m && tries--) {
+            unsigned k = (unsigned)__builtin_ctzll(m);
+            m &= m - 1;
+            size_t cp = (size_t)rpos[(hd + k) & (R - 1)] - 1 - base;
+            size_t dist = p - cp;
+            if (cp >= p || dist > wsize) break;
+            const uint8_t *ref = buf + cp;
+            if (ref[best] != cur[best] || rd32(ref) != first) continue;
+            size_t len = match_len(ref, cur, limit);
+            if (len > best) {
+                best = len;
+                out[n].len = (uint32_t)len; out[n].dist = (uint32_t)dist;
+                if (++n == max || len == limit) break;
+            }
+        }
+    }
+    row_insert_upto_(c, p + 1, rlog);
+    return n;
+}
+
+/* A match found at p - 1 continues at p one byte shorter, at no search
+ * cost. Inside a match at least lp.lazy long (lazy is unused by the tree
+ * levels), the row search makes only 2 tries: the carried match is
+ * usually the best one there. */
+static LZR_AINLINE int row_gather_(lzr_cctx *c, size_t bs, size_t be, size_t lim_end, mpair **pairs, size_t *pcap,
+                                   uint32_t *mstart, unsigned max_cand, const unsigned rlog)
+{
+    const uint32_t inside = c->lp.lazy ? c->lp.lazy : UINT32_MAX;
+    size_t np = 0;
+    uint32_t cl = 0, cd = 0;
+    if (c->ins < bs) row_insert_upto_(c, bs, rlog);
+    for (size_t p = bs; p < be; p++) {
+        mstart[p - bs] = (uint32_t)np;
+        cl = cl > LZR_MIN_MATCH ? cl - 1 : 0;
+        if (p + LZR_MIN_MATCH > lim_end) continue;
+        if (np + max_cand + 1 > *pcap) {
+            size_t ncap = *pcap * 2;
+            mpair *o = (mpair *)realloc(*pairs, ncap * sizeof(mpair));
+            if (!o) return 1;
+            *pairs = o;
+            *pcap = ncap;
+        }
+        mpair *out = *pairs + np;
+        const uint32_t maxlen = (uint32_t)(be - p);
+        size_t limit = lim_end - p;
+        if (limit > c->lp.nice) limit = c->lp.nice;
+        if (cl > maxlen) cl = maxlen;
+        out[0].len = 0;
+        unsigned n = row_cands_(c, p, limit, out, max_cand, cl >= inside ? 2 : c->lp.chain, rlog);
+        uint32_t prev = 0, m = 0;
+        for (unsigned k = 0; k < n; k++) {
+            uint32_t len = out[k].len < maxlen ? out[k].len : maxlen;
+            if (len <= prev) continue;    /* clamped duplicates */
+            out[m].len = len; out[m].dist = out[k].dist; m++;
+            prev = len;
+        }
+        if (cl > prev && cl >= LZR_MIN_MATCH) {   /* the carried match is the longest */
+            out[m].len = cl; out[m].dist = cd; m++;
+        }
+        if (m) { cl = out[m - 1].len; cd = out[m - 1].dist; }
+        np += m;
+    }
+    mstart[be - bs] = (uint32_t)np;
+    row_insert_upto_(c, be, rlog);
+    return 0;
+}
+
+int row_gather(lzr_cctx *c, size_t bs, size_t be, size_t lim_end, mpair **pairs, size_t *pcap, uint32_t *mstart,
+               unsigned max_cand)
+{
+    switch (c->lp.row) {
+    case 4: return row_gather_(c, bs, be, lim_end, pairs, pcap, mstart, max_cand, 4);
+    case 5: return row_gather_(c, bs, be, lim_end, pairs, pcap, mstart, max_cand, 5);
+    case 6: return row_gather_(c, bs, be, lim_end, pairs, pcap, mstart, max_cand, 6);
+    default: return row_gather_(c, bs, be, lim_end, pairs, pcap, mstart, max_cand, c->lp.row);   /* LZR_TUNE */
+    }
+}
 
 /* Insert positions [c->ins, upto). */
 #define insert_upto(c, upto) row_insert_upto_(c, upto, rlog)
@@ -900,19 +1005,21 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
 #endif
 
 /* Keep the last >= wsize bytes; shift by a multiple of wsize so the
- * tree indices (pos & wmask, levels 7-9) stay valid. */
+ * tree indices (pos & wmask, levels 9-11) stay valid. */
 static void slide(lzr_cctx *c)
 {
     if (c->pos <= c->wsize) return;
     size_t delta = ((c->pos - c->wsize) / c->wsize) * c->wsize;
     if (!delta) return;
+    if (c->opt) opt_sync(c);   /* a background gather reads buf */
     memmove(c->buf, c->buf + delta, c->end - delta);
     c->pos -= delta;
     c->end -= delta;
     c->ins = c->ins > delta ? c->ins - delta : 0;
     hash_cache_clear(c);   /* positions moved */
     size_t hs = head_entries(&c->lp);
-    if (!c->lp.opt) {
+    if (c->lp.opt && c->lp.row) opt_slide(c, (uint32_t)delta);   /* short-match tables */
+    if (!c->lp.opt || c->lp.row) {
         /* Levels 1-6 store base + index, so sliding only moves the base
          * (row slots do not depend on positions).
          * The table is rewritten only before positions would pass 2^31. */

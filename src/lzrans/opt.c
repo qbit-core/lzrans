@@ -1,6 +1,6 @@
 /*
  * opt.c - binary-tree match finder + price-based optimal parser
- * (levels 7-9).
+ * (levels 7-11).
  *
  * Per 256 KB block:
  *   1. gather()        For every position, walk/insert the binary tree
@@ -13,7 +13,7 @@
  *                      price to reach it, how it was reached (literal or
  *                      match length + offset) and the repeat offsets
  *                      (and token coder state) on that path. Block type 4
- *                      (levels 7-9 by default): prices from a shadow copy
+ *                      (level 11): prices from a shadow copy
  *                      of the adaptive token model, advanced over the
  *                      tokens chosen so far before each segment. Block
  *                      type 1: prices from the symbol statistics of the
@@ -35,7 +35,6 @@
 #define BITCOST     256                 /* price units per bit */
 #define PRICE_INF   0x3FFFFFFF
 
-typedef struct { uint32_t len, dist; } mpair;
 
 typedef struct { uint32_t pos, len, dist; } mrec;
 
@@ -134,7 +133,7 @@ int opt_init(lzr_cctx *c)
 {
     opt_state *st = (opt_state *)calloc(1, sizeof(opt_state));
     c->opt = st;
-    c->son = (uint32_t *)big_alloc(2 * c->wsize * sizeof(uint32_t), 1);
+    if (!c->lp.row) c->son = (uint32_t *)big_alloc(2 * c->wsize * sizeof(uint32_t), 1);
     /* son[] is a ring indexed by position & (wsize-1). Worker threads run
      * at different positions within a block (and one may gather the next
      * block), so a slot can be reused by position cm + wsize while another
@@ -142,7 +141,7 @@ int opt_init(lzr_cctx *c)
      * wsize - 2 blocks as out of range makes that impossible, and makes the
      * result identical for every thread count. */
     c->bt_maxdist = c->wsize - 2 * (size_t)LZR_BLOCK_SIZE;
-    if (!st || !c->son) return LZR_ERR_NOMEM;
+    if (!st || (!c->lp.row && !c->son)) return LZR_ERR_NOMEM;
     for (int k = 0; k < 2; k++) {
         mcache *m = &st->mc[k];
         m->pcap = (size_t)LZR_BLOCK_SIZE * 2;
@@ -318,7 +317,7 @@ void opt_slide(lzr_cctx *c, uint32_t d)
     opt_state *st = (opt_state *)c->opt;
     opt_sync(c);                     /* the background gather reads buf/tree */
     if (st->pending) { st->pend_bs -= d; st->pend_be -= d; st->pend_lim -= d; }
-    for (size_t i = 0; i < 2 * c->wsize; i++) c->son[i] = c->son[i] > d ? c->son[i] - d : 0;
+    if (c->son) for (size_t i = 0; i < 2 * c->wsize; i++) c->son[i] = c->son[i] > d ? c->son[i] - d : 0;
     for (size_t i = 0; i < 65536; i++) st->last2[i] = st->last2[i] > d ? st->last2[i] - d : 0;
     for (size_t i = 0; i < ((size_t)1 << SH3_LOG); i++) st->last3[i] = st->last3[i] > d ? st->last3[i] - d : 0;
 }
@@ -465,6 +464,14 @@ static size_t gather_limit(const lzr_cctx *c, size_t be)
 
 static int gather(lzr_cctx *c, mcache *st, size_t bs, size_t be, size_t lim_end)
 {
+    if (c->lp.row) {   /* mid levels: row finder, one thread (shared hash cache) */
+        unsigned mc = MAX_CAND;
+#ifdef LZR_TUNE
+        if (getenv("LZR_MAXC")) mc = (unsigned)atoi(getenv("LZR_MAXC"));
+#endif
+        if (row_gather(c, bs, be, lim_end, &st->pairs, &st->pcap, st->mstart, mc)) return LZR_ERR_NOMEM;
+        return LZR_OK;
+    }
     unsigned T = c->threads < 1 ? 1 : (c->threads > LZR_MAX_THREADS ? LZR_MAX_THREADS : c->threads);
     gjob *jobs = st->jobs;
     for (unsigned t = 0; t < T; t++) {
@@ -631,6 +638,9 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
     const uint32_t nice = c->lp.nice;
     onode *N = st->nodes;
     size_t ns = 0, nlit = 0, p = bs, lit_start = bs;
+    const int combos = COMBOS && !(c->lp.lite & OPT_LITE_NOCOMBO);
+    const int shortm = SH_ON && !(c->lp.lite & OPT_LITE_NOSHORT);
+    const uint32_t opt_full = c->lp.lite & OPT_LITE_CUTLEN ? OPT_LITE_FULL : LZR_OPT_FULL;
 
     while (p + LZR_MIN_MATCH <= be) {
         size_t seg = be - LZR_MIN_MATCH + 1 - p;
@@ -689,7 +699,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
             }
             /* literal + rep0, for when the literal is not the cheapest way
              * to i + 1 */
-            if (COMBOS && cur + 3 <= be && n->reps[0] < cur + 1 &&
+            if (combos && cur + 3 <= be && n->reps[0] < cur + 1 &&
                 cp[1] == cp[1 - (ptrdiff_t)n->reps[0]] && cp[2] == cp[2 - (ptrdiff_t)n->reps[0]]) {
                 uint32_t d = n->reps[0], lim = (uint32_t)(be - cur - 1), len2;
                 if (lim > TOK_MAXLEN) lim = TOK_MAXLEN;
@@ -730,7 +740,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 if (len > best_len) { best_len = len; best_off = r; }
             }
             uint32_t prevlen = LZR_MIN_MATCH - 1;
-            if (SH_ON) {        /* 2- and 3-byte matches (tree finds >= 4) */
+            if (shortm) {        /* 2- and 3-byte matches (tree finds >= 4) */
                 uint32_t d2 = st->sh2[cur - bs], d3 = st->sh3[cur - bs];
                 for (unsigned t = 0; t < 2; t++) {
                     uint32_t d = t ? d3 : d2;
@@ -787,7 +797,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 /* Lengths past LZR_OPT_FULL are only tried at full length:
                  * cutting a long match short almost never pays, and this
                  * bounds the work per position. */
-                uint32_t Lmax = cl[k], Lcut = cl[k] > LZR_OPT_FULL ? LZR_OPT_FULL : cl[k];
+                uint32_t Lmax = cl[k], Lcut = cl[k] > opt_full ? opt_full : cl[k];
                 int32_t full = 0;
                 {
                     size_t tmax = i + Lmax;
@@ -848,7 +858,7 @@ static size_t parse_pass(lzr_cctx *c, opt_state *st, size_t bs, size_t be, size_
                 }
                 /* match + literal + rep0 (the literal breaks the match, the
                  * same distance continues after it) */
-                if (COMBOS && Lmax <= TOK_MAXLEN && Lmax + 3 <= maxlen) {
+                if (combos && Lmax <= TOK_MAXLEN && Lmax + 3 <= maxlen) {
                     uint32_t d = co[k] < LZR_NUM_REPS ? n->reps[co[k]] : co[k] - 2;
                     const uint8_t *q = cp + Lmax + 1;
                     if (q[0] == q[-(ptrdiff_t)d] && q[1] == q[1 - (ptrdiff_t)d]) {
@@ -962,7 +972,7 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
      * Only when that block and its look-ahead are already buffered, so the
      * result is the same as gathering it later. */
 #if LZR_HAVE_THREADS
-    if (c->threads > 1 && c->end >= be + LZR_BLOCK_SIZE + LZR_LOOKAHEAD) {
+    if (c->threads > 1 && !c->lp.row && c->end >= be + LZR_BLOCK_SIZE + LZR_LOOKAHEAD) {
         st->pend_c = c;
         st->pend_bs = be;
         st->pend_be = be + LZR_BLOCK_SIZE;
@@ -971,7 +981,7 @@ size_t opt_parse_block(lzr_cctx *c, size_t bs, size_t be, size_t *nlit_out)
         if (pthread_create(&st->pend_tid, NULL, gather_async, st) == 0) st->pending = 1;
     }
 #endif
-    short_matches(c, st, bs, be);
+    if (!(c->lp.lite & OPT_LITE_NOSHORT)) short_matches(c, st, bs, be);
     TACC(lzr_t_gather);
     if (!c->have_stats) default_prices(&st->pr);
 

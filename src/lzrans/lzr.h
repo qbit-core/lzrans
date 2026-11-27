@@ -10,7 +10,7 @@
  *     type 0  stored:      payload = raw_len bytes
  *     type 2  end:         raw_len = 0, payload = low 32 bits of the XXH64
  *                          (seed 0) of all content (u32)
- *     type 4  token coding (level 9): one adaptive range-coded stream of
+ *     type 4  token coding (level 11): one adaptive range-coded stream of
  *                          literal / match tokens (arc.h); its model, state
  *                          and the repeat offsets carry over between blocks
  *     type 5  fast (levels 1-8): nseq u32 | nlit u32 | literal section
@@ -39,7 +39,7 @@
 #define LZR_FILTER_X86     1
 #define LZR_BLOCK_HDR      9
 #define LZR_LEVEL_MIN     -3
-#define LZR_LEVEL_MAX      9
+#define LZR_LEVEL_MAX     11
 
 /* ---- streaming compressor ---- */
 typedef struct lzr_cctx lzr_cctx;
@@ -47,7 +47,7 @@ typedef struct lzr_cctx lzr_cctx;
 /* window_log 0 = level default. content_size < 0 = unknown. */
 lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size);
 void lzr_cctx_free(lzr_cctx *c);
-/* Worker threads (1 = none). Levels 7-9: match finder threads, output
+/* Worker threads (1 = none). Levels 9-11: match finder threads, output
  * identical for any thread count. Levels 1-6: parallel 4 MB jobs, output
  * identical for any thread count > 1 (and ~0.1% larger than with one).
  * Call before the first write. */
