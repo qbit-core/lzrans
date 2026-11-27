@@ -1,0 +1,18 @@
+{
+  "_doc": "Redesign targets (plan 2026-11-27). Each new level must reach ratio >= ref ratio * (1 + min_ratio_gain) and compress speed >= ref speed * min_speed_rel, summed over Silesia, at `threads`. api_level = the current lzrans level that implements it (null = not built yet).",
+  "levels": [
+    {"level": 1,  "api_level": -1, "ref": "zstd -1",  "threads": 4, "min_ratio_gain": 0.0,  "min_speed_rel": 1.0},
+    {"level": 2,  "api_level": null, "ref": "zstd -2",  "threads": 4, "min_ratio_gain": 0.0,  "min_speed_rel": 1.0},
+    {"level": 3,  "api_level": 0,  "ref": "zstd -3",  "threads": 4, "min_ratio_gain": 0.0,  "min_speed_rel": 1.0},
+    {"level": 4,  "api_level": 1,  "ref": "zstd -5",  "threads": 1, "min_ratio_gain": 0.0,  "min_speed_rel": 1.0},
+    {"level": 5,  "api_level": 2,  "ref": "zstd -6",  "threads": 1, "min_ratio_gain": 0.0,  "min_speed_rel": 1.0},
+    {"level": 6,  "api_level": 4,  "ref": "zstd -9",  "threads": 1, "min_ratio_gain": 0.0,  "min_speed_rel": 0.9},
+    {"level": 7,  "api_level": 6,  "ref": "zstd -12", "threads": 1, "min_ratio_gain": 0.0,  "min_speed_rel": 0.9},
+    {"level": 8,  "api_level": null, "ref": "zstd -15", "threads": 1, "min_ratio_gain": 0.014, "min_speed_rel": 2.5},
+    {"level": 9,  "api_level": null, "ref": "zstd -17", "threads": 1, "min_ratio_gain": 0.0,  "min_speed_rel": 1.0},
+    {"level": 10, "api_level": 7,  "ref": "zstd -19", "threads": 1, "min_ratio_gain": -0.007, "min_speed_rel": 1.6},
+    {"level": 11, "api_level": 8,  "ref": "zstd -22", "threads": 1, "min_ratio_gain": 0.0,  "min_speed_rel": 1.4},
+    {"level": 12, "api_level": 9,  "ref": "xz -9",    "threads": 1, "min_ratio_gain": 0.0,  "min_speed_rel": 0.95}
+  ],
+  "max_adjacent_speed_ratio": 2.1
+}
