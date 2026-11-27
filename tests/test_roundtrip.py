@@ -40,7 +40,7 @@ CASES = {
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
-@pytest.mark.parametrize("level", [-3, -1, 0, 1, 4, 7, 9])
+@pytest.mark.parametrize("level", [-3, -1, 0, 1, 4, 7, 8, 9, 11])
 def test_roundtrip(name, level):
     data = CASES[name]
     comp = lzrans.compress(data, level=level)
@@ -66,7 +66,7 @@ def test_never_expands_much():
 
 def test_optimal_levels_beat_lazy():
     data = CASES["text_300k"] + CASES["binary_mix"]
-    assert len(lzrans.compress(data, level=9)) < len(lzrans.compress(data, level=6))
+    assert len(lzrans.compress(data, level=11)) < len(lzrans.compress(data, level=6))
 
 
 def test_big_window_finds_far_match():
@@ -98,7 +98,7 @@ def test_invalid_level():
     with pytest.raises(ValueError):
         lzrans.compress(b"x", level=-4)
     with pytest.raises(ValueError):
-        lzrans.compress(b"x", level=10)
+        lzrans.compress(b"x", level=12)
     with pytest.raises(ValueError):
         lzrans.compress(b"x", window_log=30)
 
@@ -202,7 +202,7 @@ def test_streaming_output_is_incremental():
     assert not d.eof
 
 
-@pytest.mark.parametrize("level", [0, 5, 9])
+@pytest.mark.parametrize("level", [0, 5, 7, 11])
 def test_streaming_matches_one_shot_chunking_independent(level):
     data = _text(700_000, 4)
     outs = set()
@@ -241,7 +241,7 @@ def test_streaming_corruption_raises():
 
 # ---------------- threads ----------------
 
-@pytest.mark.parametrize("level", [7, 9])
+@pytest.mark.parametrize("level", [7, 9, 11])
 def test_threads_do_not_change_output(level):
     data = CASES["text_300k"] * 3 + CASES["binary_mix"] + CASES["far_match_3m"]
     ref = lzrans.compress(data, level=level, threads=1)
@@ -259,8 +259,8 @@ def test_threads_identical_on_window_sized_input():
     rnd = random.Random(11)
     parts = [_text(200_000, k) for k in range(8)]
     data = b"".join(rnd.choice(parts)[: rnd.randint(1000, 200_000)] for _ in range(80))
-    c1 = lzrans.compress(data, level=7, window_log=20, threads=1)
-    assert lzrans.compress(data, level=7, window_log=20, threads=4) == c1
+    c1 = lzrans.compress(data, level=9, window_log=20, threads=1)
+    assert lzrans.compress(data, level=9, window_log=20, threads=4) == c1
     assert lzrans.decompress(c1) == data
 
 
@@ -325,7 +325,7 @@ def test_threads_validated():
         lzrans.Compressor(threads=99)
 
 
-@pytest.mark.parametrize("level", [3, 8, 9])
+@pytest.mark.parametrize("level", [3, 8, 10, 11])
 def test_adaptive_model_survives_stored_blocks(level):
     # Blocks carry state across blocks (type 5: Huffman / tANS tables for
     # the repeat modes; type 4: the adaptive token model); incompressible
@@ -354,7 +354,7 @@ def _block_types(blob):
             return types
 
 
-@pytest.mark.parametrize("level,btype", [(0, 5), (1, 5), (6, 5), (8, 5), (9, 4)])
+@pytest.mark.parametrize("level,btype", [(0, 5), (1, 5), (6, 5), (7, 5), (8, 5), (10, 5), (11, 4)])
 def test_block_type_by_level(level, btype):
     blob = lzrans.compress(_text(3 * BS), level=level)
     assert blob[4] == 5                              # format version
@@ -364,7 +364,7 @@ def test_block_type_by_level(level, btype):
 def test_long_matches_split_into_tokens():
     # Matches longer than one token (273 bytes) and runs at block edges.
     data = (b"x" * 5000 + _text(2000) + b"ab" * 40000) * 3
-    for level in (6, 9):
+    for level in (6, 8, 11):
         assert lzrans.decompress(lzrans.compress(data, level=level)) == data
 
 
@@ -385,7 +385,7 @@ def _x86_like(n, seed=3):
     return bytes(out[:n]) + b"\xe8\x01\x02"
 
 
-@pytest.mark.parametrize("level", [0, 1, 6, 9])
+@pytest.mark.parametrize("level", [0, 1, 6, 7, 11])
 def test_x86_filter_roundtrip(level):
     data = _x86_like(700_000)
     blob = lzrans.compress(data, level=level, filter="x86")
@@ -412,7 +412,7 @@ def test_x86_filter_edge_cases(data):
 
 def test_x86_filter_helps_code():
     data = _x86_like(1 << 20)
-    assert len(lzrans.compress(data, 9, filter="x86")) < len(lzrans.compress(data, 9))
+    assert len(lzrans.compress(data, 11, filter="x86")) < len(lzrans.compress(data, 11))
 
 
 def test_filter_validated():
