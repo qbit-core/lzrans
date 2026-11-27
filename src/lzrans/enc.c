@@ -21,7 +21,7 @@
 #if defined(__SSE2__) && !defined(LZR_NO_SIMD)
 #include <emmintrin.h>
 #endif
-#ifdef LZR_TUNE
+#if defined(LZR_TUNE) || defined(LZR_STATS)
 #include <stdio.h>
 #endif
 
@@ -666,7 +666,15 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     wr32le(b + k, (uint32_t)ns); k += 4;
     wr32le(b + k, (uint32_t)nlit); k += 4;
     k += huf_encode(b + k, c->lits, nlit, &c->huf[0]);
-    if (!ns) return k;
+#ifdef LZR_STATS
+    const size_t st_lit_end = k;
+#endif
+    if (!ns) {
+#ifdef LZR_STATS
+        fprintf(stderr, "LZRSTAT5 %zu %zu %zu 0 0\n", nlit, st_lit_end - LZR_BLOCK_HDR - 8, ns);
+#endif
+        return k;
+    }
 
     uint8_t *codes[3] = {c->llc, c->mlc, c->ofc};
     const unsigned alpha[3] = {VAL_CODES, ML_CODES, OF_CODES};
@@ -718,6 +726,11 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
         T->alphabet = alpha[t];
         fse_build(T);
     }
+#ifdef LZR_STATS
+    const size_t st_tab_end = k;
+    uint64_t st_extra = 0;
+    for (size_t i = 0; i < ns; i++) st_extra += (uint64_t)c->nlm[i] + c->nof[i];
+#endif
     /* bit stream, backwards over the sequences (see dec.c for the order) */
     fbw w = {0, 0, b + k};
     uint32_t x[3] = {FSE_L, FSE_L, FSE_L};
@@ -754,6 +767,15 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     }
     for (int t = 2; t >= 0; t--)
         if (!rle[t]) fbw_put(&w, x[t] - FSE_L, FSE_LOG);
+#ifdef LZR_STATS
+    {
+        size_t end = (size_t)(fbw_close(&w) - b);
+        /* nlit, literal-section bytes, nseq, table bytes, bit-stream bytes, extra bits */
+        fprintf(stderr, "LZRSTAT5 %zu %zu %zu %zu %zu %llu\n", nlit, st_lit_end - LZR_BLOCK_HDR - 8, ns,
+                st_tab_end - st_lit_end, end - st_tab_end, (unsigned long long)st_extra);
+        return end;
+    }
+#endif
     return (size_t)(fbw_close(&w) - b);
 }
 
