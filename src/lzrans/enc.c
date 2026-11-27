@@ -660,12 +660,12 @@ static size_t encode_tokens(lzr_cctx *c, size_t bs, size_t be, size_t ns, const 
  *   nseq u32 | nlit u32 | literal section (huf.h) |
  *   if nseq: 3 table modes (ll, ml, of: 0 new + counts, 1 previous,
  *   2 single symbol + that symbol) | bit stream (fse.h) to the block end */
-static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
+static size_t emit_seqs5(lzr_cctx *c, size_t s0, size_t ns, size_t l0, size_t nlit, uint8_t *b)
 {
     size_t k = LZR_BLOCK_HDR;
     wr32le(b + k, (uint32_t)ns); k += 4;
     wr32le(b + k, (uint32_t)nlit); k += 4;
-    k += huf_encode(b + k, c->lits, nlit, &c->huf[0]);
+    k += huf_encode(b + k, c->lits + l0, nlit, &c->huf[0]);
 #ifdef LZR_STATS
     const size_t st_lit_end = k;
 #endif
@@ -685,7 +685,7 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
      * Arrays in restrict locals: byte stores would otherwise make the
      * compiler reload every c->... pointer after each one. */
     {
-        const uint32_t *restrict sll = c->seq_ll, *restrict sml = c->seq_ml, *restrict sdi = c->seq_dist;
+        const uint32_t *restrict sll = c->seq_ll + s0, *restrict sml = c->seq_ml + s0, *restrict sdi = c->seq_dist + s0;
         uint8_t *restrict llc = c->llc, *restrict mlc = c->mlc, *restrict ofc = c->ofc;
         uint8_t *restrict nlm = c->nlm, *restrict nof = c->nof;
         uint32_t *restrict xlm = c->xlm, *restrict xof = c->xof;
@@ -779,6 +779,72 @@ static size_t emit_seqs5(lzr_cctx *c, size_t ns, size_t nlit, uint8_t *b)
     return (size_t)(fbw_close(&w) - b);
 }
 
+/* ---- cost-based block splitting (block type 5, optimal-parse levels) ----
+ * A parsed block is also encoded as two halves (cut at the sequence
+ * nearest the middle), recursively, and the halves are kept when their
+ * own tables make them smaller in total. Nothing changes in the format:
+ * each part is an ordinary type 5 block. Parts are never stored raw (a
+ * stored block leaves the decoder's repeat offsets as they were, and the
+ * sequences after it were coded with the advanced ones). */
+#ifndef SPLIT_DEPTH
+#define SPLIT_DEPTH 3
+#endif
+#ifndef SPLIT_MIN_SEQ
+#define SPLIT_MIN_SEQ 128
+#endif
+typedef struct { huf_table huf; fse_table fse[3]; } tab_state;
+static void tab_save(const lzr_cctx *c, tab_state *t) { t->huf = c->huf[0]; memcpy(t->fse, c->fse, sizeof(t->fse)); }
+static void tab_load(lzr_cctx *c, const tab_state *t) { c->huf[0] = t->huf; memcpy(c->fse, t->fse, sizeof(t->fse)); }
+
+/* Encode sequences [s0, s1) and literals [l0, l1) (raw bytes [p0, p1)) as
+ * type 5 block(s) into dst; returns the size, or (size_t)-1 when a part
+ * would not be smaller than raw, or (size_t)-2 on allocation failure. */
+static size_t split5(lzr_cctx *c, size_t s0, size_t s1, size_t l0, size_t l1, size_t p0, size_t p1,
+                     unsigned depth, uint8_t *dst)
+{
+    tab_state t0, tw;
+    tab_save(c, &t0);
+    size_t k = emit_seqs5(c, s0, s1 - s0, l0, l1 - l0, dst);
+    const size_t raw = p1 - p0;
+    if (k - LZR_BLOCK_HDR >= raw) { tab_load(c, &t0); return (size_t)-1; }
+    dst[0] = 5;
+    wr32le(dst + 1, (uint32_t)raw);
+    wr32le(dst + 5, (uint32_t)(k - LZR_BLOCK_HDR));
+    if (!depth || s1 - s0 < 2 * SPLIT_MIN_SEQ) return k;
+
+    /* cut at the sequence where half of the raw bytes are covered */
+    size_t sm = s0, lm = l0, pm = p0;
+    while (sm < s1 && pm - p0 < raw / 2) {
+        pm += c->seq_ll[sm] + c->seq_ml[sm];
+        lm += c->seq_ll[sm];
+        sm++;
+    }
+    if (sm - s0 < SPLIT_MIN_SEQ || s1 - sm < SPLIT_MIN_SEQ) return k;
+    tab_save(c, &tw);
+    tab_load(c, &t0);
+    uint8_t *tmp = (uint8_t *)malloc(2 * (k + 64) + 2 * (3 * (1 + 3 * FSE_MAXSYM) + 64) + huf_bound(raw) + 11 * (s1 - s0));
+    if (!tmp) return (size_t)-2;
+    size_t a = split5(c, s0, sm, l0, lm, p0, pm, depth - 1, tmp);
+    size_t b = a >= (size_t)-2 ? a : split5(c, sm, s1, lm, l1, pm, p1, depth - 1, tmp + a);
+    if (a == (size_t)-2 || b == (size_t)-2) { free(tmp); return (size_t)-2; }
+    if (a != (size_t)-1 && b != (size_t)-1 && a + b < k) {
+        memcpy(dst, tmp, a + b);
+        free(tmp);
+        return a + b;
+    }
+    free(tmp);
+    tab_load(c, &tw);
+    return k;
+}
+
+static size_t emit_split5(lzr_cctx *c, size_t s0, size_t s1, size_t l0, size_t l1, size_t p0, size_t p1,
+                          unsigned depth, lzr_buf *out)
+{
+    size_t n = split5(c, s0, s1, l0, l1, p0, p1, depth, c->blk);
+    if (n >= (size_t)-2) return n;
+    return buf_append(out, c->blk, n) ? (size_t)-2 : n;
+}
+
 static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
 {
     const size_t raw = be - bs;
@@ -802,8 +868,14 @@ static int emit_block(lzr_cctx *c, size_t bs, size_t be, lzr_buf *out)
         memcpy(tm + 1, tm, sizeof(*tm));   /* for the stored fallback */
         size_t n = encode_tokens(c, bs, be, ns, saved_reps, b + k);
         k = n == (size_t)-1 ? (size_t)-1 : k + n;
+    } else if (c->lp.opt) {
+        /* optimal-parse levels: let the block be cut where separate tables pay */
+        size_t n = emit_split5(c, 0, ns, 0, nlit, bs, be, SPLIT_DEPTH, out);
+        if (n == (size_t)-2) return LZR_ERR_NOMEM;
+        if (n != (size_t)-1) return LZR_OK;
+        k = (size_t)-1;   /* stored below */
     } else {
-        k = emit_seqs5(c, ns, nlit, b);
+        k = emit_seqs5(c, 0, ns, 0, nlit, b);
     }
 
     if (k != (size_t)-1 && k - LZR_BLOCK_HDR < raw) {

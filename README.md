@@ -7,7 +7,7 @@ CPython native extension.
 **Goal:** levels 1-8 match zstd -19 in ratio and speed; level 9 beats
 xz -9 in ratio; level 0 is a zstd -3 class fast level, levels -1..-3 are
 faster still (zstd -1 class ratio). Streaming throughout.
-Status: v0.13 phase 15 (see Roadmap).
+Status: v0.13 phase 16 (see Roadmap).
 
 ```python
 import lzrans
@@ -91,3 +91,4 @@ are rejected for now.
 | P12 | Same output, faster: job-mode threads overlap input copy/checksum with compression (L0 4 threads +17%, 1.22x zstd -3; L1-6 +5-8%); branch-free type 5 bit writers (L0 1 thread +8%) | done |
 | P13 | Ultra-fast levels -1..-3 (single-hash finder; 4 threads 790-890 MB/s, ratio 3.2-3.8; about 0.65x zstd -1 speed at +3% ratio) + threaded one-shot compress() reads the input in place (L0 4 threads +23%, 1.42x zstd -3; L1-3 +9-16%; same output) | done |
 | P15 | Redesign phase 1: levels 7-9 window 16 MB -> 32/64 MB (enwik8 L9 3.891 -> 4.032, above xz -9 4.022; Silesia L9 +0.4%, L8 +0.4%, L7 +0.7%; 1-thread compress 7-25% slower, memory about xz -9) | done |
+| P16 | Redesign phase 2: cost-based block splitting for optimal-parse levels 7-8 (each block tried as up to 8 parts, kept only if smaller; format unchanged). Silesia L7 +0.4%, L8 +0.4% (xml +0.7%, mr +0.9%), speed unchanged; enwik8 unchanged | done |
