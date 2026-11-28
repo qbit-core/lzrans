@@ -22,7 +22,9 @@ static inline unsigned highbit32(uint32_t v) { return 31u - (unsigned)__builtin_
 #define LZR_BLOCK_LOG   18
 #define LZR_BLOCK_SIZE  (1u << LZR_BLOCK_LOG)  /* 256 KB of input per block      */
 #define LZR_WLOG_MIN    18                     /* window >= block size           */
-#define LZR_WLOG_MAX    26                     /* 64 MB                          */
+#define LZR_WLOG_MAX    26                     /* 64 MB: largest the encoder uses */
+#define LZR_WLOG_FMT_MAX 31                    /* 2 GB: largest a frame may declare */
+#define LZR_WLOG_DEC_DEFAULT 27                /* decoder memory limit by default */
 #define LZR_MIN_MATCH   4                      /* new-offset matches */
 #define LZR_ML_BASE     2                      /* smallest codable match (repeat offsets) */
 #define LZR_NUM_REPS    3
@@ -46,6 +48,7 @@ enum {
     LZR_ERR_CHECKSUM = -3,    /* CRC32 mismatch after decompression        */
     LZR_ERR_UNSUPPORTED = -4, /* unknown version or flags (e.g. encrypted) */
     LZR_ERR_PARAM = -5,       /* bad argument / API misuse                 */
+    LZR_ERR_MEMLIMIT = -6,    /* frame window above the decoder's limit    */
 };
 
 static inline uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }

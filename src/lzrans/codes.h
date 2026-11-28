@@ -15,8 +15,10 @@
 #define LZRANS_CODES_H
 #include "common.h"
 
-#define VAL_CODES 62
-#define OF_CODES  (3 + VAL_CODES)
+#define VAL_CODES 62                  /* LL alphabet (and v5/v6 offsets)       */
+#define OFV_CODES 70                  /* offset value codes: up to 2^31 - 1    */
+#define OF_CODES  (3 + OFV_CODES)     /* OF alphabet, frame version >= 7: 73   */
+#define OF_CODES_V6 (3 + VAL_CODES)   /* OF alphabet, frame versions 5-6: 65   */
 
 static inline unsigned val_code(uint32_t v, unsigned *nbits, uint32_t *extra)
 {
@@ -70,10 +72,10 @@ static inline void ml_table_init(code_info *t)
     }
 }
 
-/* Fill table for codes 0..VAL_CODES-1. */
+/* Fill table for codes 0..OFV_CODES-1 (LL uses the first VAL_CODES). */
 static inline void code_table_init(code_info *t)
 {
-    for (unsigned c = 0; c < VAL_CODES; c++) {
+    for (unsigned c = 0; c < OFV_CODES; c++) {
         if (c < 16) { t[c].base = c; t[c].bits = 0; continue; }
         unsigned k = c - 16, nb = 4 + k / 2, hb = k & 1;
         t[c].base = (1u << nb) | (hb << (nb - 1));

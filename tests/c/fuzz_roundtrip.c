@@ -123,7 +123,7 @@ int main(int argc, char **argv)
             else if (m >= 0) for (int f = 0; f < 1 + m % 3; f++) mut[rnd() % mlen] ^= (uint8_t)(1 + rnd() % 255);
             lzr_buf o = {0}, o2 = {0};
             size_t used = 0;
-            int r1 = lzr_decompress_mt(mut, mlen, &o, 2 + (int)(rnd() % 3), &used);
+            int r1 = lzr_decompress_mt(mut, mlen, &o, 2 + (int)(rnd() % 3), LZR_WLOG_DEC_DEFAULT, &used);
             int r2 = decompress_chunked(mut, mlen, &o2);
             if (m < 0 && (r || r1 != 1 || o.len != n || memcmp(o.p, big, n))) {
                 printf("SEGMENT ROUNDTRIP FAIL it=%d n=%zu kind=%d level=%d r=%d r1=%d\n", it, n, kind, level, r, r1);

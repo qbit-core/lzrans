@@ -28,6 +28,7 @@
  *                          up to 8 Huffman tables chosen by the byte before
  *                          them, and decoded while the sequences run. Its
  *                          tables carry over between type 6 blocks.
+ *   window_log is 18..31; decoders refuse windows above their memory limit.
  *   Match lengths are >= LZR_ML_BASE (2); the ml code holds length - 2.
  *   Types 1 and 3 (older formats) are rejected.
  *
@@ -114,8 +115,20 @@ int lzr_dctx_set_output(lzr_dctx *d, lzr_buf *out);
  * without reset points, legacy versions and x86-filtered frames are
  * decoded by one thread. Same result and error kinds as lzr_dctx_write in
  * one-buffer mode; *consumed = frame length. Returns 1 at the verified end,
- * 0 if the frame is truncated, or LZR_ERR_*. */
-int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, size_t *consumed);
+ * 0 if the frame is truncated, or LZR_ERR_* (LZR_ERR_MEMLIMIT if the frame's
+ * window is above 2^max_window_log). */
+int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, int max_window_log,
+                      size_t *consumed);
+
+/* Decoder memory limit: frames declaring a window above 2^max_window_log
+ * bytes fail with LZR_ERR_MEMLIMIT (default LZR_WLOG_DEC_DEFAULT = 27;
+ * 18..31). Call before the first write. */
+int lzr_dctx_set_max_window_log(lzr_dctx *d, int max_window_log);
+/* The check itself, for decoders that parse the header on their own. */
+static inline int lzr_window_ok(int window_log, int max_window_log)
+{
+    return window_log <= max_window_log ? LZR_OK : LZR_ERR_MEMLIMIT;
+}
 
 /* Parse the frame header only. Returns header length, or LZR_ERR_*. */
 int lzr_frame_header(const uint8_t *src, size_t n, int *window_log, uint8_t *flags, int64_t *content_size);

@@ -39,7 +39,8 @@ struct lzr_dctx {
     uint64_t total_out;
     int64_t content_size;
     uint8_t *lits;     /* type 5 literals of the current block */
-    code_info ct[VAL_CODES], mt[ML_CODES];
+    code_info ct[OFV_CODES], mt[ML_CODES];
+    int max_wlog;      /* memory limit (lzr_dctx_set_max_window_log)       */
     tok_model tm;      /* block type 4 model, persists across blocks */
     huf_table huf;     /* block type 5 tables, kept for the repeat modes */
     hufc_dtable hufc;  /* block type 6 literal tables (same)              */
@@ -79,6 +80,7 @@ lzr_dctx *lzr_dctx_new(void)
     d->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE + LZR_SLACK);
     if (!d->lits) { lzr_dctx_free(d); return NULL; }
     code_table_init(d->ct);
+    d->max_wlog = LZR_WLOG_DEC_DEFAULT;
     ml_table_init(d->mt);
     tok_model_init(&d->tm);
     return d;
@@ -101,7 +103,8 @@ int lzr_frame_header(const uint8_t *src, size_t n, int *window_log, uint8_t *fla
     if (src[4] < LZR_VERSION_MIN || src[4] > LZR_VERSION) return LZR_ERR_UNSUPPORTED;
     if (flags) *flags = src[5];
     if (src[5] & ~LZR_KNOWN_FLAGS) return LZR_ERR_UNSUPPORTED;
-    if (src[6] < LZR_WLOG_MIN || src[6] > LZR_WLOG_MAX || src[7]) return LZR_ERR_CORRUPT;
+    /* window_log: 18..31 (versions 5-6: 18..26) */
+    if (src[6] < LZR_WLOG_MIN || src[6] > (src[4] >= 7 ? LZR_WLOG_FMT_MAX : 26) || src[7]) return LZR_ERR_CORRUPT;
     if (window_log) *window_log = src[6];
     if (src[5] & LZR_FLAG_SIZE) {
         if (n < 16) return 0;
@@ -423,7 +426,8 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
         memcpy(o, lp, nlit);
         return LZR_OK;
     }
-    const unsigned alpha[3] = {VAL_CODES, ML_CODES, OF_CODES};
+    /* the OF alphabet grew in version 7 (distances up to 2^31) */
+    const unsigned alpha[3] = {VAL_CODES, ML_CODES, d->version >= 7 ? OF_CODES : OF_CODES_V6};
     unsigned rsym[3] = {0, 0, 0};
     int rle[3];
     for (int t = 0; t < 3; t++) {
@@ -516,7 +520,7 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
             w_ = (uint32_t)(t_ & ((1u << ss_) - 1));                           \
             BRELOAD();                                                         \
         } else {                                                               \
-            /* corrupt tables can ask for up to 25 + 16 + 25 extra bits: read \
+            /* corrupt tables can ask for up to 25 + 16 + 29 extra bits: read \
              * the offset's (first in the stream) apart so no read is > 56 */ \
             const unsigned xlm_ = xl_ + xm_;                                   \
             v_ = BGET64(xo_) << xlm_; used += xo_;                             \
@@ -650,6 +654,7 @@ static int step(lzr_dctx *d, lzr_buf *out)
         uint8_t flags;
         int r = lzr_frame_header(p, avail, &wlog, &flags, &d->content_size);
         if (r <= 0) return r;
+        if (lzr_window_ok(wlog, d->max_wlog)) return LZR_ERR_MEMLIMIT;
         d->version = p[4];
         if (flags & LZR_FLAG_X86) d->direct = NULL;   /* history must hold filtered bytes */
         if (d->direct) d->wsize = (size_t)1 << wlog;
@@ -737,6 +742,13 @@ static int step(lzr_dctx *d, lzr_buf *out)
     /* history keeps the filtered bytes (matches refer to them) */
     int r = d->x86tmp ? x86_run(&d->x86, dst, raw, 1, d->x86tmp, emit_out, &s) : emit_out(&s, dst, raw);
     return r ? LZR_ERR_NOMEM : 1;
+}
+
+int lzr_dctx_set_max_window_log(lzr_dctx *d, int max_window_log)
+{
+    if (d->state != ST_HEADER || max_window_log < LZR_WLOG_MIN || max_window_log > LZR_WLOG_FMT_MAX) return LZR_ERR_PARAM;
+    d->max_wlog = max_window_log;
+    return LZR_OK;
 }
 
 int lzr_dctx_set_output(lzr_dctx *d, lzr_buf *out)
@@ -884,17 +896,18 @@ static void *pdec_thread(void *p)
 }
 #endif
 
-static int decompress_serial(const uint8_t *src, size_t n, lzr_buf *out, size_t *consumed)
+static int decompress_serial(const uint8_t *src, size_t n, lzr_buf *out, int max_window_log, size_t *consumed)
 {
     lzr_dctx *d = lzr_dctx_new();
     if (!d) return LZR_ERR_NOMEM;
     int r = lzr_dctx_set_output(d, out);
+    if (!r) r = lzr_dctx_set_max_window_log(d, max_window_log);
     if (!r) r = lzr_dctx_write(d, src, n, out, consumed);
     lzr_dctx_free(d);
     return r;
 }
 
-int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, size_t *consumed)
+int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, int max_window_log, size_t *consumed)
 {
     if (consumed) *consumed = 0;
 #if LZR_HAVE_THREADS
@@ -903,7 +916,8 @@ int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, s
     int64_t csize = -1;
     int hl = lzr_frame_header(src, n, &wlog, &flags, &csize);
     /* anything unusual goes to the serial decoder, which reports it */
-    if (threads < 2 || hl <= 0 || src[4] < 7 || (flags & LZR_FLAG_X86)) return decompress_serial(src, n, out, consumed);
+    if (hl > 0 && lzr_window_ok(wlog, max_window_log)) return decompress_serial(src, n, out, max_window_log, consumed);
+    if (threads < 2 || hl <= 0 || src[4] < 7 || (flags & LZR_FLAG_X86)) return decompress_serial(src, n, out, max_window_log, consumed);
 
     pseg *seg = NULL;
     int nseg = 0, cseg = 0, ok = 0;
@@ -943,7 +957,7 @@ int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, s
     }
     if (!ok || nseg < 2 || (csize >= 0 && (uint64_t)csize != total) || total > (uint64_t)SIZE_MAX - 1024) {
         free(seg);
-        return decompress_serial(src, n, out, consumed);
+        return decompress_serial(src, n, out, max_window_log, consumed);
     }
     /* the last segment ends at the end block (skippable blocks in between are
      * skipped by its decoder) */
@@ -1004,6 +1018,6 @@ int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, s
     return rd32le(src + endpos + LZR_BLOCK_HDR) == (uint32_t)xxh64_digest(&xs) ? 1 : LZR_ERR_CHECKSUM;
 #else
     (void)threads;
-    return decompress_serial(src, n, out, consumed);
+    return decompress_serial(src, n, out, max_window_log, consumed);
 #endif
 }
