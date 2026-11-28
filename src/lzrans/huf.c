@@ -69,6 +69,15 @@ void huf_lengths(const uint32_t *cnt, uint8_t *len)
         unsigned s = sym[i];
         while (len[s] > 1 && kraft + (full >> len[s]) <= full) { kraft += full >> len[s]; len[s]--; }
     }
+    /* format v7 requires a complete code (Kraft sum exactly 2^11). The
+     * shortfall is a multiple of the unit of the longest code, so
+     * shortening a longest code always fits (rarely needed). */
+    while (kraft < full) {
+        unsigned best = sym[0];
+        for (unsigned i = 1; i < n; i++) if (len[sym[i]] > len[best]) best = sym[i];
+        kraft += full >> len[best];
+        len[best]--;
+    }
 }
 
 /* Canonical codes, bit-reversed for LSB-first output. */
@@ -91,14 +100,14 @@ static void huf_codes(huf_table *t)
 /* Decoder table from lengths. Returns 0, or -1 if the lengths overflow
  * the code space (an incomplete code is accepted: unused slots decode as
  * a full-length symbol 0 and the stream-end check catches them). */
-static int huf_build_dt(huf_table *t)
+static int huf_build_dt(huf_table *t, int strict)
 {
     uint32_t kraft = 0;
     for (unsigned s = 0; s < 256; s++) {
         if (t->len[s] > HUF_MAXLEN) return -1;
         if (t->len[s]) kraft += HUF_TSIZE >> t->len[s];
     }
-    if (kraft > HUF_TSIZE || !kraft) return -1;
+    if (kraft > HUF_TSIZE || !kraft || (strict && kraft != HUF_TSIZE)) return -1;
     huf_codes(t);
     for (unsigned i = 0; i < HUF_TSIZE; i++) t->dt[i] = (uint16_t)(HUF_MAXLEN << 8);
     for (unsigned s = 0; s < 256; s++) {
@@ -181,7 +190,7 @@ size_t huf_encode(uint8_t *out, const uint8_t *lits, size_t n, huf_table *prev)
     uint32_t ce[256];   /* code << 4 | length */
     for (unsigned s = 0; s < 256; s++) ce[s] = (uint32_t)t->code[s] << 4 | t->len[s];
     size_t q = (n + 3) / 4, szpos = k;
-    k += 12;
+    k += 16;
     for (unsigned st = 0; st < 4; st++) {
         size_t a = st * q < n ? st * q : n, b = (st + 1) * q < n ? (st + 1) * q : n;
         /* branch-free: 8-byte writes, 4 codes (<= 44 bits) per flush; the
@@ -207,7 +216,7 @@ size_t huf_encode(uint8_t *out, const uint8_t *lits, size_t n, huf_table *prev)
         for (; i < b; i++) hbw_put(&w, t->code[lits[i]], t->len[lits[i]]);
         hbw_flush(&w);
         size_t sz = (size_t)(w.p - (out + k));
-        if (st < 3) wr32le(out + szpos + 4 * st, (uint32_t)sz);
+        wr32le(out + szpos + 4 * st, (uint32_t)sz);
         k += sz;
     }
     return k;
@@ -225,7 +234,7 @@ static inline uint64_t ld64(const uint8_t *p)
     return v;
 }
 
-static inline __attribute__((always_inline)) size_t huf_decode_impl(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+static inline __attribute__((always_inline)) size_t huf_decode_impl(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t, int v7)
 {
     if (!n) return 0;
     if (avail < 2) return 0;
@@ -243,25 +252,27 @@ static inline __attribute__((always_inline)) size_t huf_decode_impl(const uint8_
         memset(t->len, 0, sizeof(t->len));
         for (unsigned s = 0; s <= last; s++) t->len[s] = (uint8_t)((in[2 + s / 2] >> (4 * (s & 1))) & 15);
         t->valid = 0;
-        if (huf_build_dt(t)) return 0;
+        if (huf_build_dt(t, v7)) return 0;
         k = 2 + hb;
     } else if (in[0] != 3 || !t->valid) {
         return 0;
     }
-    if (avail - k < 12) return 0;
+    /* v7: 4 stream sizes; v5/v6: 3, and stream 3 ends where its last
+     * literal ends */
+    const size_t nsz = v7 ? 4 : 3;
+    if (avail - k < 4 * nsz) return 0;
     size_t sz[4], total = 0;
-    for (int s = 0; s < 3; s++) { sz[s] = rd32le(in + k + 4 * s); total += sz[s]; }
-    k += 12;
+    for (size_t s = 0; s < nsz; s++) { sz[s] = rd32le(in + k + 4 * s); total += sz[s]; }
+    k += 4 * nsz;
     if (total > avail - k) return 0;
-    sz[3] = avail - k - total;   /* provisional: the last stream ends at the section end */
+    if (!v7) sz[3] = avail - k - (sz[0] + sz[1] + sz[2]);
 
     const uint8_t *p[4], *end[4];
     unsigned pos[4] = {0, 0, 0, 0};
     const uint8_t *q0 = in + k;
     for (int s = 0; s < 4; s++) { p[s] = q0; q0 += s < 3 ? sz[s] : 0; }
     /* stream 3's size is not stored: it is found from where decoding stops */
-    for (int s = 0; s < 3; s++) end[s] = p[s] + sz[s];
-    end[3] = in + avail;
+    for (int s = 0; s < 4; s++) end[s] = p[s] + sz[s];
 
     const size_t q = (n + 3) / 4;
     size_t lo[4], hi[4];
@@ -322,29 +333,29 @@ static inline __attribute__((always_inline)) size_t huf_decode_impl(const uint8_
     /* each stream must end within its last byte */
     for (int s = 0; s < 4; s++) {
         const uint8_t *e = p[s] + (pos[s] + 7) / 8;
-        if (s < 3 ? e != end[s] : e > end[s]) return 0;
+        if ((s < 3 || v7) ? e != end[s] : e > end[s]) return 0;
     }
     return (size_t)(p[3] + (pos[3] + 7) / 8 - in);
 }
 
-static __attribute__((noinline)) size_t huf_decode_generic(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+static __attribute__((noinline)) size_t huf_decode_generic(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t, int v7)
 {
-    return huf_decode_impl(in, avail, out, n, t);
+    return huf_decode_impl(in, avail, out, n, t, v7);
 }
 
 #ifdef LZR_BMI2_DISPATCH
-static __attribute__((noinline)) LZR_TARGET_BMI2 size_t huf_decode_bmi2(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+static __attribute__((noinline)) LZR_TARGET_BMI2 size_t huf_decode_bmi2(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t, int v7)
 {
-    return huf_decode_impl(in, avail, out, n, t);
+    return huf_decode_impl(in, avail, out, n, t, v7);
 }
 #endif
 
-size_t huf_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t)
+size_t huf_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_table *t, int v7)
 {
 #ifdef LZR_BMI2_DISPATCH
-    if (LZR_HAS_BMI2()) return huf_decode_bmi2(in, avail, out, n, t);
+    if (LZR_HAS_BMI2()) return huf_decode_bmi2(in, avail, out, n, t, v7);
 #endif
-    return huf_decode_generic(in, avail, out, n, t);
+    return huf_decode_generic(in, avail, out, n, t, v7);
 }
 
 /* ---- context literals (block type 6) ------------------------------ */
@@ -393,6 +404,11 @@ size_t hufc_encode(uint8_t *out, const uint8_t *lits, const uint8_t *prev, size_
         off[p + 1] = m;
         if (pc[p]) np++;
     }
+    /* a single literal value: type 5 codes it as a run (and a one-symbol
+     * Huffman code would be incomplete, which format v7 forbids) */
+    unsigned ndistinct = 0;
+    for (unsigned s = 0; s < 256; s++) ndistinct += tot[s] != 0;
+    if (ndistinct < 2) return 0;
     /* one table (what type 5 would use, without its 4-stream sizes) */
     uint8_t len1[256];
     huf_lengths(tot, len1);
@@ -516,7 +532,7 @@ size_t hufc_encode(uint8_t *out, const uint8_t *lits, const uint8_t *prev, size_
     return k + sz;
 }
 
-size_t hufc_read(const uint8_t *in, size_t avail, hufc_dtable *t)
+size_t hufc_read(const uint8_t *in, size_t avail, hufc_dtable *t, int strict)
 {
     if (avail < 1) return 0;
     if (in[0] == 1) return t->valid ? 1 : 0;
@@ -538,7 +554,7 @@ size_t hufc_read(const uint8_t *in, size_t avail, hufc_dtable *t)
         if (avail - k - 1 < hb) return 0;
         memset(h.len, 0, sizeof(h.len));
         for (unsigned s = 0; s <= last; s++) h.len[s] = (uint8_t)((in[k + 1 + s / 2] >> (4 * (s & 1))) & 15);
-        if (huf_build_dt(&h)) return 0;
+        if (huf_build_dt(&h, strict)) return 0;
         k += 1 + hb;
         uint16_t *dt = t->dt + ((size_t)c << HUF_MAXLEN);
         for (unsigned j = 0; j < HUF_TSIZE; j++) {

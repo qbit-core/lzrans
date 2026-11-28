@@ -44,6 +44,10 @@ struct lzr_dctx {
     huf_table huf;     /* block type 5 tables, kept for the repeat modes */
     hufc_dtable hufc;  /* block type 6 literal tables (same)              */
     int version;       /* frame version (type 6 blocks: 6 and later)      */
+    uint64_t seg_start;    /* content offset of the last reset point (v7)   */
+    const uint8_t *lo;     /* lowest byte matches may use: the history start
+                            * or the segment start, whichever is later      */
+    unsigned pbase;        /* type 4: (segment position of the block) & 3   */
     fse_table fse[3];
     seq_dent sq[3][FSE_L];   /* per-block sequence decoding tables */
     lzr_x86 x86;
@@ -203,12 +207,13 @@ static __attribute__((noinline)) int decode_tokens(lzr_dctx *d, const uint8_t *i
     tok_model *m = &d->tm;
     unsigned s = m->state;
     uint32_t rep0 = d->reps[0], rep1 = d->reps[1], rep2 = d->reps[2];
-    const uint8_t *hist = d->hist;
+    const uint8_t *hist = d->lo;
     const size_t wsize = d->wsize;
     uint8_t *o = dst, *const oend = dst + raw;
+    const unsigned pbase = d->pbase;
     int err = 0;
     while (o < oend) {
-        unsigned ps = (unsigned)(o - dst) & (TOK_POS - 1), bit;
+        unsigned ps = ((unsigned)(o - dst) + pbase) & (TOK_POS - 1), bit;
         if (ip > iend) { err = 1; break; }
         RC_BIT(&m->is_match[s][ps], bit);
         if (!bit) {
@@ -357,7 +362,7 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
     if (ctx) {
         /* type 6 always has literals (else it would be type 5) */
         if (!nlit) return LZR_ERR_CORRUPT;
-        size_t c = hufc_read(in + k, avail - k, &d->hufc);
+        size_t c = hufc_read(in + k, avail - k, &d->hufc, d->version >= 7);
         if (!c || avail - k - c < 4) return LZR_ERR_CORRUPT;
         k += c;
         size_t sz = rd32le(in + k);
@@ -366,9 +371,9 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
         lb = in + k;
         lbend = lb + sz;
         k += sz;
-        lctx = d->hufc.cmap[dst > d->hist ? dst[-1] : 0];
+        lctx = d->hufc.cmap[dst > d->lo ? dst[-1] : 0];
     } else if (nlit) {
-        size_t c = huf_decode(in + k, avail - k, d->lits, nlit, &d->huf);
+        size_t c = huf_decode(in + k, avail - k, d->lits, nlit, &d->huf, d->version >= 7);
         if (!c) return LZR_ERR_CORRUPT;
         k += c;
     }
@@ -456,7 +461,7 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
     BRELOAD();
     const seq_dent *const sq = tb[0];
     uint32_t rep0 = d->reps[0], rep1 = d->reps[1], rep2 = d->reps[2];
-    const uint8_t *hist = d->hist;
+    const uint8_t *hist = d->lo;
     const size_t wsize = d->wsize;
 
     /* Decode a sequence (ll, ml, dist), advancing the bit stream. */
@@ -477,7 +482,12 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
             w_ = (uint32_t)(t_ & ((1u << ss_) - 1));                           \
             BRELOAD();                                                         \
         } else {                                                               \
-            v_ = BGET64(xs_); used += xs_;                                     \
+            /* corrupt tables can ask for up to 25 + 16 + 25 extra bits: read \
+             * the offset's (first in the stream) apart so no read is > 56 */ \
+            const unsigned xlm_ = xl_ + xm_;                                   \
+            v_ = BGET64(xo_) << xlm_; used += xo_;                             \
+            BRELOAD();                                                         \
+            v_ |= BGET64(xlm_); used += xlm_;                                  \
             BRELOAD();                                                         \
             w_ = BGET(ss_); used += ss_;                                       \
             BRELOAD();                                                         \
@@ -605,15 +615,37 @@ static int step(lzr_dctx *d, lzr_buf *out)
     }
 
     if (avail < LZR_BLOCK_HDR) return 0;
-    uint8_t type = p[0];
+    uint8_t type = p[0], reset = 0;
     size_t raw = rd32le(p + 1), comp = rd32le(p + 5);
-    if (type > 6 || type == 1 || type == 3 || (type == 6 && d->version < 6) || raw > LZR_BLOCK_SIZE || comp > MAX_COMP)
+    if (raw > LZR_BLOCK_SIZE || comp > MAX_COMP) return LZR_ERR_CORRUPT;
+    if (d->version >= 7) {
+        if (type & LZR_BT_SKIP) {   /* skippable block: payload ignored */
+            if (raw != 0) return LZR_ERR_CORRUPT;
+            if (avail - LZR_BLOCK_HDR < comp) return 0;
+            d->ipos += LZR_BLOCK_HDR + comp;
+            return 1;
+        }
+        reset = type & LZR_BT_RESET;
+        type &= LZR_BT_TYPE;
+        if (type > 6) return LZR_ERR_UNSUPPORTED;   /* a newer block type */
+        if ((type == 2 && reset) || (type >= 4 && comp > raw)) return LZR_ERR_CORRUPT;
+    } else if (type > 6 || (type == 6 && d->version < 6)) {
         return LZR_ERR_CORRUPT;
+    }
+    if (type == 1 || type == 3) return LZR_ERR_CORRUPT;
     if (type == 0 && comp != raw) return LZR_ERR_CORRUPT;
     if (type == 2 && (raw != 0 || comp != 4)) return LZR_ERR_CORRUPT;
     if (type >= 4 && raw == 0) return LZR_ERR_CORRUPT;
     if (avail - LZR_BLOCK_HDR < comp) return 0;
     const uint8_t *payload = p + LZR_BLOCK_HDR;
+    if (reset) {   /* reset point: frame-start state, earlier output unused */
+        d->reps[0] = 1; d->reps[1] = 4; d->reps[2] = 8;
+        d->huf.valid = 0;
+        d->hufc.valid = 0;
+        for (int t = 0; t < 3; t++) d->fse[t].valid = 0;
+        tok_model_init(&d->tm);
+        d->seg_start = d->total_out;
+    }
 
     if (type == 2) {
         if (d->content_size >= 0 && (uint64_t)d->content_size != d->total_out) return LZR_ERR_CORRUPT;
@@ -638,6 +670,11 @@ static int step(lzr_dctx *d, lzr_buf *out)
         d->op = d->wsize;
     }
     uint8_t *dst = d->hist + d->op;
+    {
+        uint64_t back = d->total_out - d->seg_start;   /* segment bytes before dst */
+        d->lo = back < d->op ? dst - back : d->hist;
+        d->pbase = d->version >= 7 ? (unsigned)back & (TOK_POS - 1) : 0;
+    }
     if (type == 0) {
         memcpy(dst, payload, raw);
     } else {

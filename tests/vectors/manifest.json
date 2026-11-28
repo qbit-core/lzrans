@@ -1,0 +1,1383 @@
+{
+ "format": "LZR 1.0 (frame version 7; v5-/v6- vectors: legacy versions)",
+ "vectors": [
+  {
+   "file": "v6-enc-empty.lzr",
+   "expect": "ok",
+   "description": "empty content: header + end block",
+   "size": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "features": [
+    "flag.size",
+    "version6",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "v6-enc-stored.lzr",
+   "expect": "ok",
+   "description": "incompressible: one stored block",
+   "size": 3000,
+   "sha256": "0f75c21f6a75170423676219888a544faedf4a357f9d34b346091bc77a308a0d",
+   "features": [
+    "block0",
+    "flag.size",
+    "version6",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "v6-enc-l1-text.lzr",
+   "expect": "ok",
+   "description": "level 1, type 5: Huffman literals (mode 2), new tANS tables",
+   "size": 40000,
+   "sha256": "741fe098977184cca7ee758106efd15e1704a6ca78664b64c9b344545567244c",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "version6",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "v6-enc-l-3-multiblock.lzr",
+   "expect": "ok",
+   "description": "level -3, three type 5 blocks: table repeat modes",
+   "size": 525287,
+   "sha256": "76ce6701fa3c3387bee99cc9484881851148adc1c27f892bc897430f5134d3ac",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ll.mode1",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode2",
+    "seq.of.new",
+    "seq.of.rep0",
+    "t5.lit.mode0",
+    "t5.lit.mode2",
+    "version6",
+    "wlog19"
+   ]
+  },
+  {
+   "file": "v6-enc-l6-records.lzr",
+   "expect": "ok",
+   "description": "level 6, type 5, repeat offsets 1 and 2",
+   "size": 131072,
+   "sha256": "ba8707db09d98d2f8c28f58e02fb9d098a024ebaf09750d00a178da5920b8de5",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "version6",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "v6-enc-l10-ctx.lzr",
+   "expect": "ok",
+   "description": "level 10, type 6 context literals, new and repeated tables",
+   "size": 60000,
+   "sha256": "e230ec5687aa5a7ec8b1d05f50f6403ee928da23ea6bad39210c981f64cdc06f",
+   "features": [
+    "block6",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t6.ctx.mode0",
+    "t6.ctx.mode1",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-enc-l11-text.lzr",
+   "expect": "ok",
+   "description": "level 11, type 4 over three blocks (model carries over)",
+   "size": 524365,
+   "sha256": "56a81b6f79462f694e4205b87a7b07bf47fe09b1b6a25e23e5a71dc5b5e6f159",
+   "features": [
+    "block4",
+    "flag.size",
+    "t4.len.high",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-enc-l11-zeros.lzr",
+   "expect": "ok",
+   "description": "level 11, long rep0 runs (matches split at 273)",
+   "size": 262244,
+   "sha256": "b29835022fd3818582af823914d928ce2ffd30357c8186464a74637bfa485987",
+   "features": [
+    "block4",
+    "flag.size",
+    "t4.lit.plain",
+    "t4.rep",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-enc-l3-zeros.lzr",
+   "expect": "ok",
+   "description": "level 3, matches of 2^18 - 2 bytes",
+   "size": 300000,
+   "sha256": "886715e4051e827f4fe215df3053af3f85ad0d352db2c829c7487af6d78efe30",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep0",
+    "t5.lit.mode1",
+    "version6",
+    "wlog19"
+   ]
+  },
+  {
+   "file": "v6-enc-x86-l6.lzr",
+   "expect": "ok",
+   "description": "x86 filter flag, type 5",
+   "size": 20003,
+   "sha256": "940619db0bde24c7adfdc0cdf32cf2b412b65061414eeaa606b8b8b250c2aeb1",
+   "features": [
+    "block5",
+    "flag.size",
+    "flag.x86",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "version6",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "v6-enc-x86-l11.lzr",
+   "expect": "ok",
+   "description": "x86 filter flag, type 4",
+   "size": 20003,
+   "sha256": "44621b8c4f51c7471f361e274c52ff25f42fa6388375810404e979445ddbc2fe",
+   "features": [
+    "block4",
+    "flag.size",
+    "flag.x86",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-enc-wlog18.lzr",
+   "expect": "ok",
+   "description": "window_log 18 (smallest window)",
+   "size": 349525,
+   "sha256": "db1eeb8f36349a84fcb9a1ab56e806d143afc79d9d50e150c08a3f21cf1c9b97",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode0",
+    "t5.lit.mode2",
+    "version6",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "v6-enc-stream-l5.lzr",
+   "expect": "ok",
+   "description": "streaming compressor: no content size in the header",
+   "size": 266465,
+   "sha256": "e6b55ffd3fb91d20868d72e03a1419c05100e0e77deeb5454c9da6f7ef652eb9",
+   "features": [
+    "block5",
+    "seq.ll.mode0",
+    "seq.ll.mode1",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode1",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode0",
+    "t5.lit.mode2",
+    "version6",
+    "wlog23"
+   ]
+  },
+  {
+   "file": "v6-enc-stream-l9.lzr",
+   "expect": "ok",
+   "description": "streaming compressor, level 9",
+   "size": 30000,
+   "sha256": "4a466ef2c28d0df8e8781dbca4bf60a7501ec4f1463e2a7f6c7fc02b4404956f",
+   "features": [
+    "block5",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "t5.lit.mode3",
+    "version6",
+    "wlog25"
+   ]
+  },
+  {
+   "file": "v6-enc-wlog26.lzr",
+   "expect": "ok",
+   "description": "window_log 26 (largest window), level 11, streaming",
+   "size": 60000,
+   "sha256": "eb8985f4ee527bf6193c3efe6af5a2fa5c3065e1378db7369920e78b061e67f6",
+   "features": [
+    "block4",
+    "t4.len.high",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version6",
+    "wlog26"
+   ]
+  },
+  {
+   "file": "v5-enc.lzr",
+   "expect": "ok",
+   "description": "frame version 5 (still decoded)",
+   "size": 20000,
+   "sha256": "94565f54842cd2b1649446651b0f6a8f87ade86d601543797639f7fa41b5c323",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "t5.lit.mode2",
+    "version5",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "v6-hand-stored-between-type5.lzr",
+   "expect": "ok",
+   "description": "type 5 tables repeated across a stored block",
+   "size": 292244,
+   "sha256": "fe6288536c728ee9efc03dfec54d877e941a4896db674c2bb920e9d553a7d23c",
+   "features": [
+    "block0",
+    "block5",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode2",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "t5.lit.mode2",
+    "t5.lit.mode3",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-hand-initial-rep0.lzr",
+   "expect": "ok",
+   "description": "initial repeat offset 0 = 1; all tables mode 2; bit stream = end marker only",
+   "size": 11,
+   "sha256": "28cb017dfc99073aa1b47c1b30f413e3ce774c4991eb4158de50f9dbb36d8043",
+   "features": [
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep0",
+    "t5.lit.mode0",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-hand-initial-rep2-rep1.lzr",
+   "expect": "ok",
+   "description": "initial repeat offset 2 = 8, then the repeat offset update rule",
+   "size": 22,
+   "sha256": "b09061781cded15c61684c5e5374437de6198b46e49d4b09dc5d5a88fac1bfa9",
+   "features": [
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode0",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-hand-literal-only.lzr",
+   "expect": "ok",
+   "description": "nseq = 0 blocks with raw and run literals; an empty stored block",
+   "size": 53,
+   "sha256": "58db4258199b17aba84b8ba3ae72f752b19df5ffeeec5f9c079f4f51129e38bb",
+   "features": [
+    "block0",
+    "block5",
+    "seq.none",
+    "t5.lit.mode0",
+    "t5.lit.mode1",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-hand-new-offset.lzr",
+   "expect": "ok",
+   "description": "a new offset and a literal length with extra bits",
+   "size": 64,
+   "sha256": "625b41490b883891943c5fa54ad45d7c900b9b6e91e159334e320b1f5215a209",
+   "features": [
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.new",
+    "t5.lit.mode0",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-hand-type4-then-type5.lzr",
+   "expect": "ok",
+   "description": "repeat offsets carry over from a type 4 block to a type 5 block",
+   "size": 3020,
+   "sha256": "6c872a06a0e48e604b6971215659aa41a20ccb9795693fd9dca19857f31cce56",
+   "features": [
+    "block4",
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep0",
+    "t4.len.high",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version6",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "v6-bad-magic.lzr",
+   "expect": "corrupt",
+   "description": "wrong magic"
+  },
+  {
+   "file": "v6-bad-version4.lzr",
+   "expect": "unsupported",
+   "description": "frame version 4"
+  },
+  {
+   "file": "v6-bad-flag-encrypted.lzr",
+   "expect": "unsupported",
+   "description": "flag bit 0 (encryption, reserved)"
+  },
+  {
+   "file": "v6-bad-flag-bit3.lzr",
+   "expect": "unsupported",
+   "description": "unknown flag bit 3"
+  },
+  {
+   "file": "v6-bad-wlog17.lzr",
+   "expect": "corrupt",
+   "description": "window_log below 18"
+  },
+  {
+   "file": "v6-bad-wlog27.lzr",
+   "expect": "corrupt",
+   "description": "window_log above 26"
+  },
+  {
+   "file": "v6-bad-reserved.lzr",
+   "expect": "corrupt",
+   "description": "reserved header byte not zero"
+  },
+  {
+   "file": "v6-bad-block-type1.lzr",
+   "expect": "corrupt",
+   "description": "block type 1"
+  },
+  {
+   "file": "v6-bad-block-type3.lzr",
+   "expect": "corrupt",
+   "description": "block type 3"
+  },
+  {
+   "file": "v6-bad-block-type7.lzr",
+   "expect": "corrupt",
+   "description": "block type 7"
+  },
+  {
+   "file": "v6-bad-block-type255.lzr",
+   "expect": "corrupt",
+   "description": "block type 255"
+  },
+  {
+   "file": "v6-bad-type6-in-v5.lzr",
+   "expect": "corrupt",
+   "description": "type 6 block in a version 5 frame"
+  },
+  {
+   "file": "v6-bad-raw-too-big.lzr",
+   "expect": "corrupt",
+   "description": "stored block header with raw_len 2^18 + 1 (rejected before its payload is needed)"
+  },
+  {
+   "file": "v6-bad-stored-len.lzr",
+   "expect": "corrupt",
+   "description": "stored block, comp_len != raw_len"
+  },
+  {
+   "file": "v6-bad-checksum.lzr",
+   "expect": "checksum",
+   "description": "checksum mismatch"
+  },
+  {
+   "file": "v6-bad-size-short.lzr",
+   "expect": "corrupt",
+   "description": "content_size larger than the content"
+  },
+  {
+   "file": "v6-bad-size-long.lzr",
+   "expect": "corrupt",
+   "description": "content_size smaller than the content"
+  },
+  {
+   "file": "v6-bad-truncated.lzr",
+   "expect": "corrupt",
+   "description": "no end block"
+  },
+  {
+   "file": "v6-bad-trailing.lzr",
+   "expect": "corrupt",
+   "description": "a byte after the end block (one-shot decoding)"
+  },
+  {
+   "file": "v6-bad-end-len.lzr",
+   "expect": "corrupt",
+   "description": "end block with comp_len 5"
+  },
+  {
+   "file": "v6-bad-empty-type5.lzr",
+   "expect": "corrupt",
+   "description": "type 5 block with raw_len 0"
+  },
+  {
+   "file": "v6-bad-dist-before-start.lzr",
+   "expect": "corrupt",
+   "description": "match before the start of the content"
+  },
+  {
+   "file": "v6-bad-bits-left.lzr",
+   "expect": "corrupt",
+   "description": "sequence bit stream not consumed exactly"
+  },
+  {
+   "file": "v6-bad-no-end-marker.lzr",
+   "expect": "corrupt",
+   "description": "sequence bit stream: last byte zero"
+  },
+  {
+   "file": "v6-bad-table-repeat.lzr",
+   "expect": "corrupt",
+   "description": "tANS repeat mode without a table"
+  },
+  {
+   "file": "v6-bad-table-sum.lzr",
+   "expect": "corrupt",
+   "description": "tANS counts summing to 256"
+  },
+  {
+   "file": "v6-bad-huf-oversub.lzr",
+   "expect": "corrupt",
+   "description": "Huffman lengths 1,1,1 (oversubscribed)"
+  },
+  {
+   "file": "v6-bad-huf-repeat.lzr",
+   "expect": "corrupt",
+   "description": "Huffman repeat mode without a table"
+  },
+  {
+   "file": "v6-bad-huf-len12.lzr",
+   "expect": "corrupt",
+   "description": "Huffman code length 12"
+  },
+  {
+   "file": "v6-bad-extra-bits-66.lzr",
+   "expect": "corrupt",
+   "description": "codes with 25 + 16 + 25 extra bits (C decoder read > 64 bits at once before the fix)"
+  },
+  {
+   "file": "v6-bad-type4-first-byte.lzr",
+   "expect": "corrupt",
+   "description": "type 4 payload whose first byte is not 0"
+  },
+  {
+   "file": "v6-bad-type4-short.lzr",
+   "expect": "corrupt",
+   "description": "type 4 payload one byte short"
+  },
+  {
+   "file": "enc-empty.lzr",
+   "expect": "ok",
+   "description": "empty content: header + end block",
+   "size": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "features": [
+    "flag.size",
+    "version7",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "enc-stored.lzr",
+   "expect": "ok",
+   "description": "incompressible: one stored block",
+   "size": 3000,
+   "sha256": "0f75c21f6a75170423676219888a544faedf4a357f9d34b346091bc77a308a0d",
+   "features": [
+    "block0",
+    "flag.size",
+    "version7",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "enc-l1-text.lzr",
+   "expect": "ok",
+   "description": "level 1, type 5: Huffman literals (mode 2), new tANS tables",
+   "size": 40000,
+   "sha256": "741fe098977184cca7ee758106efd15e1704a6ca78664b64c9b344545567244c",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "version7",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "enc-l-3-multiblock.lzr",
+   "expect": "ok",
+   "description": "level -3, three type 5 blocks: table repeat modes",
+   "size": 525287,
+   "sha256": "76ce6701fa3c3387bee99cc9484881851148adc1c27f892bc897430f5134d3ac",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ll.mode1",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode2",
+    "seq.of.new",
+    "seq.of.rep0",
+    "t5.lit.mode0",
+    "t5.lit.mode2",
+    "version7",
+    "wlog19"
+   ]
+  },
+  {
+   "file": "enc-l6-records.lzr",
+   "expect": "ok",
+   "description": "level 6, type 5, repeat offsets 1 and 2",
+   "size": 131072,
+   "sha256": "ba8707db09d98d2f8c28f58e02fb9d098a024ebaf09750d00a178da5920b8de5",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "version7",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "enc-l10-ctx.lzr",
+   "expect": "ok",
+   "description": "level 10, type 6 context literals, new and repeated tables",
+   "size": 60000,
+   "sha256": "e230ec5687aa5a7ec8b1d05f50f6403ee928da23ea6bad39210c981f64cdc06f",
+   "features": [
+    "block6",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t6.ctx.mode0",
+    "t6.ctx.mode1",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "enc-l11-text.lzr",
+   "expect": "ok",
+   "description": "level 11, type 4 over three blocks (model carries over)",
+   "size": 524365,
+   "sha256": "56a81b6f79462f694e4205b87a7b07bf47fe09b1b6a25e23e5a71dc5b5e6f159",
+   "features": [
+    "block4",
+    "flag.size",
+    "t4.len.high",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "enc-l11-zeros.lzr",
+   "expect": "ok",
+   "description": "level 11, long rep0 runs (matches split at 273)",
+   "size": 262244,
+   "sha256": "b29835022fd3818582af823914d928ce2ffd30357c8186464a74637bfa485987",
+   "features": [
+    "block4",
+    "flag.size",
+    "t4.lit.plain",
+    "t4.rep",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "enc-l3-zeros.lzr",
+   "expect": "ok",
+   "description": "level 3, matches of 2^18 - 2 bytes",
+   "size": 300000,
+   "sha256": "886715e4051e827f4fe215df3053af3f85ad0d352db2c829c7487af6d78efe30",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep0",
+    "t5.lit.mode1",
+    "version7",
+    "wlog19"
+   ]
+  },
+  {
+   "file": "enc-x86-l6.lzr",
+   "expect": "ok",
+   "description": "x86 filter flag, type 5",
+   "size": 20003,
+   "sha256": "940619db0bde24c7adfdc0cdf32cf2b412b65061414eeaa606b8b8b250c2aeb1",
+   "features": [
+    "block5",
+    "flag.size",
+    "flag.x86",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "version7",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "enc-x86-l11.lzr",
+   "expect": "ok",
+   "description": "x86 filter flag, type 4",
+   "size": 20003,
+   "sha256": "44621b8c4f51c7471f361e274c52ff25f42fa6388375810404e979445ddbc2fe",
+   "features": [
+    "block4",
+    "flag.size",
+    "flag.x86",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "enc-wlog18.lzr",
+   "expect": "ok",
+   "description": "window_log 18 (smallest window)",
+   "size": 349525,
+   "sha256": "db1eeb8f36349a84fcb9a1ab56e806d143afc79d9d50e150c08a3f21cf1c9b97",
+   "features": [
+    "block5",
+    "flag.size",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode0",
+    "t5.lit.mode2",
+    "version7",
+    "wlog18"
+   ]
+  },
+  {
+   "file": "enc-stream-l5.lzr",
+   "expect": "ok",
+   "description": "streaming compressor: no content size in the header",
+   "size": 266465,
+   "sha256": "e6b55ffd3fb91d20868d72e03a1419c05100e0e77deeb5454c9da6f7ef652eb9",
+   "features": [
+    "block5",
+    "seq.ll.mode0",
+    "seq.ll.mode1",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode1",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode0",
+    "t5.lit.mode2",
+    "version7",
+    "wlog23"
+   ]
+  },
+  {
+   "file": "enc-stream-l9.lzr",
+   "expect": "ok",
+   "description": "streaming compressor, level 9",
+   "size": 30000,
+   "sha256": "4a466ef2c28d0df8e8781dbca4bf60a7501ec4f1463e2a7f6c7fc02b4404956f",
+   "features": [
+    "block5",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "t5.lit.mode3",
+    "version7",
+    "wlog25"
+   ]
+  },
+  {
+   "file": "enc-wlog26.lzr",
+   "expect": "ok",
+   "description": "window_log 26 (largest window), level 11, streaming",
+   "size": 60000,
+   "sha256": "eb8985f4ee527bf6193c3efe6af5a2fa5c3065e1378db7369920e78b061e67f6",
+   "features": [
+    "block4",
+    "t4.len.high",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version7",
+    "wlog26"
+   ]
+  },
+  {
+   "file": "reset-splice-type5.lzr",
+   "expect": "ok",
+   "description": "level 1 frames spliced at a reset point",
+   "size": 268144,
+   "sha256": "b1954ed68d30085122a70cec197c9eec41ef886644ad934f9ab20ea6a4fd25e0",
+   "features": [
+    "block5",
+    "reset",
+    "seq.ll.mode0",
+    "seq.ll.mode1",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode1",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode1",
+    "t5.lit.mode2",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "reset-splice-type6.lzr",
+   "expect": "ok",
+   "description": "level 10 frames spliced at a reset point",
+   "size": 30001,
+   "sha256": "b39e4e55dd8f3838dd9033b2b02062154e513bb0e7cc6c18cc6ea6a8462d3986",
+   "features": [
+    "block5",
+    "block6",
+    "reset",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.of.mode0",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode2",
+    "t6.ctx.mode0",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "reset-splice-type4.lzr",
+   "expect": "ok",
+   "description": "level 11 frames spliced at a reset point",
+   "size": 268144,
+   "sha256": "ee7aa5f243ad0f00b30789dd07ea6db99be68f73ef150a8aeb839932874241c2",
+   "features": [
+    "block4",
+    "reset",
+    "t4.len.high",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "skippable-blocks.lzr",
+   "expect": "ok",
+   "description": "skippable blocks 0x80 and 0xBF (empty)",
+   "size": 263143,
+   "sha256": "5a1f45c3fd03a7e99233ede0b4ac926728c7586ed793bbb0e5821a8712f185ba",
+   "features": [
+    "block.skippable",
+    "block5",
+    "seq.ll.mode0",
+    "seq.ll.mode1",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode2",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode1",
+    "t5.lit.mode2",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-stored-between-type5.lzr",
+   "expect": "ok",
+   "description": "type 5 tables repeated across a stored block",
+   "size": 292244,
+   "sha256": "fe6288536c728ee9efc03dfec54d877e941a4896db674c2bb920e9d553a7d23c",
+   "features": [
+    "block0",
+    "block5",
+    "seq.ll.mode0",
+    "seq.ml.mode0",
+    "seq.ml.mode1",
+    "seq.of.mode0",
+    "seq.of.mode2",
+    "seq.of.new",
+    "seq.of.rep0",
+    "seq.of.rep1",
+    "t5.lit.mode2",
+    "t5.lit.mode3",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-initial-rep0.lzr",
+   "expect": "ok",
+   "description": "initial repeat offset 0 = 1; all tables mode 2; bit stream = end marker only",
+   "size": 34,
+   "sha256": "a27c896c4859204843166af66f0e902b9c3b3ed6d2fd13d435abc020065c526f",
+   "features": [
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep0",
+    "t5.lit.mode0",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-initial-rep2-rep1.lzr",
+   "expect": "ok",
+   "description": "initial repeat offset 2 = 8, then the repeat offset update rule",
+   "size": 46,
+   "sha256": "5972583a1d79a3ff60fc6b6fbbbf99e3e73f9e856ffb102d6c84c6b2f53a391d",
+   "features": [
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep1",
+    "seq.of.rep2",
+    "t5.lit.mode0",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-reset-reps.lzr",
+   "expect": "ok",
+   "description": "a reset point restores the initial repeat offsets",
+   "size": 46,
+   "sha256": "ff0c5ed787895c95a70e4933560b35ac97defee43d349650f758befc9bdddeaa",
+   "features": [
+    "block5",
+    "reset",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep0",
+    "seq.of.rep2",
+    "t5.lit.mode0",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-literal-only.lzr",
+   "expect": "ok",
+   "description": "nseq = 0 block with run literals; an empty stored block",
+   "size": 41,
+   "sha256": "2946185e629b11ae8f53c171ba3870ecdf9652a760d34de9f3851561a58738e2",
+   "features": [
+    "block0",
+    "block5",
+    "seq.none",
+    "t5.lit.mode1",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-new-offset.lzr",
+   "expect": "ok",
+   "description": "a new offset and a literal length with extra bits",
+   "size": 64,
+   "sha256": "625b41490b883891943c5fa54ad45d7c900b9b6e91e159334e320b1f5215a209",
+   "features": [
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.new",
+    "t5.lit.mode0",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-huffman.lzr",
+   "expect": "ok",
+   "description": "Huffman literal section, 4 stream sizes",
+   "size": 64,
+   "sha256": "12e425ebc6b87ebd204fcfa9ed3c75a69478468f11228624cd11e2b76eeb9ca7",
+   "features": [
+    "block5",
+    "seq.none",
+    "t5.lit.mode2",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "hand-type4-then-type5.lzr",
+   "expect": "ok",
+   "description": "repeat offsets carry over from a type 4 block to a type 5 block",
+   "size": 3020,
+   "sha256": "6c872a06a0e48e604b6971215659aa41a20ccb9795693fd9dca19857f31cce56",
+   "features": [
+    "block4",
+    "block5",
+    "seq.ll.mode2",
+    "seq.ml.mode2",
+    "seq.of.mode2",
+    "seq.of.rep0",
+    "t4.len.high",
+    "t4.len.low",
+    "t4.len.mid",
+    "t4.lit.matched",
+    "t4.lit.plain",
+    "t4.rep",
+    "t4.rep1",
+    "t4.rep2",
+    "t4.repN",
+    "t4.shortrep",
+    "t4.slot.align",
+    "t4.slot.direct",
+    "t4.slot.tree",
+    "version7",
+    "wlog20"
+   ]
+  },
+  {
+   "file": "bad-magic.lzr",
+   "expect": "corrupt",
+   "description": "wrong magic"
+  },
+  {
+   "file": "bad-version4.lzr",
+   "expect": "unsupported",
+   "description": "frame version 4"
+  },
+  {
+   "file": "bad-version8.lzr",
+   "expect": "unsupported",
+   "description": "frame version 8 (newer than this spec)"
+  },
+  {
+   "file": "bad-flag-encrypted.lzr",
+   "expect": "unsupported",
+   "description": "flag bit 0 (encryption, reserved)"
+  },
+  {
+   "file": "bad-flag-bit3.lzr",
+   "expect": "unsupported",
+   "description": "unknown flag bit 3"
+  },
+  {
+   "file": "bad-wlog17.lzr",
+   "expect": "corrupt",
+   "description": "window_log below 18"
+  },
+  {
+   "file": "bad-wlog27.lzr",
+   "expect": "corrupt",
+   "description": "window_log above 26"
+  },
+  {
+   "file": "bad-reserved.lzr",
+   "expect": "corrupt",
+   "description": "reserved header byte not zero"
+  },
+  {
+   "file": "bad-block-type-0x01.lzr",
+   "expect": "corrupt",
+   "description": "block type byte 0x01"
+  },
+  {
+   "file": "bad-block-type-0x03.lzr",
+   "expect": "corrupt",
+   "description": "block type byte 0x03"
+  },
+  {
+   "file": "bad-block-type-0x41.lzr",
+   "expect": "corrupt",
+   "description": "block type byte 0x41"
+  },
+  {
+   "file": "bad-block-type-0x43.lzr",
+   "expect": "corrupt",
+   "description": "block type byte 0x43"
+  },
+  {
+   "file": "bad-block-type-0x07.lzr",
+   "expect": "unsupported",
+   "description": "block type byte 0x07: a block type of a newer format"
+  },
+  {
+   "file": "bad-block-type-0x3f.lzr",
+   "expect": "unsupported",
+   "description": "block type byte 0x3f: a block type of a newer format"
+  },
+  {
+   "file": "bad-block-type-0x47.lzr",
+   "expect": "unsupported",
+   "description": "block type byte 0x47: a block type of a newer format"
+  },
+  {
+   "file": "bad-reset-on-end.lzr",
+   "expect": "corrupt",
+   "description": "reset bit on the end block"
+  },
+  {
+   "file": "bad-skippable-raw.lzr",
+   "expect": "corrupt",
+   "description": "skippable block with raw_len 1"
+  },
+  {
+   "file": "bad-match-before-reset.lzr",
+   "expect": "corrupt",
+   "description": "a match reaching before a reset point"
+  },
+  {
+   "file": "bad-comp-gt-raw.lzr",
+   "expect": "corrupt",
+   "description": "type 5 block with comp_len > raw_len (valid in version 6)"
+  },
+  {
+   "file": "bad-raw-too-big.lzr",
+   "expect": "corrupt",
+   "description": "stored block header with raw_len 2^18 + 1 (rejected before its payload is needed)"
+  },
+  {
+   "file": "bad-stored-len.lzr",
+   "expect": "corrupt",
+   "description": "stored block, comp_len != raw_len"
+  },
+  {
+   "file": "bad-checksum.lzr",
+   "expect": "checksum",
+   "description": "checksum mismatch"
+  },
+  {
+   "file": "bad-size-short.lzr",
+   "expect": "corrupt",
+   "description": "content_size larger than the content"
+  },
+  {
+   "file": "bad-size-long.lzr",
+   "expect": "corrupt",
+   "description": "content_size smaller than the content"
+  },
+  {
+   "file": "bad-truncated.lzr",
+   "expect": "corrupt",
+   "description": "no end block"
+  },
+  {
+   "file": "bad-trailing.lzr",
+   "expect": "corrupt",
+   "description": "a byte after the end block (one-shot decoding)"
+  },
+  {
+   "file": "bad-end-len.lzr",
+   "expect": "corrupt",
+   "description": "end block with comp_len 5"
+  },
+  {
+   "file": "bad-empty-type5.lzr",
+   "expect": "corrupt",
+   "description": "type 5 block with raw_len 0"
+  },
+  {
+   "file": "bad-dist-before-start.lzr",
+   "expect": "corrupt",
+   "description": "match before the start of the content"
+  },
+  {
+   "file": "bad-bits-left.lzr",
+   "expect": "corrupt",
+   "description": "sequence bit stream not consumed exactly"
+  },
+  {
+   "file": "bad-no-end-marker.lzr",
+   "expect": "corrupt",
+   "description": "sequence bit stream: last byte zero"
+  },
+  {
+   "file": "bad-table-repeat.lzr",
+   "expect": "corrupt",
+   "description": "tANS repeat mode without a table"
+  },
+  {
+   "file": "bad-table-sum.lzr",
+   "expect": "corrupt",
+   "description": "tANS counts summing to 256"
+  },
+  {
+   "file": "bad-huf-oversub.lzr",
+   "expect": "corrupt",
+   "description": "Huffman lengths 1,1,1 (oversubscribed)"
+  },
+  {
+   "file": "bad-huf-repeat.lzr",
+   "expect": "corrupt",
+   "description": "Huffman repeat mode without a table"
+  },
+  {
+   "file": "bad-huf-len12.lzr",
+   "expect": "corrupt",
+   "description": "Huffman code length 12"
+  },
+  {
+   "file": "bad-huf-incomplete.lzr",
+   "expect": "corrupt",
+   "description": "incomplete Huffman code (lengths 1 and 2)"
+  },
+  {
+   "file": "bad-huf-size3.lzr",
+   "expect": "corrupt",
+   "description": "stream 3 does not end at its stored size"
+  },
+  {
+   "file": "bad-extra-bits-66.lzr",
+   "expect": "corrupt",
+   "description": "codes with 25 + 16 + 25 extra bits (C decoder read > 64 bits at once before the fix)"
+  },
+  {
+   "file": "bad-type4-first-byte.lzr",
+   "expect": "corrupt",
+   "description": "type 4 payload whose first byte is not 0"
+  },
+  {
+   "file": "bad-type4-short.lzr",
+   "expect": "corrupt",
+   "description": "type 4 payload one byte short"
+  }
+ ]
+}
