@@ -4,7 +4,7 @@
  */
 #ifndef LZRANS_ENC_INTERNAL_H
 #define LZRANS_ENC_INTERNAL_H
-#include "lzr.h"
+#include "core.h"
 #include "codes.h"
 #include "arc.h"
 #include "x86.h"

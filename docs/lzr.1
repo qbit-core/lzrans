@@ -1,0 +1,124 @@
+.TH LZR 1 "2026-11-28" "lzr 0.15.0" "User Commands"
+.SH NAME
+lzr, unlzr, lzrcat \- compress or decompress .lzr files (LZR 1.0)
+.SH SYNOPSIS
+.B lzr
+.RI [ OPTION ]... " " [ FILE ]...
+.br
+.B unlzr
+is
+.BR "lzr \-d" ;
+.B lzrcat
+is
+.BR "lzr \-dc" .
+.SH DESCRIPTION
+.B lzr
+compresses each
+.I FILE
+to
+.IR FILE .lzr
+and removes the original, or with
+.B \-d
+restores it, keeping permissions and timestamps, in the manner of
+.BR xz (1).
+With no
+.IR FILE ,
+or when
+.I FILE
+is
+.BR \- ,
+it reads standard input and writes standard output, so it can be used as
+.B tar \-I lzr
+or in a pipe. Concatenated .lzr frames decompress to the concatenation of
+their contents. Every frame carries a checksum (XXH64) of its content that is
+verified on decompression.
+.SH OPTIONS
+.TP
+.BR \-z ", " \-\-compress
+Compress (the default).
+.TP
+.BR \-d ", " \-\-decompress ", " \-\-uncompress
+Decompress.
+.TP
+.BR \-t ", " \-\-test
+Decompress and verify without writing anything.
+.TP
+.BR \-l ", " \-\-list
+Print frames, segments, compressed and uncompressed sizes of .lzr files
+(reads block headers only).
+.TP
+.BR \-c ", " \-\-stdout ", " \-\-to\-stdout
+Write to standard output and keep input files.
+.TP
+.BR \-k ", " \-\-keep
+Keep input files.
+.TP
+.BR \-f ", " \-\-force
+Overwrite existing output files, write compressed data to a terminal,
+compress files that already have the suffix or have several hard links.
+.TP
+.BR \-0 " ... " \-11
+Compression level (default 6). Levels 0\-10 decode at zstd\-class speed;
+level 11 gives the best ratio (xz \-9 class).
+.TP
+.BR \-\-fast [ =\fIN\fR ]
+Level \-\fIN\fR, \fIN\fR = 1..3 (default 1): fastest compression.
+.TP
+.BI \-\-level= N
+Level \-3..11.
+.TP
+.BR \-T ", " \-\-threads=\fIN\fR
+Worker threads (default 1; 0 = one per CPU, at most 16). Compressed output
+does not depend on
+.I N
+(at levels \-3..6, it is the same for any
+.I N
+> 1). Decompression with
+.I N
+> 1 decodes segments and blocks in parallel when the input is a regular file
+whose frames record their size.
+.TP
+.BI \-\-segment= SIZE
+Start a new independent segment every
+.I SIZE
+bytes (suffixes K, M, G; at least 1MiB; 0 = off) so that the output can be
+decompressed in parallel. Default: 48MiB at levels 9\-11, off otherwise.
+.TP
+.BI \-\-window\-log= N
+Match window of 2^\fIN\fR bytes, \fIN\fR = 18..26 (default by level; levels
+9\-11 use at least 2^20).
+.TP
+.B \-\-x86
+Filter x86/x86\-64 CALL instructions first (better ratio on executables).
+.TP
+.BI \-\-max\-window\-log= N
+Refuse frames whose window is above 2^\fIN\fR bytes (18..31, default 27);
+this bounds decoder memory.
+.TP
+.BR \-S ", " \-\-suffix=\fI.SUF\fR
+Suffix of compressed files (default .lzr).
+.TP
+.BR \-q ", " \-\-quiet
+Suppress warnings.
+.TP
+.BR \-v ", " \-\-verbose
+Report sizes, ratio and speed for each file.
+.TP
+.BR \-h ", " \-\-help
+.TP
+.BR \-V ", " \-\-version
+.SH EXIT STATUS
+0 on success, 1 on error, 2 when only warnings occurred (for example a file
+skipped or trailing garbage after the last frame).
+.SH EXAMPLES
+.nf
+lzr \-9 \-T4 big.tar            # big.tar.lzr
+lzr \-dc big.tar.lzr | tar xf \-
+tar \-I 'lzr \-11 \-T0' \-cf src.tar.lzr src/
+tar \-I lzr \-xf src.tar.lzr
+.fi
+.SH SEE ALSO
+.BR xz (1),
+.BR zstd (1),
+.BR tar (1).
+The format is specified in docs/FORMAT.md of the lzrans sources.

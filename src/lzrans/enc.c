@@ -11,7 +11,7 @@
  *                     sequences) or type 4 (range-coded tokens, level 11)
  *   slide()           drops history older than the window, rebases tables
  */
-#include "lzr.h"
+#include "core.h"
 #include "codes.h"
 #include "xxh64.h"
 #include "x86.h"
