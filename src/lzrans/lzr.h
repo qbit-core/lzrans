@@ -19,7 +19,7 @@
  *                          table modes + one backward tANS bit stream of
  *                          states and extra bits (fse.h, dec.c). Tables and
  *                          repeat offsets carry over between blocks.
- *     type 6  context literals (levels 7-10, frame version >= 6): as type
+ *     type 6  context literals (levels 9-10, frame version >= 6): as type
  *                          5, but the literal section is a context literal
  *                          section (huf.h): literals are coded with one of
  *                          up to 8 Huffman tables chosen by the byte before

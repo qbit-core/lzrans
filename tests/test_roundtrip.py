@@ -435,7 +435,7 @@ def _markov(n, seed=3):
     return bytes(out)
 
 
-@pytest.mark.parametrize("level", [7, 8, 9, 10])
+@pytest.mark.parametrize("level", [9, 10])
 def test_context_literals_block_type_6(level):
     data = _markov(3 * BS)
     blob = lzrans.compress(data, level=level)
@@ -456,6 +456,12 @@ def test_context_literals_block_type_6(level):
             pass
 
 
+@pytest.mark.parametrize("level", [1, 6, 7, 8, 11])
+def test_no_type_6_outside_levels_9_10(level):
+    # decode speed: levels other than 9-10 keep their literal coding
+    assert 6 not in _block_types(lzrans.compress(_markov(3 * BS), level=level))
+
+
 def test_version_5_frames_still_decode():
     data = _text(2 * BS, 3)
     blob = bytearray(lzrans.compress(data, level=1))   # type 5 blocks only
@@ -463,7 +469,7 @@ def test_version_5_frames_still_decode():
     blob[4] = 5
     assert lzrans.decompress(bytes(blob)) == data
     # a type 6 block is not valid in a version 5 frame
-    blob6 = bytearray(lzrans.compress(_markov(2 * BS), level=7))
+    blob6 = bytearray(lzrans.compress(_markov(2 * BS), level=9))
     assert 6 in _block_types(blob6)
     blob6[4] = 5
     with pytest.raises(lzrans.LzransError):

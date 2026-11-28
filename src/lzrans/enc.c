@@ -110,7 +110,8 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     c->seq_ml = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->seq_dist = (uint32_t *)malloc(MAX_SEQ * sizeof(uint32_t));
     c->lits = (uint8_t *)malloc(LZR_BLOCK_SIZE + 32);
-    if (c->lp.opt && level < LZR_ADAPTIVE_LEVEL) {   /* block type 6 */
+    /* block type 6: tree levels 9-10 only (levels 7-8 keep type 5 for decode speed) */
+    if (c->lp.opt && !c->lp.row && level < LZR_ADAPTIVE_LEVEL) {
         c->lctx = (uint8_t *)malloc(LZR_BLOCK_SIZE + 32);
         c->ctmp = (uint8_t *)malloc(hufc_bound(LZR_BLOCK_SIZE));
         c->hufc = (hufc_table *)calloc(2, sizeof(hufc_table));
