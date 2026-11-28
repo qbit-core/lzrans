@@ -234,7 +234,8 @@ def code_value(c, direct_log):
     return (1 << nb) | ((k & 1) << (nb - 1)), nb - 1
 
 
-LL_CODES, ML_CODES, OF_CODES = 62, 58, 65
+LL_CODES, ML_CODES = 62, 58
+OF_CODES, OF_CODES_V6 = 73, 65      # 6.4 (Appendix C: versions 5-6)
 ML_MIN = 2
 BLOCK_MAX = 1 << 18
 MAX_SEQ = BLOCK_MAX // 2 + 1
@@ -357,7 +358,7 @@ def decode_seq_block(p, raw, fr, ctx):
             _need(lbits.used_bytes() == sz, "literal stream does not end at its size")
         return
 
-    alpha = (LL_CODES, ML_CODES, OF_CODES)
+    alpha = (LL_CODES, ML_CODES, OF_CODES if fr.version >= 7 else OF_CODES_V6)
     tabs = []
     for t in range(3):
         _need(k < len(p), "truncated table modes")
@@ -619,7 +620,7 @@ def parse_header(data):
         raise UnsupportedError("frame version %d" % ver)
     if flags & ~0x06:
         raise UnsupportedError("flags 0x%02x" % flags)
-    _need(18 <= wlog <= 26 and res == 0, "bad window_log or reserved byte")
+    _need(18 <= wlog <= (31 if ver >= 7 else 26) and res == 0, "bad window_log or reserved byte")
     if flags & 2:
         _need(len(data) >= 16, "truncated header")
         size = struct.unpack_from("<Q", data, 8)[0]

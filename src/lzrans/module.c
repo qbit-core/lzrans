@@ -2,9 +2,9 @@
  * module.c - CPython binding for the lzrans C core.
  *
  *   compress(data, level=6, window_log=0, threads=1, filter=None) -> bytes
- *   decompress(data) -> bytes
+ *   decompress(data, max_window_log=27) -> bytes
  *   Compressor(level=6, window_log=0, threads=1, filter=None): .compress(data), .flush()
- *   Decompressor(): .decompress(data) -> bytes, .eof, .unused_data
+ *   Decompressor(max_window_log=27): .decompress(data) -> bytes, .eof, .unused_data
  *   crc32(data, value=0) -> int                     (zlib-compatible)
  *   frame_info(data) -> (content_size | None, window_log, flags)
  *
@@ -27,6 +27,9 @@ static PyObject *raise_code(int code)
         return NULL;
     case LZR_ERR_UNSUPPORTED:
         PyErr_SetString(LzrError, "unsupported frame version, flags or block type: needs a newer decoder (encrypted frames are not supported yet)");
+        return NULL;
+    case LZR_ERR_MEMLIMIT:
+        PyErr_SetString(LzrError, "frame window is larger than max_window_log allows: pass a larger max_window_log (up to 31)");
         return NULL;
     case LZR_ERR_PARAM:
         PyErr_SetString(PyExc_ValueError, "invalid argument or stream already finished");
@@ -125,10 +128,17 @@ static PyObject *py_compress(PyObject *self, PyObject *args, PyObject *kw)
     return res;
 }
 
-static PyObject *py_decompress(PyObject *self, PyObject *arg)
+static PyObject *py_decompress(PyObject *self, PyObject *args, PyObject *kw)
 {
+    static char *kwlist[] = {"data", "max_window_log", NULL};
     Py_buffer in;
-    if (PyObject_GetBuffer(arg, &in, PyBUF_SIMPLE) < 0) return NULL;
+    int maxw = LZR_WLOG_DEC_DEFAULT;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|i:decompress", kwlist, &in, &maxw)) return NULL;
+    if (maxw < LZR_WLOG_MIN || maxw > LZR_WLOG_FMT_MAX) {
+        PyBuffer_Release(&in);
+        PyErr_SetString(PyExc_ValueError, "max_window_log must be 18..31");
+        return NULL;
+    }
     lzr_buf out = {0};
     int r;
     size_t used = 0;
@@ -153,6 +163,7 @@ static PyObject *py_decompress(PyObject *self, PyObject *arg)
     if (!d) r = LZR_ERR_NOMEM;
     else {
         r = lzr_dctx_set_output(d, &out);
+        if (!r) r = lzr_dctx_set_max_window_log(d, maxw);
         if (!r) r = lzr_dctx_write(d, (const uint8_t *)in.buf, (size_t)in.len, &out, &used);
         lzr_dctx_free(d);
     }
@@ -298,11 +309,17 @@ typedef struct {
 
 static int Decompressor_init(DecompressorObject *self, PyObject *args, PyObject *kw)
 {
-    static char *kwlist[] = {NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kw, ":Decompressor", kwlist)) return -1;
+    static char *kwlist[] = {"max_window_log", NULL};
+    int maxw = LZR_WLOG_DEC_DEFAULT;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|i:Decompressor", kwlist, &maxw)) return -1;
+    if (maxw < LZR_WLOG_MIN || maxw > LZR_WLOG_FMT_MAX) {
+        PyErr_SetString(PyExc_ValueError, "max_window_log must be 18..31");
+        return -1;
+    }
     if (self->d) lzr_dctx_free(self->d);
     self->d = lzr_dctx_new();
     if (!self->d) { PyErr_NoMemory(); return -1; }
+    lzr_dctx_set_max_window_log(self->d, maxw);
     self->eof = 0;
     Py_XSETREF(self->unused, PyBytes_FromStringAndSize(NULL, 0));
     if (!self->lock && !(self->lock = PyThread_allocate_lock())) { PyErr_NoMemory(); return -1; }
@@ -368,7 +385,7 @@ static PyTypeObject DecompressorType = {
     .tp_name = "lzrans.Decompressor",
     .tp_basicsize = sizeof(DecompressorObject),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_doc = "Decompressor(): streaming decompressor.",
+    .tp_doc = "Decompressor(max_window_log=27): streaming decompressor.",
     .tp_new = PyType_GenericNew,
     .tp_init = (initproc)Decompressor_init,
     .tp_dealloc = (destructor)Decompressor_dealloc,
@@ -383,7 +400,8 @@ static PyMethodDef methods[] = {
      "compress(data, level=6, window_log=0, threads=1, filter=None) -> bytes\n"
      "threads: match-finder threads for levels 9-11 (0 = auto, up to 4). Output is identical for any value.\n"
      "filter: None, or \"x86\" for x86/x86-64 machine code (executables, libraries)."},
-    {"decompress", py_decompress, METH_O, "decompress(data) -> bytes"},
+    {"decompress", (PyCFunction)(void (*)(void))py_decompress, METH_VARARGS | METH_KEYWORDS,
+     "decompress(data, max_window_log=27) -> bytes. Frames declaring a larger window are refused."},
     {"crc32", py_crc32, METH_VARARGS, "crc32(data, value=0) -> int (zlib-compatible)"},
     {"frame_info", py_frame_info, METH_O, "frame_info(data) -> (content_size or None, window_log, flags)"},
     {NULL, NULL, 0, NULL}};

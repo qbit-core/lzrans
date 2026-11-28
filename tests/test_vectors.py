@@ -36,14 +36,15 @@ def _check_content(e, out):
 @pytest.mark.parametrize("e", MANIFEST, ids=[e["file"] for e in MANIFEST])
 def test_c_decoder_one_shot(e):
     blob = _load(e)
+    maxw = e.get("max_window_log", 27)
     if e["expect"] == "ok":
-        _check_content(e, lzrans.decompress(blob))
+        _check_content(e, lzrans.decompress(blob, max_window_log=maxw))
     elif e["expect"] == "checksum":
         with pytest.raises(lzrans.ChecksumError):
-            lzrans.decompress(blob)
+            lzrans.decompress(blob, max_window_log=maxw)
     else:
         with pytest.raises(lzrans.LzransError) as ei:
-            lzrans.decompress(blob)
+            lzrans.decompress(blob, max_window_log=maxw)
         assert not isinstance(ei.value, lzrans.ChecksumError)
         assert ("unsupported" in str(ei.value)) == (e["expect"] == "unsupported")
 
@@ -52,7 +53,7 @@ def test_c_decoder_one_shot(e):
                          ids=[e["file"] for e in MANIFEST if e["expect"] == "ok"])
 def test_c_decoder_streaming(e):
     blob = _load(e)
-    d = lzrans.Decompressor()
+    d = lzrans.Decompressor(max_window_log=e.get("max_window_log", 27))
     out = b"".join(d.decompress(blob[i:i + 777]) for i in range(0, len(blob), 777))
     assert d.eof
     _check_content(e, out)

@@ -467,3 +467,57 @@ def test_writes_format_version_7():
     # tests/test_vectors.py (enc-version5, the other enc-* are version 6).
     assert lzrans.FORMAT_VERSION == 7
     assert lzrans.compress(b"abc" * 1000, level=1)[4] == 7
+
+
+def _frame7(blocks, wlog, content):
+    """A version 7 frame from (type byte, raw_len, payload) blocks."""
+    import struct
+    sys_path = os.path.join(os.path.dirname(__file__), "..", "tools")
+    import sys
+    sys.path.insert(0, sys_path)
+    import refdec
+    h = b"LZRN" + bytes([7, 0, wlog, 0])
+    for t, raw, p in blocks:
+        h += bytes([t]) + struct.pack("<II", raw, len(p)) + p
+    return h + bytes([2]) + struct.pack("<II", 0, 4) + struct.pack("<I", refdec.xxh64(content) & 0xFFFFFFFF), refdec
+
+
+def test_window_above_memory_limit_refused():
+    data = b"x" * 100
+    blob, _ = _frame7([(0, 100, data)], 31, data)
+    with pytest.raises(lzrans.LzransError, match="max_window_log"):
+        lzrans.decompress(blob)
+    with pytest.raises(lzrans.LzransError, match="max_window_log"):
+        lzrans.Decompressor().decompress(blob)
+    assert lzrans.decompress(blob, max_window_log=31) == data
+    with pytest.raises(ValueError):
+        lzrans.decompress(blob, max_window_log=32)
+    # (versions 5-6 keep the old range 18..26: vector v6-bad-wlog27)
+
+
+def test_offset_beyond_2_27():
+    # type 5 offsets past 2^27 (OF codes 65..72, version 7 only): 2^27 +
+    # 2^18 stored bytes, then a 22-byte match at distance 2^27 + 1000
+    import struct
+    import random as _r
+    n = (1 << 27) + (1 << 18)
+    data = _r.Random(9).randbytes(1 << 18) * (n >> 18)
+    data = bytearray(data)
+    for i in range(0, n, 4096):          # make the 256 KiB copies differ
+        data[i:i + 4] = i.to_bytes(4, "little")
+    data = bytes(data)
+    dist = (1 << 27) + 1000
+    v = dist - 1                         # value; top bit 27 -> code 16 + 2*23 + 0 = 62
+    assert v >> 27 == 1 and not (v >> 26) & 1
+    of_code = 3 + 62
+    bits = ((1 << 26) | (v & ((1 << 26) - 1))).to_bytes(4, "little")   # 26 extra bits + end marker
+    p = struct.pack("<II", 1, 0) + bytes([2, 0, 2, 20, 2, of_code]) + bits
+    blocks = [(0, 1 << 18, data[i:i + (1 << 18)]) for i in range(0, n, 1 << 18)] + [(5, 22, p)]
+    want = data + data[n - dist:n - dist + 22]
+    blob, refdec = _frame7(blocks, 28, want)
+    assert lzrans.decompress(blob, max_window_log=28) == want
+    # the reference decoder on the last block (its checksum pass would be slow)
+    fr = refdec.Frame(7, 28, 0, None)
+    fr.out = bytearray(data)
+    refdec.decode_seq_block(p, 22, fr, False)
+    assert bytes(fr.out[n:]) == want[n:]
