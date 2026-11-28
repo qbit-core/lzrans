@@ -467,3 +467,101 @@ def test_writes_format_version_7():
     # tests/test_vectors.py (enc-version5, the other enc-* are version 6).
     assert lzrans.FORMAT_VERSION == 7
     assert lzrans.compress(b"abc" * 1000, level=1)[4] == 7
+
+
+# ---- segment mode (reset points + seek index) and parallel decompression
+
+MB = 1 << 20
+
+
+def _seg_data(n=3 * MB + 12345, seed=8):
+    # text with long-range repeats, so segments really lose matches
+    t = _text(n // 2, seed)
+    return (t + t[::-1])[:n]
+
+
+@pytest.mark.parametrize("level", [-3, 0, 4, 7, 9, 10, 11])
+def test_segment_mode_roundtrip_and_parallel_decode(level):
+    data = _seg_data()
+    blob = lzrans.compress(data, level=level, segment=MB)
+    assert lzrans.decompress(blob) == data
+    for t in (2, 3, 4, 8):
+        assert lzrans.decompress(blob, threads=t) == data
+    # the output does not depend on the thread count
+    assert lzrans.compress(data, level=level, segment=MB, threads=3) == blob
+
+
+def test_segment_mode_small_input_is_unchanged():
+    data = _text(MB - 7)
+    for level in (1, 9, 11):
+        assert lzrans.compress(data, level=level, segment=MB) == lzrans.compress(data, level=level, segment=0)
+
+
+def test_segment_mode_streaming_matches_one_shot():
+    data = _seg_data(2 * MB + 999)
+    one = lzrans.compress(data, level=6, segment=MB)
+    rnd = random.Random(3)
+    c = lzrans.Compressor(level=6, segment=MB, threads=2)
+    parts, i = [], 0
+    while i < len(data):
+        k = rnd.randint(1, 400_000)
+        parts.append(c.compress(data[i:i + k]))
+        i += k
+    blob = b"".join(parts) + c.flush()
+    # same data blocks and checksum; the header has no content size when
+    # streaming, so the seek index's frame offsets differ by 8
+    ix = 9 + 16 * 3 + 16 + 13
+    assert blob[8:-ix] == one[16:-ix] and blob[-13:] == one[-13:]
+    assert lzrans.decompress(blob, threads=4) == data
+
+
+def test_segment_mode_x86_filter():
+    data = _seg_data(2 * MB + 5) + bytes([0xE8, 1, 2, 3]) * 1000
+    blob = lzrans.compress(data, level=9, segment=MB, filter="x86", threads=2)
+    assert lzrans.decompress(blob, threads=4) == data
+
+
+def test_segment_validated():
+    with pytest.raises(ValueError):
+        lzrans.compress(b"x", segment=1000)
+    with pytest.raises(ValueError):
+        lzrans.Compressor(segment=5)
+
+
+def _segment_offsets(blob):
+    import struct
+    pos, offs = 16, []
+    while True:
+        t, raw, comp = blob[pos], *struct.unpack_from("<II", blob, pos + 1)
+        if t & 0xC0 == 0x40:
+            offs.append(pos)
+        if t == 2:
+            return offs
+        pos += 9 + comp
+
+
+def test_parallel_decode_detects_corruption_in_each_segment():
+    data = _seg_data()
+    blob = lzrans.compress(data, level=9, segment=MB)
+    offs = _segment_offsets(blob)
+    assert len(offs) == 3
+    for o in offs + [16]:
+        bad = bytearray(blob)
+        bad[o + 9 + 40] ^= 0x10   # inside the first block of that segment
+        with pytest.raises(lzrans.LzransError):
+            lzrans.decompress(bytes(bad), threads=4)
+    bad = bytearray(blob)
+    bad[-1] ^= 1
+    with pytest.raises(lzrans.ChecksumError):
+        lzrans.decompress(bytes(bad), threads=4)
+    with pytest.raises(lzrans.LzransError):
+        lzrans.decompress(blob[:-5], threads=4)
+    with pytest.raises(lzrans.LzransError):
+        lzrans.decompress(blob + b"x", threads=4)
+
+
+def test_parallel_decode_without_reset_points():
+    data = _seg_data(MB)
+    for level in (3, 11):
+        blob = lzrans.compress(data, level=level, segment=0)
+        assert lzrans.decompress(blob, threads=4) == data

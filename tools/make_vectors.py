@@ -188,6 +188,28 @@ def build():
     bl.insert(0, (0xBF, 0, b""))
     V.append(("skippable-blocks", frame(bl, checksum_of=a), "ok", "skippable blocks 0x80 and 0xBF (empty)", a))
 
+    # ---- segment mode (14): reset points + seek index (12.3), and 0x80
+    # blocks that are not a valid index, which decoders ignore
+    a = mutated(2 * (1 << 20) + 5000, 40, every=2000)
+    enc("seg-l11-type4", a, "segment mode, level 11: three segments (reset points) and a seek index",
+        level=11, segment=1 << 20)
+    enc("seg-l3-type5", a, "segment mode, level 3: three segments and a seek index", level=3, segment=1 << 20)
+    good = lzrans.compress(a, level=3, segment=1 << 20)
+    h = header_len(good)
+    bl = [(ev[1], ev[2], ev[3]) if ev[0] == "block" else (ev[1], 0, ev[3])   # data blocks and the index block
+          for ev in refdec.blocks(good) if ev[0] == "skip" or (ev[0] == "block" and ev[1] != 2)]
+    bl = [(t | (0x40 if r else 0), raw, p) if t < 0x80 else (t, raw, p)
+          for (t, raw, p), r in zip(bl, [ev[5] if ev[0] == "block" else False
+                                         for ev in refdec.blocks(good) if ev[0] == "skip" or (ev[0] == "block" and ev[1] != 2)])]
+    assert bl[-1][0] == 0x80
+    idx = bytearray(bl[-1][2])
+    idx[24] ^= 1                               # content_offset of entry 1
+    V.append(("seg-index-bad-offset", frame(bl[:-1] + [(0x80, 0, bytes(idx))], content_size=len(a), checksum_of=a),
+              "ok", "0x80 block whose entry 1 has a wrong content offset: not a valid index, ignored", a))
+    V.append(("seg-index-bad-notlast", frame(bl + [(0, 0, b"")], content_size=len(a), checksum_of=a),
+              "ok", "seek index followed by an empty stored block: not a valid index, ignored", a))
+    assert h == 16
+
     # ---- encoder blocks with a hand-inserted stored block in between:
     # the decoder state (tables, repeat offsets) survives it. The content
     # differs from the encoder input (later matches now reach into the

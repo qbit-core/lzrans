@@ -52,7 +52,22 @@ struct lzr_dctx {
     seq_dent sq[3][FSE_L];   /* per-block sequence decoding tables */
     lzr_x86 x86;
     uint8_t *x86tmp;   /* x86 filter work buffer, NULL = no filter */
+    /* lzr_decompress_mt workers: the block ending here is decoded without
+     * writing past its end (another thread owns the next bytes); no hash */
+    const uint8_t *exact_end;
+    int nohash;
 };
+
+/* Frame-start decoder state: at the start of a frame and at reset points. */
+static void reset_state(lzr_dctx *d)
+{
+    d->reps[0] = 1; d->reps[1] = 4; d->reps[2] = 8;
+    d->huf.valid = 0;
+    d->hufc.valid = 0;
+    for (int t = 0; t < 3; t++) d->fse[t].valid = 0;
+    tok_model_init(&d->tm);
+    d->seg_start = d->total_out;
+}
 
 lzr_dctx *lzr_dctx_new(void)
 {
@@ -116,6 +131,15 @@ static inline void copy_match(uint8_t *op, size_t dist, size_t len)
         size_t back = dist * ((8 + dist - 1) / dist);
         for (size_t k = 8; k < len; k += 8) memcpy(op + k, op + k - back, 8);
     }
+}
+
+/* Byte-exact match copy: writes nothing past op + len. Used near the end
+ * of a segment decoded in parallel, where the bytes after it belong to the
+ * next segment, which another thread is writing (lzr_decompress_mt). */
+static inline void copy_match_exact(uint8_t *op, size_t dist, size_t len)
+{
+    const uint8_t *src = op - dist;
+    for (size_t k = 0; k < len; k++) op[k] = src[k];
 }
 
 /* Literal run: 16-byte chunks (source and destination have slack). */
@@ -198,7 +222,8 @@ static inline void copy_lits(uint8_t *o, const uint8_t *lp, size_t ll)
         RC_TREE((l)->high, 8, v0_); out = 18 + v0_;                            \
     } while (0)
 
-static __attribute__((noinline)) int decode_tokens(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+static inline __attribute__((always_inline)) int decode_tokens_impl(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw,
+                                                                    const int exact)
 {
     arc_dec r;
     if (arcd_init(&r, in, avail)) return LZR_ERR_CORRUPT;
@@ -312,13 +337,22 @@ static __attribute__((noinline)) int decode_tokens(lzr_dctx *d, const uint8_t *i
             s = tok_after_rep(s);
         }
         if (len > (size_t)(oend - o) || dist > (size_t)(o - hist) || dist > wsize) { err = 1; break; }
-        copy_match(o, dist, len);
+        if (exact && (size_t)(oend - o) < len + 16) copy_match_exact(o, dist, len);
+        else copy_match(o, dist, len);
         o += len;
     }
     m->state = (uint8_t)s;
     d->reps[0] = rep0; d->reps[1] = rep1; d->reps[2] = rep2;
     if (err || ip != iend) return LZR_ERR_CORRUPT;
     return LZR_OK;
+}
+static __attribute__((noinline)) int decode_tokens_fast(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_tokens_impl(d, in, avail, dst, raw, 0);
+}
+static __attribute__((noinline)) int decode_tokens_exact(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_tokens_impl(d, in, avail, dst, raw, 1);
 }
 
 /* Block type 5 (see emit_seqs5 in enc.c): Huffman literals into d->lits,
@@ -351,7 +385,7 @@ static inline uint64_t ld64le_(const uint8_t *p)
 }
 
 static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw,
-                                                                    const int ctx)
+                                                                    const int ctx, const int exact)
 {
     if (avail < 8) return LZR_ERR_CORRUPT;
     size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8;
@@ -509,12 +543,15 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
 #define EXEC_SEQ(LL, ML, DIST)                                                 \
     do {                                                                       \
         if ((LL) > (size_t)(lend - lp) || (LL) + (ML) > (size_t)(oend - o)) { berr = 1; goto done; } \
+        const int ex_ = exact && (size_t)(oend - o) < (LL) + (ML) + 32;       \
         if (ctx) CTX_LITS(LL, { berr = 1; goto done; });                       \
+        else if (ex_) memcpy(o, lp, LL);                                       \
         else copy_lits(o, lp, LL);                                             \
         o += LL;                                                               \
         lp += LL;                                                              \
         if ((DIST) > (size_t)(o - hist) || (DIST) > wsize) { berr = 1; goto done; } \
-        copy_match(o, DIST, ML);                                               \
+        if (ex_) copy_match_exact(o, DIST, ML);                                \
+        else copy_match(o, DIST, ML);                                          \
         o += ML;                                                               \
         if (ctx) lctx = d->hufc.cmap[o[-1]];                                   \
     } while (0)
@@ -548,21 +585,30 @@ done:
 
 static __attribute__((noinline)) int decode_block5_generic(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
-    return decode_block5_impl(d, in, avail, dst, raw, 0);
+    return decode_block5_impl(d, in, avail, dst, raw, 0, 0);
 }
 static __attribute__((noinline)) int decode_block6_generic(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
-    return decode_block5_impl(d, in, avail, dst, raw, 1);
+    return decode_block5_impl(d, in, avail, dst, raw, 1, 0);
+}
+/* writes nothing past dst + raw: the last block of a parallel segment */
+static __attribute__((noinline)) int decode_block5_exact(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_block5_impl(d, in, avail, dst, raw, 0, 1);
+}
+static __attribute__((noinline)) int decode_block6_exact(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_block5_impl(d, in, avail, dst, raw, 1, 1);
 }
 
 #ifdef LZR_BMI2_DISPATCH
 static __attribute__((noinline)) LZR_TARGET_BMI2 int decode_block5_bmi2(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
-    return decode_block5_impl(d, in, avail, dst, raw, 0);
+    return decode_block5_impl(d, in, avail, dst, raw, 0, 0);
 }
 static __attribute__((noinline)) LZR_TARGET_BMI2 int decode_block6_bmi2(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
-    return decode_block5_impl(d, in, avail, dst, raw, 1);
+    return decode_block5_impl(d, in, avail, dst, raw, 1, 0);
 }
 #endif
 
@@ -638,14 +684,7 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (type >= 4 && raw == 0) return LZR_ERR_CORRUPT;
     if (avail - LZR_BLOCK_HDR < comp) return 0;
     const uint8_t *payload = p + LZR_BLOCK_HDR;
-    if (reset) {   /* reset point: frame-start state, earlier output unused */
-        d->reps[0] = 1; d->reps[1] = 4; d->reps[2] = 8;
-        d->huf.valid = 0;
-        d->hufc.valid = 0;
-        for (int t = 0; t < 3; t++) d->fse[t].valid = 0;
-        tok_model_init(&d->tm);
-        d->seg_start = d->total_out;
-    }
+    if (reset) reset_state(d);   /* reset point: frame-start state, earlier output unused */
 
     if (type == 2) {
         if (d->content_size >= 0 && (uint64_t)d->content_size != d->total_out) return LZR_ERR_CORRUPT;
@@ -678,14 +717,19 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (type == 0) {
         memcpy(dst, payload, raw);
     } else {
-        int r = type == 4 ? decode_tokens(d, payload, comp, dst, raw) : decode_block5(d, payload, comp, dst, raw, type == 6);
+        int r;
+        if (d->exact_end && dst + raw == d->exact_end)
+            r = type == 4 ? decode_tokens_exact(d, payload, comp, dst, raw)
+                          : type == 6 ? decode_block6_exact(d, payload, comp, dst, raw) : decode_block5_exact(d, payload, comp, dst, raw);
+        else
+            r = type == 4 ? decode_tokens_fast(d, payload, comp, dst, raw) : decode_block5(d, payload, comp, dst, raw, type == 6);
         if (r) return r;
     }
     d->op += raw;
     d->total_out += raw;
     d->ipos += LZR_BLOCK_HDR + comp;
     if (d->direct) {
-        xxh64_update(&d->xs, dst, raw);
+        if (!d->nohash) xxh64_update(&d->xs, dst, raw);
         out->len += raw;
         return 1;
     }
@@ -727,4 +771,239 @@ int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size
         d->ipos = 0;
     }
     return LZR_OK;
+}
+
+/* ---------------- parallel one-shot decoding ----------------
+ * A reset point (FORMAT.md 5.5) starts a segment that uses nothing before
+ * it, so segments decode independently once their positions are known.
+ * The block headers give them: one pass over the headers (9 bytes per
+ * 256 KiB block) finds every reset point and the content offset where its
+ * segment starts. (The seek index, skippable block 0x80, holds the same
+ * list for readers that cannot scan, e.g. seeking in a file; it is not
+ * needed here, and not trusted.) Worker threads then decode whole segments
+ * straight into the output buffer, each with its own decoder state. The
+ * last block of a segment is decoded without wildcopy past its end, since
+ * those bytes belong to the next segment. The calling thread hashes the
+ * segments in order as they finish, for the end block's checksum. */
+#ifndef LZR_HAVE_THREADS
+#if defined(_WIN32)
+#define LZR_HAVE_THREADS 0
+#else
+#define LZR_HAVE_THREADS 1
+#endif
+#endif
+#if LZR_HAVE_THREADS
+#include <pthread.h>
+
+typedef struct { size_t off, len; uint64_t coff, clen; } pseg;
+
+typedef struct {
+    const uint8_t *src;
+    size_t n;
+    int version, wlog;
+    pseg *seg;
+    int nseg;
+    uint8_t *obase;         /* output: content offset 0           */
+    size_t ocap;            /* bytes usable from obase             */
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int next;               /* next segment to take                */
+    int *state;             /* per segment: 0 queued, 1 done, <0 error */
+    int stop;
+} pjob;
+
+static int pdec_segment(lzr_dctx *d, pjob *j, int i, lzr_buf *scratch)
+{
+    const pseg *g = &j->seg[i];
+    lzr_buf view = {j->obase, (size_t)g->coff, j->ocap, 1};
+    d->state = ST_BLOCKS;
+    d->version = j->version;
+    d->wsize = (size_t)1 << j->wlog;
+    d->direct = &view;
+    d->content_size = -1;
+    d->total_out = g->coff;
+    reset_state(d);
+    d->exact_end = i + 1 < j->nseg ? j->obase + g->coff + g->clen : NULL;
+    d->nohash = 1;
+
+    lzr_buf own = d->in;   /* the decoder reads the caller's bytes in place */
+    size_t tail = g->len;  /* where the borrowed input lacks read-ahead slack */
+    if (g->off + g->len + ARC_SLACK > j->n) {
+        size_t p = 0;
+        while (p < g->len) {
+            size_t bl = LZR_BLOCK_HDR + rd32le(j->src + g->off + p + 5);
+            if (g->off + p + bl + ARC_SLACK > j->n) { tail = p; break; }
+            p += bl;
+        }
+    }
+    int r = 1;
+    d->in.p = (uint8_t *)(uintptr_t)(j->src + g->off);
+    d->in.len = tail;
+    d->ipos = 0;
+    while (d->ipos < tail && (r = step(d, &view)) == 1) {}
+    if (r == 1 && tail < g->len) {   /* the rest from a padded copy */
+        size_t rest = g->len - tail;
+        scratch->len = 0;
+        if (buf_reserve(scratch, rest + ARC_SLACK)) r = LZR_ERR_NOMEM;
+        else {
+            memcpy(scratch->p, j->src + g->off + tail, rest);
+            memset(scratch->p + rest, 0, ARC_SLACK);
+            d->in.p = scratch->p;
+            d->in.len = rest;
+            d->ipos = 0;
+            while (d->ipos < rest && (r = step(d, &view)) == 1) {}
+        }
+    }
+    d->in = own;
+    d->ipos = 0;
+    d->direct = NULL;
+    d->hist = NULL;
+    if (r != 1) return r < 0 ? r : LZR_ERR_CORRUPT;
+    return d->total_out == g->coff + g->clen ? LZR_OK : LZR_ERR_CORRUPT;
+}
+
+static void *pdec_thread(void *p)
+{
+    pjob *j = (pjob *)p;
+    lzr_dctx *d = lzr_dctx_new();
+    lzr_buf scratch = {0};
+    for (;;) {
+        pthread_mutex_lock(&j->mu);
+        int i = j->stop ? j->nseg : j->next++;
+        pthread_mutex_unlock(&j->mu);
+        if (i >= j->nseg) break;
+        int r = d ? pdec_segment(d, j, i, &scratch) : LZR_ERR_NOMEM;
+        pthread_mutex_lock(&j->mu);
+        j->state[i] = r ? r : 1;   /* the calling thread stops the rest at the first error in frame order */
+        pthread_cond_broadcast(&j->cv);
+        pthread_mutex_unlock(&j->mu);
+    }
+    free(scratch.p);
+    lzr_dctx_free(d);
+    return NULL;
+}
+#endif
+
+static int decompress_serial(const uint8_t *src, size_t n, lzr_buf *out, size_t *consumed)
+{
+    lzr_dctx *d = lzr_dctx_new();
+    if (!d) return LZR_ERR_NOMEM;
+    int r = lzr_dctx_set_output(d, out);
+    if (!r) r = lzr_dctx_write(d, src, n, out, consumed);
+    lzr_dctx_free(d);
+    return r;
+}
+
+int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, size_t *consumed)
+{
+    if (consumed) *consumed = 0;
+#if LZR_HAVE_THREADS
+    int wlog = 0;
+    uint8_t flags = 0;
+    int64_t csize = -1;
+    int hl = lzr_frame_header(src, n, &wlog, &flags, &csize);
+    /* anything unusual goes to the serial decoder, which reports it */
+    if (threads < 2 || hl <= 0 || src[4] < 7 || (flags & LZR_FLAG_X86)) return decompress_serial(src, n, out, consumed);
+
+    pseg *seg = NULL;
+    int nseg = 0, cseg = 0, ok = 0;
+    size_t pos = (size_t)hl, endpos = 0;
+    uint64_t total = 0;
+    for (;;) {
+        if (n - pos < LZR_BLOCK_HDR) break;
+        uint8_t type = src[pos];
+        size_t raw = rd32le(src + pos + 1), comp = rd32le(src + pos + 5);
+        if (comp > n - pos - LZR_BLOCK_HDR || raw > LZR_BLOCK_SIZE) break;
+        if (type & LZR_BT_SKIP) {
+            if (raw) break;
+            pos += LZR_BLOCK_HDR + comp;
+            continue;
+        }
+        unsigned t = type & LZR_BT_TYPE;
+        if (t == 2) {
+            if (type == 2 && raw == 0 && comp == 4) { endpos = pos; ok = 1; }
+            break;
+        }
+        if (t != 0 && t != 4 && t != 5 && t != 6) break;
+        if (!nseg || (type & LZR_BT_RESET)) {
+            if (nseg == cseg) {
+                int nc = cseg ? 2 * cseg : 64;
+                pseg *ns = (pseg *)realloc(seg, (size_t)nc * sizeof(pseg));
+                if (!ns) { free(seg); return LZR_ERR_NOMEM; }
+                seg = ns;
+                cseg = nc;
+            }
+            if (nseg) seg[nseg - 1].len = pos - seg[nseg - 1].off, seg[nseg - 1].clen = total - seg[nseg - 1].coff;
+            seg[nseg].off = pos;
+            seg[nseg].coff = total;
+            nseg++;
+        }
+        total += raw;
+        pos += LZR_BLOCK_HDR + comp;
+    }
+    if (!ok || nseg < 2 || (csize >= 0 && (uint64_t)csize != total) || total > (uint64_t)SIZE_MAX - 1024) {
+        free(seg);
+        return decompress_serial(src, n, out, consumed);
+    }
+    /* the last segment ends at the end block (skippable blocks in between are
+     * skipped by its decoder) */
+    seg[nseg - 1].len = endpos - seg[nseg - 1].off;
+    seg[nseg - 1].clen = total - seg[nseg - 1].coff;
+
+    int r = buf_reserve(out, (size_t)total + LZR_SLACK);
+    int *state = (int *)calloc((size_t)nseg, sizeof(int));
+    if (r || !state) { free(seg); free(state); return r ? r : LZR_ERR_NOMEM; }
+    pjob j;
+    memset(&j, 0, sizeof(j));
+    j.src = src;
+    j.n = n;
+    j.version = src[4];
+    j.wlog = wlog;
+    j.seg = seg;
+    j.nseg = nseg;
+    j.obase = out->p + out->len;
+    j.ocap = out->cap - out->len;
+    j.state = state;
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    int nt = threads < nseg ? threads : nseg, started = 0;
+    pthread_t tid[64];
+    if (nt > 64) nt = 64;
+    for (int t = 0; t < nt; t++)
+        if (pthread_create(&tid[started], NULL, pdec_thread, &j) == 0) started++;
+    if (!started) pdec_thread(&j);
+
+    /* hash the segments in order while the rest decode */
+    xxh64_state xs;
+    xxh64_init(&xs);
+    r = LZR_OK;
+    for (int i = 0; i < nseg && !r; i++) {
+        pthread_mutex_lock(&j.mu);
+        while (!state[i]) pthread_cond_wait(&j.cv, &j.mu);
+        int st = state[i];
+        pthread_mutex_unlock(&j.mu);
+        if (st < 0) {   /* report the first failing segment in frame order */
+            r = st;
+            break;
+        }
+        xxh64_update(&xs, j.obase + seg[i].coff, (size_t)seg[i].clen);
+    }
+    if (r) {   /* stop the others; an earlier segment's error wins */
+        pthread_mutex_lock(&j.mu);
+        j.stop = 1;
+        pthread_mutex_unlock(&j.mu);
+    }
+    for (int t = 0; t < started; t++) pthread_join(tid[t], NULL);
+    pthread_mutex_destroy(&j.mu);
+    pthread_cond_destroy(&j.cv);
+    free(seg);
+    free(state);
+    if (r) return r;
+    out->len += (size_t)total;
+    if (consumed) *consumed = endpos + LZR_BLOCK_HDR + 4;
+    return rd32le(src + endpos + LZR_BLOCK_HDR) == (uint32_t)xxh64_digest(&xs) ? 1 : LZR_ERR_CHECKSUM;
+#else
+    (void)threads;
+    return decompress_serial(src, n, out, consumed);
+#endif
 }

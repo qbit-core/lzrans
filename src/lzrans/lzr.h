@@ -31,6 +31,10 @@
  *   Match lengths are >= LZR_ML_BASE (2); the ml code holds length - 2.
  *   Types 1 and 3 (older formats) are rejected.
  *
+ *   type byte 0x80 = seek index (skippable): per segment u64 frame offset,
+ *                          u64 content offset; u64 content size, u32 count,
+ *                          "LZRX" (FORMAT.md 12.3); written by segment mode
+ *
  * Matches may reach back up to 2^window_log bytes, across block borders.
  * The checksum sits at the end so a stream can be produced without knowing
  * its size in advance.
@@ -64,6 +68,18 @@ typedef struct lzr_cctx lzr_cctx;
 /* window_log 0 = level default. content_size < 0 = unknown. */
 lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size);
 void lzr_cctx_free(lzr_cctx *c);
+/* Segment mode: like lzr_cctx_new, but the content is cut into segments of
+ * seg_size bytes (the last one shorter), each compressed independently
+ * and starting at a reset point, and a seek index (skippable block 0x80)
+ * is written before the end block. Segments decode in parallel
+ * (lzr_decompress_mt). With threads, up to `threads` segments are
+ * compressed at once; the output does not depend on the thread count.
+ * seg_size 0, or a known content_size <= seg_size, gives exactly the
+ * output of lzr_cctx_new. Output is produced a batch of segments at a time. */
+lzr_cctx *lzr_cctx_new_seg(int level, int window_log, int64_t content_size, uint64_t seg_size);
+#define LZR_SEG_MIN ((uint64_t)1 << 20)   /* smallest segment size accepted */
+/* The segment size a level uses by default (0 = no segments). */
+uint64_t lzr_default_segment(int level);
 /* Worker threads (1 = none). Levels 9-11: match finder threads, output
  * identical for any thread count. Levels 1-6: parallel 4 MB jobs, output
  * identical for any thread count > 1 (and ~0.1% larger than with one).
@@ -92,6 +108,14 @@ int lzr_dctx_write(lzr_dctx *d, const uint8_t *src, size_t n, lzr_buf *out, size
  * output is the history): no copy, no history allocation. Call before the
  * first write. Ignored for x86-filtered frames. */
 int lzr_dctx_set_output(lzr_dctx *d, lzr_buf *out);
+
+/* One-shot decode of a whole frame src[0..n) into out, with up to
+ * `threads` threads decoding segments (reset points) in parallel. Frames
+ * without reset points, legacy versions and x86-filtered frames are
+ * decoded by one thread. Same result and error kinds as lzr_dctx_write in
+ * one-buffer mode; *consumed = frame length. Returns 1 at the verified end,
+ * 0 if the frame is truncated, or LZR_ERR_*. */
+int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, size_t *consumed);
 
 /* Parse the frame header only. Returns header length, or LZR_ERR_*. */
 int lzr_frame_header(const uint8_t *src, size_t n, int *window_log, uint8_t *flags, int64_t *content_size);
