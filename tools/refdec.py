@@ -125,12 +125,14 @@ class BackBits:
 HUF_MAXLEN = 11
 
 
-def huf_table(lengths):
+def huf_table(lengths, strict):
     """Decoding table (2^11 entries of (symbol, length)) from code lengths,
-    canonical codes as in DEFLATE (section 6.3.1)."""
+    canonical codes as in DEFLATE (section 6.3.1). strict (version 7): the
+    code must be complete."""
     _need(all(l <= HUF_MAXLEN for l in lengths), "Huffman code length > 11")
     kraft = sum(1 << (HUF_MAXLEN - l) for l in lengths if l)
     _need(0 < kraft <= 1 << HUF_MAXLEN, "Huffman lengths oversubscribed or empty")
+    _need(not strict or kraft == 1 << HUF_MAXLEN, "incomplete Huffman code")
     bl_count = [0] * (HUF_MAXLEN + 1)
     for l in lengths:
         if l:
@@ -249,6 +251,7 @@ class Frame:
         self.ctx = None                   # type 6 tables: (cmap, [tables])
         self.fse = [None, None, None]     # sequence tables (6.4.3 mode 0/1)
         self.tok = TokModel()             # type 4 model (7)
+        self.seg = 0                      # start of the current segment (5.5)
 
 
 # ------------------------------------------------- 6. block types 5 and 6
@@ -267,24 +270,25 @@ def huf_literals(p, k, n, fr):
     if mode == 2:
         lens, k = read_lengths(p, k)
         fr.huf = None
-        fr.huf = huf_table(lens)
+        fr.huf = huf_table(lens, fr.version >= 7)
     elif mode != 3 or fr.huf is None:
         raise FormatError("bad literal mode %d" % mode)
-    _need(k + 12 <= len(p), "truncated stream sizes")
-    sizes = list(struct.unpack_from("<3I", p, k))
-    k += 12
+    nsz = 4 if fr.version >= 7 else 3      # v5/v6: stream 3's size is implicit
+    _need(k + 4 * nsz <= len(p), "truncated stream sizes")
+    sizes = list(struct.unpack_from("<%dI" % nsz, p, k))
+    k += 4 * nsz
     _need(sum(sizes) <= len(p) - k, "stream sizes past the payload")
     q = (n + 3) // 4
     out = bytearray()
     start = k
     for st in range(4):
         cnt = max(0, min((st + 1) * q, n) - min(st * q, n))
-        end = start + sizes[st] if st < 3 else len(p)
+        end = start + sizes[st] if st < nsz else len(p)
         bits = FwdBits(p, start, end)
         for _ in range(cnt):
             out.append(huf_sym(bits, fr.huf))
         used = bits.used_bytes()
-        if st < 3:
+        if st < nsz:
             _need(used == sizes[st], "Huffman stream %d does not end at its size" % st)
         start += used
     return bytes(out), start
@@ -310,7 +314,7 @@ def ctx_header(p, k, fr):
     tables = []
     for _ in range(K):
         lens, k = read_lengths(p, k)
-        tables.append(huf_table(lens))
+        tables.append(huf_table(lens, fr.version >= 7))
     fr.ctx = (cmap, tables)
     return k
 
@@ -332,7 +336,7 @@ def decode_seq_block(p, raw, fr, ctx):
         lend = k + sz
         k += sz
         cmap, tables = fr.ctx
-        prev = [fr.out[-1] if fr.out else 0]
+        prev = [fr.out[-1] if len(fr.out) > fr.seg else 0]
 
         def take(n):
             o = bytearray()
@@ -413,7 +417,7 @@ def decode_seq_block(p, raw, fr, ctx):
         else:
             out += lits[li:li + ll]
         li += ll
-        _need(dist <= len(out) and dist <= fr.wsize, "distance too far")
+        _need(dist <= len(out) - fr.seg and dist <= fr.wsize, "distance too far")
         for _ in range(ml):
             out.append(out[-dist])
         if ctx:
@@ -522,12 +526,13 @@ def decode_tok_block(p, raw, fr):
     start = len(out)
     while len(out) - start < raw:
         _need(rc.i <= len(p), "range coder overrun")
-        ps, s = (len(out) - start) & 3, m.state
+        # pos: version 7 segment position, versions 5-6 block position
+        ps, s = (len(out) - (fr.seg if fr.version >= 7 else start)) & 3, m.state
         if not rc.bit(m.is_match[s], ps):                          # literal
-            probs = m.lit[(out[-1] if out else 0) >> 5]
+            probs = m.lit[(out[-1] if len(out) > fr.seg else 0) >> 5]
             fr.feat.add("t4.lit.%s" % ("matched" if s >= 7 else "plain"))
             if s >= 7:
-                _need(fr.reps[0] <= len(out), "matched literal before content start")
+                _need(fr.reps[0] <= len(out) - fr.seg, "matched literal before segment start")
                 mbyte, v, same = out[-fr.reps[0]], 1, True
                 for i in range(7, -1, -1):
                     mb = (mbyte >> i) & 1
@@ -564,7 +569,7 @@ def decode_tok_block(p, raw, fr):
                 dist = r[0]
                 if not rc.bit(m.is_rep0_long[s], ps):              # short rep
                     fr.feat.add("t4.shortrep")
-                    _need(dist <= len(out), "distance before content start")
+                    _need(dist <= len(out) - fr.seg, "distance before segment start")
                     out.append(out[-dist])
                     m.state = 9 if s < 7 else 11
                     continue
@@ -580,7 +585,7 @@ def decode_tok_block(p, raw, fr):
             fr.feat.add("t4.rep" if dist == r[0] else "t4.repN")
             m.state = 8 if s < 7 else 11
         _need(ln <= raw - (len(out) - start), "match past the block")
-        _need(dist <= len(out) and dist <= fr.wsize, "distance too far")
+        _need(dist <= len(out) - fr.seg and dist <= fr.wsize, "distance too far")
         for _ in range(ln):
             out.append(out[-dist])
     _need(rc.i == len(p), "range coder did not end at the payload end")
@@ -610,7 +615,7 @@ def x86_unfilter(buf):
 def parse_header(data):
     _need(len(data) >= 8 and data[:4] == b"LZRN", "bad magic or truncated header")
     ver, flags, wlog, res = data[4], data[5], data[6], data[7]
-    if ver < 5 or ver > 6:
+    if ver < 5 or ver > 7:
         raise UnsupportedError("frame version %d" % ver)
     if flags & ~0x06:
         raise UnsupportedError("flags 0x%02x" % flags)
@@ -629,14 +634,27 @@ def blocks(data):
     while True:
         _need(pos + 9 <= len(data), "truncated block header")
         t, raw, comp = data[pos], *struct.unpack_from("<II", data, pos + 1)
-        _need(t in (0, 2, 4, 5, 6) and not (t == 6 and ver < 6), "bad block type %d" % t)
         _need(raw <= BLOCK_MAX and comp <= 2 * BLOCK_MAX + 65536, "block too large")
+        reset = False
+        if ver >= 7:                          # 3.2.1 block type byte
+            if t & 0x80:                      # skippable
+                _need(raw == 0, "skippable block with raw_len != 0")
+                _need(pos + 9 + comp <= len(data), "truncated block")
+                pos += 9 + comp
+                yield ("skip", t, comp)
+                continue
+            reset, t = bool(t & 0x40), t & 0x3F
+            if t > 6:
+                raise UnsupportedError("block type %d" % t)
+            _need(not (reset and t == 2), "reset bit on the end block")
+            _need(t < 4 or comp <= raw, "comp_len > raw_len")
+        _need(t in (0, 2, 4, 5, 6) and not (t == 6 and ver < 6), "bad block type %d" % t)
         _need(t != 0 or comp == raw, "stored block: comp_len != raw_len")
         _need(t != 2 or (raw == 0 and comp == 4), "bad end block")
         _need(t < 4 or raw > 0, "empty compressed block")
         _need(pos + 9 + comp <= len(data), "truncated block")
         pos += 9 + comp
-        yield ("block", t, raw, data[pos - comp:pos], pos)
+        yield ("block", t, raw, data[pos - comp:pos], pos, reset)
         if t == 2:
             return
 
@@ -657,7 +675,14 @@ def decode(data, allow_trailing=False, features=None):
             if flags & 4:
                 fr.feat.add("flag.x86")
             continue
-        _, t, raw, p, end = ev
+        if ev[0] == "skip":
+            fr.feat.add("block.skippable")
+            continue
+        _, t, raw, p, end, reset = ev
+        if reset:                             # 5.5 reset point
+            fr.feat.add("reset")
+            fr.reps, fr.huf, fr.ctx, fr.fse, fr.tok = [1, 4, 8], None, None, [None, None, None], TokModel()
+            fr.seg = len(fr.out)
         if t == 2:
             _need(allow_trailing or end == len(data), "trailing data after the frame")
             _need(fr.content_size is None or fr.content_size == len(fr.out), "content size mismatch")
@@ -686,12 +711,14 @@ def trace(data):
             _, ver, flags, wlog, size = ev
             lines.append("header version=%d flags=0x%02x window_log=%d content_size=%s" % (ver, flags, wlog, size))
         elif ev[0] == "block":
-            _, t, raw, p, _ = ev
+            _, t, raw, p, _, reset = ev
             extra = ""
             if t in (5, 6) and len(p) >= 8:
                 ns, nl = struct.unpack_from("<II", p, 0)
                 extra = " nseq=%d nlit=%d lit_mode=%d" % (ns, nl, p[8] if nl else -1)
-            lines.append("block type=%d raw=%d comp=%d%s" % (t, raw, len(p), extra))
+            lines.append("block type=%d%s raw=%d comp=%d%s" % (t, " reset" if reset else "", raw, len(p), extra))
+        elif ev[0] == "skip":
+            lines.append("skippable block 0x%02x comp=%d" % (ev[1], ev[2]))
     return "\n".join(lines)
 
 

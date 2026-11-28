@@ -359,7 +359,7 @@ def _block_types(blob):
 @pytest.mark.parametrize("level,btype", [(0, 5), (1, 5), (6, 5), (7, 5), (8, 5), (10, 5), (11, 4)])
 def test_block_type_by_level(level, btype):
     blob = lzrans.compress(_text(3 * BS), level=level)
-    assert blob[4] == 6                              # format version
+    assert blob[4] == 7                              # format version
     assert set(_block_types(blob)) == {btype, 2}
 
 
@@ -462,15 +462,8 @@ def test_no_type_6_outside_levels_9_10(level):
     assert 6 not in _block_types(lzrans.compress(_markov(3 * BS), level=level))
 
 
-def test_version_5_frames_still_decode():
-    data = _text(2 * BS, 3)
-    blob = bytearray(lzrans.compress(data, level=1))   # type 5 blocks only
-    assert blob[4] == 6
-    blob[4] = 5
-    assert lzrans.decompress(bytes(blob)) == data
-    # a type 6 block is not valid in a version 5 frame
-    blob6 = bytearray(lzrans.compress(_markov(2 * BS), level=9))
-    assert 6 in _block_types(blob6)
-    blob6[4] = 5
-    with pytest.raises(lzrans.LzransError):
-        lzrans.decompress(bytes(blob6))
+def test_writes_format_version_7():
+    # Versions 5 and 6 still decode: see the frozen vectors in
+    # tests/test_vectors.py (enc-version5, the other enc-* are version 6).
+    assert lzrans.FORMAT_VERSION == 7
+    assert lzrans.compress(b"abc" * 1000, level=1)[4] == 7

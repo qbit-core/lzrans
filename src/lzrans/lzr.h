@@ -1,14 +1,16 @@
 /*
- * lzr.h - public C API of the lzrans core (frame format v6, streaming;
- * full specification: docs/FORMAT.md;
- * v5 frames, which have no type 6 blocks, still decode).
+ * lzr.h - public C API of the lzrans core (frame format v7 = LZR 1.0,
+ * streaming; full specification: docs/FORMAT.md; v5 and v6 frames still
+ * decode). Summary of v7 below; see FORMAT.md for v5/v6 differences.
  *
  * Frame layout (little-endian):
- *   "LZRN" | version u8 (=6) | flags u8 | window_log u8 | reserved u8
+ *   "LZRN" | version u8 (=7) | flags u8 | window_log u8 | reserved u8
  *   [content_size u64]                       if flags & LZR_FLAG_SIZE
  *   block*                                   until an end block
  *
  *   block header: type u8 | raw_len u32 | comp_len u32 | payload[comp_len]
+ *     type byte: bit 7 skippable (raw_len 0, payload ignored), else bits
+ *     0-5 the type and bit 6 a reset point; types 7-63 unsupported
  *     type 0  stored:      payload = raw_len bytes
  *     type 2  end:         raw_len = 0, payload = low 32 bits of the XXH64
  *                          (seed 0) of all content (u32)
@@ -38,7 +40,7 @@
 #include "common.h"
 
 #define LZR_MAGIC          "LZRN"
-#define LZR_VERSION        6
+#define LZR_VERSION        7   /* format 1.0 */
 #define LZR_VERSION_MIN    5   /* oldest frame version still decoded */
 #define LZR_FLAG_ENCRYPTED 0x01u   /* reserved: future AEAD envelope       */
 #define LZR_FLAG_SIZE      0x02u   /* header carries the content size       */
@@ -47,6 +49,12 @@
 #define LZR_FILTER_NONE    0
 #define LZR_FILTER_X86     1
 #define LZR_BLOCK_HDR      9
+/* Block type byte, frame version >= 7: bit 7 = skippable block (raw_len 0,
+ * payload ignored), else bits 0-5 = type, bit 6 = reset point (decoder
+ * state back to frame-start values; nothing before the block is used). */
+#define LZR_BT_SKIP        0x80u
+#define LZR_BT_RESET       0x40u
+#define LZR_BT_TYPE        0x3Fu
 #define LZR_LEVEL_MIN     -3
 #define LZR_LEVEL_MAX     11
 

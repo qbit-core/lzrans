@@ -1,15 +1,10 @@
 # The LZR compressed data format
 
-**Version 1.0-draft** (describes frame versions 5 and 6, as written and read by lzrans at commit `10f73c8`)
+**Version 1.0** (frame version 7). Also defines how to read legacy frame versions 5 and 6 (Appendix C).
 
-**Status:** draft for the 1.0 format freeze. Everything in sections 3 to 11 is what the current decoder (`src/lzrans/dec.c`) accepts, byte for byte. Two parts are not settled yet:
+**Status:** frozen once this document is merged. From then on, the format changes only as section 12 allows: new block types and features are added behind a feature flag or a new version number, and nothing a 1.0 decoder accepts changes meaning. Appendix A records the decisions taken for the freeze.
 
-* **Appendix A** lists format problems worth fixing *before* the freeze. Some of the fixes change the bitstream, so they need a decision.
-* **Section 12** describes the extension mechanism proposed for 1.0. Another branch of work (a long-range dedup layer) may add a block type. Section 12 reserves room for that.
-
-Until this document drops the "-draft" label, a new lzrans release may still change the format. After the freeze, the format may only change as section 12 allows.
-
-A second decoder, `tools/refdec.py` (pure Python, about 700 lines), was written from this document alone. It decodes every golden vector in `tests/vectors/` (section 13) and everything the current encoder produces at levels -3 to 11, with the same result as the C decoder. Treat any difference between this text, `refdec.py` and `dec.c` as a bug in this document.
+A second decoder, `tools/refdec.py` (pure Python, about 730 lines), was written from this document alone. It decodes every golden vector in `tests/vectors/` (section 13) and everything the current encoder produces at levels -3 to 11, with the same result as the C decoder (`src/lzrans/dec.c`). Treat any difference between this text, `refdec.py` and `dec.c` as a bug.
 
 ---
 
@@ -22,7 +17,7 @@ frame  = header  block*  end-block
 ```
 
 * The **header** (section 3.1) carries a magic number, the frame version, flags, and the window size. It can also carry the content size.
-* **Blocks** (section 3.2) each decode to at most 256 KiB of content. Blocks are decoded in order. A block may copy bytes from earlier blocks, up to the window size back. A block may also reuse coding tables or model state left by earlier blocks.
+* **Blocks** (section 3.2) each decode to at most 256 KiB of content. Blocks are decoded in order. A block may copy bytes from earlier blocks, up to the window size back. A block may also reuse coding tables or model state left by earlier blocks. A block marked as a **reset point** (section 5.5) depends on nothing before it, so the stretch from one reset point to the next can be decoded on its own: in parallel, or after a seek. **Skippable blocks** (section 3.2) carry data that does not change the content.
 * The **end block** carries a checksum of the content (section 9).
 
 Most of the format is LZ77: sequences of *literal bytes* and *matches* that copy bytes from the decoded output. There are three ways to code a block:
@@ -62,7 +57,7 @@ Constants used throughout:
 ```
 offset size field
 0      4    magic        "LZRN" (4C 5A 52 4E)
-4      1    version      5 or 6
+4      1    version      7 (5 and 6: legacy, Appendix C)
 5      1    flags
 6      1    window_log   18..26
 7      1    reserved     0
@@ -71,7 +66,7 @@ offset size field
 
 The header is 8 bytes long, or 16 if it carries `content_size`.
 
-**version.** This document defines versions 5 and 6. They differ in one way: block type 6 is only valid in version 6 frames. A decoder MUST reject any other version as *unsupported*. A decoder for this document MUST accept both 5 and 6.
+**version.** This document defines version 7, the 1.0 format. A 1.0 decoder MUST also read versions 5 and 6, which are older lzrans formats with a few differences listed in Appendix C. It MUST reject any other version as *unsupported*. A higher version means a newer format, which this decoder cannot read (section 12).
 
 **flags.**
 
@@ -80,7 +75,7 @@ The header is 8 bytes long, or 16 if it carries `content_size`.
 | 0 | 0x01 | ENCRYPTED | reserved for a future encryption envelope; never set in valid frames |
 | 1 | 0x02 | SIZE | the header carries `content_size` |
 | 2 | 0x04 | X86 | the content went through the x86 filter (section 8) |
-| 3-7 | 0xF8 | | reserved |
+| 3-7 | 0xF8 | | reserved for required features (section 12) |
 
 A decoder MUST reject a frame as *unsupported* if any flag other than SIZE or X86 is set. That includes ENCRYPTED.
 
@@ -96,24 +91,37 @@ Each block starts with a 9-byte header:
 
 ```
 offset size field
-0      1    type      0, 2, 4, 5 or 6
+0      1    type byte
 1      4    raw_len   u32: content bytes this block decodes to
 5      4    comp_len  u32: bytes of payload that follow
 9      comp_len  payload
 ```
 
-A decoder MUST reject the frame as corrupt if any of these hold:
+#### 3.2.1 Type byte
 
-* `type` is 1, 3, or greater than 6. Types 1 and 3 belonged to pre-release formats. For 7 and up, see section 12.
-* `type` is 6 and the frame version is 5.
-* `raw_len > BLOCK_MAX` or `comp_len > COMP_MAX`.
-* `type` is 0 and `comp_len != raw_len`.
-* `type` is 2 and (`raw_len != 0` or `comp_len != 4`).
-* `type` is 4, 5 or 6 and `raw_len == 0`.
+| Bits | Meaning |
+|---|---|
+| bit 7 = 1 | **skippable block**. The decoder skips its payload. Bits 0-6 name the kind of data (section 12.2). |
+| bit 7 = 0 | a data block: bits 0-5 are the **block type**, bit 6 is the **reset** bit (section 5.5) |
 
-These checks use only the header, so a decoder can make them before the payload arrives. A block's payload MUST decode to exactly `raw_len` bytes. Section 10 gives the other per-type checks.
+Block types: 0 stored, 2 end, 4 tokens, 5 sequences, 6 context sequences. Types 1 and 3 belonged to pre-release formats and are invalid. Types 7-63 are reserved for newer formats.
 
-**Type 0, stored.** The payload is `raw_len` content bytes. A stored block may be empty (`raw_len == 0`). A stored block does not change any decoder state except the history (section 5.2).
+#### 3.2.2 Checks
+
+These checks use only the header, so a decoder can make them before the payload arrives. In this order, a decoder MUST reject the frame:
+
+1. as corrupt if `raw_len > BLOCK_MAX` or `comp_len > COMP_MAX`;
+2. skippable block: as corrupt if `raw_len != 0`; otherwise it skips `comp_len` bytes, and nothing else changes;
+3. as *unsupported* if the block type is 7..63;
+4. as corrupt if the block type is 1 or 3;
+5. as corrupt if:
+   * the type is 2 (end) with the reset bit set, or `raw_len != 0`, or `comp_len != 4`;
+   * the type is 0 and `comp_len != raw_len`;
+   * the type is 4, 5 or 6 and `raw_len == 0` or `comp_len > raw_len`.
+
+A data block's payload MUST decode to exactly `raw_len` bytes. Sections 6, 7 and 10 give the other checks.
+
+**Type 0, stored.** The payload is `raw_len` content bytes. A stored block may be empty (`raw_len == 0`). A stored block does not change any decoder state except the history (section 5.2). (A stored block with the reset bit still makes a reset point.)
 
 **Type 2, end.** The payload is a `u32`: the low 32 bits of the XXH64 checksum of the content (section 9). The frame ends right after this block. Any bytes after it are not part of the frame (section 10.3).
 
@@ -165,7 +173,7 @@ Some state lives for the whole frame. It starts at the values below when the fra
 | tANS tables for LL, ML, OF | none | types 5 and 6, table mode 0 (6.4) |
 | type 4 model and state | section 7.2 | type 4 |
 
-Stored blocks and end blocks change none of this. Block types share state: a type 5 block after a type 4 block sees the repeat offsets the type 4 block left. Types 5 and 6 share the tANS tables. The type 5 Huffman table survives type 6 blocks, and the type 6 tables survive type 5 blocks.
+Stored blocks and end blocks change none of this, and skippable blocks change nothing at all. A reset point (5.5) sets all of it back to the initial values. Block types share state: a type 5 block after a type 4 block sees the repeat offsets the type 4 block left. Types 5 and 6 share the tANS tables. The type 5 Huffman table survives type 6 blocks, and the type 6 tables survive type 5 blocks.
 
 ### 5.3 Repeat offsets
 
@@ -186,7 +194,16 @@ A match `(length L, distance D)` at decoded-stream position `o` copies `L` bytes
 for j in range(L): out[o + j] = out[o + j - D]
 ```
 
-When `D < L` the copy overlaps itself, which repeats the last `D` bytes. A match is corrupt if `D > o` (it reaches before the start of the frame's decoded stream), if `D > W`, or if it runs past the block's `raw_len`. Matches never span block boundaries, but they may copy from any earlier block within the window.
+When `D < L` the copy overlaps itself, which repeats the last `D` bytes. A match is corrupt if `D > o - seg` (it reaches before the start of the current segment, 5.5), if `D > W`, or if it runs past the block's `raw_len`. Matches never span block boundaries, but they may copy from any earlier block of the segment within the window.
+
+### 5.5 Reset points and segments
+
+A data block whose type byte has the reset bit set is a **reset point**. Before decoding it, the decoder:
+
+* sets every piece of state in 5.2 back to its initial value (repeat offsets 1, 4, 8; no Huffman, context or tANS tables; a fresh type 4 model, state 0);
+* sets `seg`, the start of the current **segment**, to the current decoded-stream position. At the start of the frame, `seg` is 0.
+
+Inside a segment, nothing before `seg` is used: a match may not reach before it (5.4), and every "previous byte" or "match byte" before `seg` reads as 0 or is corrupt as stated where it is used (6.6, 7.2, 7.4). The type 4 position context counts from `seg` (7.2). So a decoder can decode a segment knowing only where it starts in the frame. Encoders do not have to emit reset points. A future seek index (a skippable block, 12.2) will list them.
 
 ## 6. Block types 5 and 6
 
@@ -230,7 +247,7 @@ for s in 0..255 with len[s] > 0: code[s] = next_code[len[s]]; next_code[len[s]] 
 
 A code `c` of length `l` is stored with its most significant bit first in the bit stream (section 4.1).
 
-**Incomplete codes (K < 2^11).** These are currently allowed. A decoder MUST behave as if every 11-bit pattern with no matching code decodes to symbol 0 and uses 11 bits. A valid stream never contains such a pattern. Appendix A, item A5, proposes to forbid incomplete codes.
+The code MUST be **complete**: `K == 2^11`. Otherwise the table is corrupt. (So a table needs at least two symbols. A block whose literals are all one byte value uses the run mode, 6.3.3.)
 
 #### 6.3.2 Table description
 
@@ -253,13 +270,15 @@ mode u8
   3  repeat:    the streams below, coded with the frame's Huffman literal table
                 (corrupt if no mode 2 section came earlier in the frame)
 modes 2 and 3:
-  size0 u32, size1 u32, size2 u32    byte lengths of streams 0-2
+  size0 u32, size1 u32, size2 u32, size3 u32    byte lengths of streams 0-3
   stream0 | stream1 | stream2 | stream3
 ```
 
 Any other mode is corrupt. Modes 0 and 1 leave the frame's Huffman table as it was. In mode 2, if the table description is corrupt, the frame is corrupt.
 
-The `nlit` literals are split into four runs. With `q = ceil(nlit / 4)`, stream `k` (k = 0..3) holds literals `[min(k*q, nlit), min((k+1)*q, nlit))`. Some streams may be empty. Each stream is a forward bit stream (4.1). Streams 0-2 have the byte lengths given, and each MUST end exactly at its length (4.1). Stream 3 starts right after stream 2. **Its length is not stored:** it ends at the byte where its last literal ends, and the literal section ends there too. The section is corrupt if `size0 + size1 + size2` reaches past the payload, or if stream 3 would read past the payload. (Appendix A, item A3, proposes to store the length.)
+The `nlit` literals are split into four runs. With `q = ceil(nlit / 4)`, stream `k` (k = 0..3) holds literals `[min(k*q, nlit), min((k+1)*q, nlit))`. Some streams may be empty. Each stream is a forward bit stream (4.1) of the byte length given, and it MUST end exactly at that length (4.1). The streams follow each other with no gap, and the literal section ends after stream 3. The section is corrupt if the four sizes add up to more than the rest of the payload.
+
+Because every size is stored, a decoder knows where the sequence section starts before decoding any literal. It can decode the four literal streams and the sequences in parallel.
 
 ### 6.4 tANS tables
 
@@ -357,7 +376,7 @@ stream                       one forward bit stream (4.1) of `size` bytes
 
 Any other mode, or `K` outside 1..8, is corrupt. Each table follows 6.3.1. Mode 0 replaces the frame's context tables.
 
-Literals are decoded *while the sequences run* (6.7), in content order. Each literal is decoded with table `cmap[prev]`, where `prev` is the byte just before it in the decoded stream. At the start of the frame, `prev` is 0. After a match, `prev` is the last byte the match copied. After all `nlit` literals, the stream MUST end as in 4.1.
+Literals are decoded *while the sequences run* (6.7), in content order. Each literal is decoded with table `cmap[prev]`, where `prev` is the byte just before it in the decoded stream. At the start of a segment (5.5), and so of the frame, `prev` is 0. After a match, `prev` is the last byte the match copied. After all `nlit` literals, the stream MUST end as in 4.1.
 
 ### 6.7 Sequence section
 
@@ -433,7 +452,7 @@ All probabilities start at 2048. They are reset only at the start of a frame.
 | `align` | 16 | node |
 | `mlen`, `rlen` | each: `choice`, `choice2`, `low[4][8]`, `mid[4][8]`, `high[256]` | |
 
-`pos` is the decoded-stream position **relative to the start of the block**, modulo 4. (Appendix A, item A7: LZMA uses the absolute position.) `prev` is the byte before the current position in the decoded stream, or 0 at the start of the frame. The state starts at 0.
+`pos` is the decoded-stream position **relative to the start of the segment** (5.5), modulo 4; without reset points, that is the content position. `prev` is the byte before the current position in the decoded stream, or 0 at the start of a segment. The state starts at 0.
 
 ### 7.3 State transitions
 
@@ -453,7 +472,7 @@ if bit(is_match[s][pos]) == 0:                     # literal
   probs = lit[prev >> 5]
   if s < 7: byte = tree(probs, 8)
   else:                                            # "matched" literal
-    (corrupt if rep[0] > bytes decoded so far)
+    (corrupt if rep[0] > bytes decoded so far in the segment)
     mbyte = out[o - rep[0]]; v = 1; same = true
     for i = 7 down to 0:
       mb = (mbyte >> i) & 1
@@ -532,7 +551,7 @@ A frame has no other checksum: not for the header, not per block. Streaming deco
 
 | Kind | When |
 |---|---|
-| **unsupported** | version not 5 or 6; a reserved flag set |
+| **unsupported** | version not 5, 6 or 7; a reserved flag set; block type 7-63 (version 7) |
 | **corrupt** | anything else this document calls corrupt, including a truncated frame |
 | **checksum** | the end block's checksum does not match |
 
@@ -550,7 +569,7 @@ A frame ends after its end block. What follows is outside the frame. The lzrans 
 
 * A **conforming decoder** decodes every valid frame to its content. It rejects every frame this document calls corrupt, unsupported or a checksum failure, with the kind given. Implementations may merge "corrupt" and "unsupported" into one error, as lzrans' Python API does today, but SHOULD keep them apart.
 * A **conforming encoder** produces only valid frames. It need not use every feature.
-* Encoders MUST NOT depend on the incomplete-code rule in 6.3.1, or on padding bits being ignored.
+* Encoders MUST NOT depend on padding bits being ignored.
 
 ## 11. Limits and resources
 
@@ -558,7 +577,7 @@ A frame ends after its end block. What follows is outside the frame. The lzrans 
 |---|---|
 | content size | < 2^63 bytes |
 | block content | ≤ 2^18 bytes |
-| block payload | ≤ 589824 bytes |
+| block payload | ≤ `raw_len` (types 4-6); ≤ 589824 bytes (any block) |
 | match distance | ≤ 2^window_log ≤ 64 MiB |
 | sequences per block | ≤ 131073 |
 | match length | type 5/6: ≤ 2^18; type 4 token: ≤ 273 |
@@ -567,68 +586,75 @@ A decoder needs about `2^window_log + 2^18` bytes of history, plus one block of 
 
 ## 12. Versioning and extension
 
-### 12.1 Today (versions 5 and 6)
+The rules below let the format grow without changing what a 1.0 decoder accepts.
 
-Today, any new block type or flag needs a new frame version. A decoder rejects unknown versions and flags as *unsupported*, and unknown block types as *corrupt*. There is no way to add optional data that old decoders can skip.
+**Version byte.** 7 is LZR 1.0. A change that old decoders must not misread (a different meaning for existing bytes) needs a new version number. Decoders reject versions they do not know as *unsupported*. Versions 5 and 6 stay readable (Appendix C).
 
-### 12.2 Proposed for 1.0 (not implemented)
+**Required features.** A new block type that changes the content (for example the long-range dedup layer being prototyped) takes a number from 7-63 and a flag bit from 3-7 that frames using it MUST set. A 1.0 decoder then stops at the header with *unsupported*, before writing any output. If a decoder still meets an unknown type 7-63 (a frame without the flag), it reports *unsupported*, not *corrupt*, so users can tell "needs a newer decoder" from "damaged".
 
-This proposal is part of the freeze decision (Appendix A, items A1 and A2):
+**Skippable blocks.** A type byte of 0x80 or more marks a skippable block (3.2.1). Its `raw_len` is 0, and decoders that do not know it skip `comp_len` bytes. Skippable blocks are for data that does not change the content: a seek index, a dedup manifest, encoder information. Kinds (bits 0-6) are assigned as they are defined:
 
-* **Frame version.** The frozen format gets one version byte value, called `V1` below (6, or 7 if bitstream fixes are made). Decoders keep reading 5 and 6. Versions above `V1` are *unsupported*.
-* **Block type ranges.**
+| Type byte | Kind |
+|---|---|
+| 0x80 | seek index (reserved; format to be defined with the parallel decoder) |
+| 0x81-0xFF | unassigned |
 
-  | Types | Use |
-  |---|---|
-  | 0-6 | defined here (1 and 3 stay invalid) |
-  | 7-63 | future **required** block types. A decoder that does not know one MUST stop with *unsupported*, not *corrupt*, so users can tell "needs a newer decoder" from "damaged". New required types must be announced by a feature flag or a version bump, so old decoders fail at the header, not halfway through the content. |
-  | 64-127 | reserved |
-  | 128-191 | **skippable** blocks: `raw_len` MUST be 0, and decoders that do not know the type skip `comp_len` bytes. For metadata that does not change the content: a seek index, a dedup manifest, the encoder name. |
-  | 192-255 | reserved |
-
-* **Feature flags.** Flag bits 3-7 stay reserved. A future required feature (for example the long-range dedup layer being prototyped now) sets a flag bit. Decoders without it reject the frame at the header.
-* **Reset points** (A1): a way to mark a block as starting a new independent segment, so segments can be decoded in parallel and a seek index can point into them.
+A decoder MUST NOT change the decoded content because of a skippable block it knows. It may use one, for example to find reset points.
 
 ## 13. Test vectors
 
-`tests/vectors/` holds 55 frozen vectors, listed in `tests/vectors/manifest.json` with the expected outcome. For each valid frame it gives the size and SHA-256 of the content and the format features it uses. For each invalid frame it gives the error kind.
+`tests/vectors/` holds frozen vectors, listed in `tests/vectors/manifest.json` with the expected outcome. For each valid frame it gives the size and SHA-256 of the content and the format features it uses. For each invalid frame it gives the error kind.
 
-* `enc-*`: written by the C encoder (all block types, every table mode, x86, window logs 18-26, streaming and one-shot headers, version 5).
-* `hand-*`: built byte by byte by `tools/make_vectors.py`, for cases the encoder never writes. These are the initial repeat offsets, single-symbol tables with an empty bit stream, literal-only blocks, an empty stored block, a stored block between type 5 blocks that share tables, and a type 5 block that uses repeat offsets left by a type 4 block.
-* `bad-*`: invalid frames, one fault each: header fields, block header limits, a wrong checksum or content size, truncation, trailing data, bit streams not consumed exactly, malformed tANS or Huffman tables, oversized extra-bit reads, and malformed type 4 payloads.
+* `enc-*`: written by the C encoder (all block types, every table mode, x86, window logs 18-26, streaming and one-shot headers).
+* `reset-splice-*`, `skippable-blocks`: two independent encoder frames joined at a reset point (types 4, 5 and 6), and skippable blocks between data blocks.
+* `hand-*`: built byte by byte by `tools/make_vectors.py`, for cases the encoder never writes. These are the initial repeat offsets and their reset, single-symbol tables with an empty bit stream, literal-only blocks, an empty stored block, a hand-coded Huffman section, a stored block between type 5 blocks that share tables, and a type 5 block that uses repeat offsets left by a type 4 block.
+* `bad-*`: invalid frames, one fault each, with the error kind: header fields, type bytes (unknown types are *unsupported*), reset and skippable misuse, block limits, a wrong checksum or content size, truncation, trailing data, bit streams not consumed exactly, malformed tANS or Huffman tables (including incomplete codes and a wrong stream 3 size), oversized extra-bit reads, and malformed type 4 payloads.
+* `v5-*`, `v6-*`: frames of the legacy versions, frozen when the format was version 6.
 
-`tests/test_vectors.py` checks every vector with the C decoder (one-shot and streaming) and with `tools/refdec.py`. It also checks that together the vectors cover every feature listed in this document. The vectors are frozen: `tools/make_vectors.py` adds new ones but keeps the committed bytes of existing ones.
+`tests/test_vectors.py` checks every vector with the C decoder (one-shot and streaming, including the error kind) and with `tools/refdec.py`. It also checks that the version 7 vectors cover every feature in this document. The vectors are frozen: `tools/make_vectors.py` adds new ones but keeps the committed bytes of existing ones.
 
 ## 14. Encoder notes (non-normative)
 
-* A block is stored whenever its coded form would not be smaller than `raw_len`. So in today's frames, `comp_len < raw_len` for types 4-6.
+* A block is stored whenever its coded form would not be smaller than `raw_len`, which also keeps `comp_len <= raw_len` (3.2.2).
+* The encoder does not emit reset points or skippable blocks yet.
 * Blocks hold 256 KiB of input. The last block, and the halves made by cost-based block splitting (levels 7-10), are shorter.
 * Level 11 uses only types 4 and 0. Levels -3 to 8 use types 5 and 0. Levels 9 and 10 use types 5, 6 and 0, choosing type 6 for a block only when its literal section is at least 2% smaller.
 * With threads at levels -3 to 6, each 4 MiB job starts with fresh tables (mode 0) and does not count on the repeat offsets. The format is the same either way.
 
 ---
 
-## Appendix A. Format problems to settle before the freeze
+## Appendix A. Decisions taken for the freeze
 
-Ordered by importance. "Breaking" means frames written with the fix can't be read by today's decoder, so the fix needs a new version byte (A10). Today's decoder can keep reading versions 5 and 6.
+Before 1.0, the draft of this document listed format problems found while writing it. The user chose to fix the recommended ones and freeze as version 7 (2026-11-28).
 
-| # | Problem | Proposal | Breaking? |
-|---|---|---|---|
-| **A1** | **No independent points.** Every block may depend on all earlier blocks: history, Huffman/tANS tables, repeat offsets, type 4 model. So a frame can't be decoded in parallel or entered in the middle. That rules out the "xz-class ratio + parallel decompression" goal without a format change. | Add a *reset* marker: bit 7 of the block type byte (or a dedicated empty block type). It means "decoder state goes back to frame-start values, and no match reaches before this block." Add an optional seek index as a skippable block (12.2). It costs nothing when unused, and encoders can add parallel-decodable output later without another format change. | yes (new bit) |
-| **A2** | **No extension mechanism.** Unknown block types are "corrupt". There are no skippable blocks. | Block-type ranges, feature flags, and an *unsupported* error for unknown required types (12.2). The dedup layer then fits as a new required type behind a flag. | rules only |
-| **A3** | **The length of literal stream 3 is not stored** (6.3.3). The sequence section's start is only known after all literals are decoded. That forces literal and sequence decoding to run one after the other, and blocks the planned parallel entropy decoding. | Store `size3` (+4 bytes per block, about 0.002%). | yes |
-| **A4** | **Block size is fixed at 256 KiB, and the ML alphabet (58 codes) is tied to it.** Phase 18 measured table cost per 256 KiB block as what holds back the context literal gain. | Decide now. Either keep 2^18 forever, or allow up to 2^20 to 2^22 and extend the ML alphabet. The second costs a bigger decoder buffer and higher streaming latency. Recommendation: keep 2^18 unless a measurement shows a clear gain. | if changed |
-| **A5** | **Incomplete Huffman codes are accepted** and decode as "symbol 0, 11 bits" (6.3.1). That is an artifact of the table-based decoder that every other decoder must copy. | Require `K == 2^11` when the table is read: no cost in the hot loop. Every table the encoder wrote on the sampled data was complete (91 of 91), but a single-symbol table would be incomplete. That case is already coded as a run (mode 1). | yes (stricter) |
-| A6 | Only a 32-bit checksum, only at the end. No header check, no per-block check. | Keep it (same as zstd), or add an optional per-block checksum flag. Low priority. | if added |
-| A7 | **The type 4 `pos` context is relative to the block** (7.2). It matches the content position only if every earlier block's `raw_len` is a multiple of 4. | Redefine it as the content position mod 4. Frames from today's encoder decode the same, because level 11 blocks are always 256 KiB except the last. So this is a free cleanup. | no for existing frames |
-| A8 | `COMP_MAX` (589824) is an arbitrary sanity limit. The encoder always keeps `comp_len < raw_len` for coded blocks. | Tighten to `comp_len <= raw_len` for types 4-6. That bounds input buffering by the block size. | yes (stricter) |
-| A9 | Encryption flag (bit 0) is reserved with no meaning. | Keep it reserved ("MUST be 0"). Do encryption as an outer envelope, not inside the frame. | no |
-| A10 | Version number for the frozen format. | No breaking fixes: freeze as version 6. With A1/A3/A5/A8: version 7 = "LZR 1.0". Decoders keep reading 5 and 6. | |
-| A11 | The LL (62) and OF (65) alphabets are larger than valid blocks need. Before this draft, a crafted block could make the C decoder read 66 bits at once (undefined behavior in C). That is fixed in `dec.c` and covered by vector `bad-extra-bits-66`. | Keep the alphabets: changing them buys nothing. | no |
-| A12 | The meaning of concatenated frames is not defined. | Define it like zstd and xz: a stream of frames decodes to the concatenation. Decide together with the CLI. | no |
+| # | Problem in version 6 | Decision in version 7 |
+|---|---|---|
+| A1 | No independent points: every block could depend on everything before it, which rules out parallel decoding and seeking. | **Fixed.** Reset bit in the type byte (5.5). Seek index reserved as skippable kind 0x80. |
+| A2 | No extension mechanism: unknown block types were "corrupt", and no block could be skipped. | **Fixed.** Type byte layout, skippable blocks, *unsupported* for types 7-63, feature flags (3.2.1, 12). |
+| A3 | Length of literal stream 3 not stored, so literals had to be decoded before the sequences could be found. | **Fixed.** `size3` stored (6.3.3). |
+| A4 | Block size fixed at 256 KiB, with the ML alphabet tied to it. | **Kept** at 2^18. Larger blocks would need a new version. |
+| A5 | Incomplete Huffman codes accepted ("symbol 0, 11 bits" for unused patterns). | **Fixed.** Codes must be complete (6.3.1). The encoder now always writes complete codes. |
+| A6 | Only a 32-bit checksum, at the end. | **Kept**, same as zstd. A per-block checksum could come later as a feature. |
+| A7 | Type 4 `pos` context relative to the block. | **Fixed.** Relative to the segment (7.2). Same result for everything the old encoder wrote. |
+| A8 | `comp_len` limited only by an arbitrary constant. | **Fixed.** `comp_len <= raw_len` for types 4-6 (3.2.2). |
+| A9 | Encryption flag reserved with no meaning. | **Kept** reserved. Encryption belongs in an outer envelope. |
+| A10 | Version number of the frozen format. | **7**. Versions 5 and 6 stay readable. |
+| A11 | LL and OF alphabets larger than needed. A crafted block could make the C decoder read 66 bits at once. | **Kept**; decoder fixed, vector `bad-extra-bits-66`. |
+| A12 | Meaning of concatenated frames not defined. | **Open.** To be settled with the CLI (10.3). |
 
 ## Appendix B. Differences from zstd and LZMA (informative)
 
 * Repeat offsets update the same way whatever the literal length (5.3). zstd shifts them when LL = 0.
 * tANS tables have no "less than one" probability. Counts are written as varints rather than zstd's bit-packed form. The state updates after the last sequence are still read (6.7).
-* Type 4 is LZMA's coding layer with these changes: lc = 3, lp = 0, pb = 2, but `pos` is block-relative; one reverse tree per distance slot (not a shared array); initial repeat offsets 1, 4, 8; and the model persists across blocks within a frame.
+* Type 4 is LZMA's coding layer with these changes: lc = 3, lp = 0, pb = 2, but `pos` counts from the segment start; one reverse tree per distance slot (not a shared array); initial repeat offsets 1, 4, 8; and the model persists across blocks up to the next reset point.
+
+## Appendix C. Legacy frame versions 5 and 6
+
+A 1.0 decoder reads versions 5 and 6 with these differences from version 7:
+
+* The type byte is the block type itself. Types 7-255 are *corrupt* (not unsupported, and not skippable), and there is no reset bit, so the whole frame is one segment.
+* Block type 6 is valid only in version 6. Version 5 has no other difference from version 6.
+* `comp_len` for types 4-6 may be larger than `raw_len` (up to `COMP_MAX`).
+* Type 5 literal section, modes 2 and 3: only `size0`, `size1` and `size2` are stored (12 bytes). Stream 3 starts after stream 2 and ends at the byte where its last literal ends. The literal section ends there, and the section is corrupt if stream 3 would read past the payload.
+* Huffman codes may be incomplete. A decoder MUST behave as if every 11-bit pattern that matches no code decodes to symbol 0 and uses 11 bits. (Valid streams never contain one.)
+* Type 4 `pos` (7.2) is the position relative to the start of the **block**, modulo 4.

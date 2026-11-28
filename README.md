@@ -7,7 +7,7 @@ CPython native extension.
 **Goal:** levels 1-10 match zstd in ratio and speed (level 10: zstd -19);
 level 11 beats xz -9 in ratio; level 0 is a zstd -3 class fast level,
 levels -1..-3 are faster still (zstd -1 class ratio). Streaming throughout.
-Status: v0.15 phase 18 (see Roadmap). Levels 7-11 were renumbered in v0.14:
+Status: v0.16 phase 19, format 1.0 (see Roadmap). Levels 7-11 were renumbered in v0.14:
 the old levels 7, 8, 9 are now 9, 10, 11.
 
 ```python
@@ -53,16 +53,17 @@ python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 | Streaming | Input is consumed and output produced block by block. Encoder memory is about 2x window + match tables (level 0: 512 KB; levels 1-6: 5 bytes per row slot, up to 40 MB at level 6, 40-48 MB at levels 7-8; levels 9-11: 8 bytes per window byte for the tree, about 680 MB at 64 MB, close to xz -9); decoder memory is about 2x window. |
 | Integrity | Low 32 bits of XXH64 (`xxh64.h`, same value as zstd's frame checksum) in the end block, plus structural checks: every bit stream must be consumed exactly. (`lzrans.crc32` stays available as a zlib-compatible helper.) |
 
-## Frame format v6 (little-endian)
+## Frame format v7 = LZR 1.0 (little-endian)
 
-The full specification (1.0-draft, with golden test vectors and a
-reference decoder) is [docs/FORMAT.md](docs/FORMAT.md); this is a summary.
-
-Version 5 frames (no type 6 blocks) still decode.
+The full specification, with golden test vectors and a pure-Python
+reference decoder (`tools/refdec.py`), is [docs/FORMAT.md](docs/FORMAT.md);
+this is a summary. Version 5 and 6 frames still decode.
 
 ```
-"LZRN" | version u8 = 6 | flags u8 | window_log u8 | reserved u8 | [content_size u64]
+"LZRN" | version u8 = 7 | flags u8 | window_log u8 | reserved u8 | [content_size u64]
 block*: type u8 | raw_len u32 | comp_len u32 | payload
+  type byte: bit 7 = skippable (raw_len 0, payload ignored); else bits 0-5 =
+             type, bit 6 = reset point (state reset, no references before it)
   type 0 stored      payload = raw bytes
   type 2 end         payload = low 32 bits of XXH64 (seed 0) of the whole content
   type 4 tokens      one adaptive range-coded token stream (arc.h); level 11
@@ -71,10 +72,13 @@ block*: type u8 | raw_len u32 | comp_len u32 | payload
   type 6 ctx literals as type 5, literal section = mode u8 (0 new / 1 previous tables)
                      | mode 0: K u8, 256 nibbles (previous byte -> table), K tables
                      | stream size u32 | forward LSB-first stream (huf.h)
+  types 7-63         newer formats: rejected as unsupported
 ```
 
 `flags`: bit 0 = encrypted (reserved), bit 1 = content size present
-(set by one-shot `compress`), bit 2 = x86 filter applied to the content. Decoders reject unknown versions and flags.
+(set by one-shot `compress`), bit 2 = x86 filter applied to the content,
+bits 3-7 = reserved for required features. Decoders reject unknown versions
+and flags.
 
 ## Encryption hook (not implemented yet)
 
@@ -104,3 +108,4 @@ are rejected for now.
 | P16 | Redesign phase 2: cost-based block splitting for optimal-parse levels 7-8 (each block tried as up to 8 parts, kept only if smaller; format unchanged). Silesia L7 +0.4%, L8 +0.4% (xml +0.7%, mr +0.9%), speed unchanged; enwik8 unchanged | done |
 | P17 | Redesign phase 3: levels 7-8 (new) = row finder feeding a light optimal parser; old levels 7-9 renumbered 9-11. Silesia 1 thread: L7 3.720 @ 5.5 MB/s (zstd -14 3.700 @ 5.4), L8 3.785 @ 3.6 MB/s (zstd -15 3.726 @ 3.7); enwik8 L7 +2.2% vs zstd -14 at 1.26x speed, L8 +3.4% vs zstd -15 at 1.28x. Speed gap between lazy level 6 and the tree levels 10x -> 3.3x | done |
 | P18 | Frame format v6, block type 6: context literals for levels 9-10 (up to 8 Huffman tables chosen by the previous byte, picked per block, type 5 kept when the gain is under 2%). Silesia 1 thread vs v0.14: ratio +0.71% (L9) / +0.72% (L10, 4.027), compress -4% / 0%, decode -6% / -4%; enwik8 +0.02%. Levels 7-8 measured +0.7% at -11..-16% decode and were left on type 5 (output unchanged). v5 frames still decode | done |
+| P19 | Format freeze: frame version 7 = LZR 1.0, specified in docs/FORMAT.md with golden test vectors (tests/vectors/) and a pure-Python reference decoder (tools/refdec.py). New in v7: reset points (parallel decoding / seeking later), skippable blocks, unsupported-vs-corrupt for newer block types, stored size of Huffman stream 3, complete Huffman codes only, comp_len <= raw_len. Compression output otherwise unchanged (+4 bytes per Huffman literal section). v5/v6 frames still decode | done |

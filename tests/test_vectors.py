@@ -1,4 +1,5 @@
 """Golden test vectors (tests/vectors/, docs/FORMAT.md section 13).
+Names starting with v5- or v6- are frames of those legacy versions.
 
 Each vector is a frozen .lzr file with its expected outcome: "ok" (with the
 size and SHA-256 of the content), "corrupt", "unsupported" or "checksum".
@@ -44,6 +45,7 @@ def test_c_decoder_one_shot(e):
         with pytest.raises(lzrans.LzransError) as ei:
             lzrans.decompress(blob)
         assert not isinstance(ei.value, lzrans.ChecksumError)
+        assert ("unsupported" in str(ei.value)) == (e["expect"] == "unsupported")
 
 
 @pytest.mark.parametrize("e", [e for e in MANIFEST if e["expect"] == "ok"],
@@ -71,10 +73,13 @@ def test_reference_decoder(e):
 
 
 def test_vectors_cover_the_format():
-    feats = set()
+    # version 7 vectors alone cover every feature; legacy v5-/v6- vectors
+    # cover the older versions
+    feats, legacy = set(), set()
     for e in MANIFEST:
-        feats |= set(e.get("features", ()))
-    need = {"version5", "version6", "flag.size", "flag.x86", "wlog18", "wlog26",
+        (legacy if e["file"].startswith(("v5-", "v6-")) else feats).update(e.get("features", ()))
+    assert {"version5", "version6", "block6", "t5.lit.mode2"} <= legacy
+    need = {"version7", "reset", "block.skippable", "flag.size", "flag.x86", "wlog18", "wlog26",
             "block0", "block4", "block5", "block6", "seq.none",
             "t5.lit.mode0", "t5.lit.mode1", "t5.lit.mode2", "t5.lit.mode3", "t6.ctx.mode0", "t6.ctx.mode1",
             "seq.of.new", "seq.of.rep0", "seq.of.rep1", "seq.of.rep2",

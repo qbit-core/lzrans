@@ -26,7 +26,7 @@ static PyObject *raise_code(int code)
         PyErr_SetString(LzrChecksumError, "checksum mismatch: decompressed data is corrupt");
         return NULL;
     case LZR_ERR_UNSUPPORTED:
-        PyErr_SetString(LzrError, "unsupported frame version or flags (encrypted frames are not supported yet)");
+        PyErr_SetString(LzrError, "unsupported frame version, flags or block type: needs a newer decoder (encrypted frames are not supported yet)");
         return NULL;
     case LZR_ERR_PARAM:
         PyErr_SetString(PyExc_ValueError, "invalid argument or stream already finished");
