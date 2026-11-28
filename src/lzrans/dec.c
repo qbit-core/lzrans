@@ -10,7 +10,7 @@
  * lzr_decompress_mt (end of the file) decodes one-shot input with threads:
  * whole segments in parallel, or blocks through a pipeline.
  */
-#include "lzr.h"
+#include "core.h"
 #include "codes.h"
 #include "xxh64.h"
 #include "arc.h"

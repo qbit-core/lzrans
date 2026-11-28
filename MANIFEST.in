@@ -1,0 +1,3 @@
+# sdist: C sources and headers of the extension (src/lzrans/common.h includes include/lzr.h)
+include include/lzr.h
+recursive-include src/lzrans *.c *.h

@@ -39,6 +39,54 @@ make -C tests/c run      # C core under ASan/UBSan, incl. mutated-input fuzzing
 python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 ```
 
+## C library (liblzr) and command-line tool (lzr)
+
+```sh
+make                     # build/c/liblzr.a, build/c/liblzr.so, build/c/lzr (+ unlzr, lzrcat)
+make check               # C API tests + CLI / tar round trips
+sudo make install        # PREFIX=/usr/local; lzr.h, liblzr, lzr.pc, man page
+# or: cmake -B build/cmake && cmake --build build/cmake && ctest --test-dir build/cmake
+```
+
+`lzr` is used like `xz`: `lzr -9 -T4 file` writes `file.lzr` (input removed unless
+`-k`; mode and times kept), `lzr -d file.lzr` restores it, `-c` writes to standard
+output, `-t` tests, `-l` lists frames and segments. Levels `-0`..`-11` and
+`--fast=1..3`; `--segment=SIZE`, `--window-log=N`, `--x86`, `--max-window-log=N`.
+Standard input and output work, so it plugs into tar and pipes:
+
+```sh
+tar -I 'lzr -11 -T0' -cf src.tar.lzr src/    # compress with tar
+tar -I lzr -xf src.tar.lzr                   # extract
+lzr -dc big.lzr | less                       # concatenated frames decode in sequence
+```
+
+The output is byte-identical to the Python package for the same parameters
+(regular files carry their size in the header, as `lzrans.compress`; pipes do
+not, as `lzrans.Compressor`). Decompression with `-T` > 1 decodes in parallel
+when the input is a regular file whose frames carry their size.
+
+C API (`include/lzr.h`, link `-llzr`):
+
+```c
+#include <lzr.h>
+size_t cap = lzr_compress_bound(n), clen, dlen;
+lzr_compress(dst, cap, &clen, src, n, 11);           /* one-shot */
+lzr_decompress(out, n, &dlen, dst, clen);             /* LZR_OK or LZR_ERR_* */
+
+lzr_cstream *cs = lzr_cstream_create();               /* streaming, bounded memory */
+lzr_cstream_set(cs, LZR_C_LEVEL, 9);
+lzr_cstream_set(cs, LZR_C_THREADS, 4);
+lzr_inbuf in = {buf, len, 0};
+lzr_outbuf out = {obuf, sizeof obuf, 0};
+int r = lzr_compress_stream(cs, &out, &in, last ? LZR_FINISH : LZR_CONTINUE);
+/* r: 1 = more output pending, 0 = done with this input (frame complete after LZR_FINISH) */
+```
+
+`lzr_dstream` / `lzr_decompress_stream` mirror it (returns `LZR_FRAME_END` at the end
+of each frame); `lzr_decompress_ds` decodes one frame with threads and a window limit;
+`lzr_get_frame_info` parses a header. Contexts are independent and can be used
+from different threads. The Python extension compiles the same core sources.
+
 ## Design
 
 | Stage | Implementation (`src/lzrans/`) |

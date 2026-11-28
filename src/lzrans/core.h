@@ -1,5 +1,5 @@
 /*
- * lzr.h - public C API of the lzrans core (frame format v7 = LZR 1.0,
+ * core.h - internal C API of the lzrans core (frame format v7 = LZR 1.0,
  * streaming; full specification: docs/FORMAT.md; v5 and v6 frames still
  * decode). Summary of v7 below; see FORMAT.md for v5/v6 differences.
  *
@@ -51,17 +51,14 @@
 #define LZR_FLAG_SIZE      0x02u   /* header carries the content size       */
 #define LZR_FLAG_X86       0x04u   /* content passed the x86 filter (x86.h) */
 #define LZR_KNOWN_FLAGS    (LZR_FLAG_SIZE | LZR_FLAG_X86)
-#define LZR_FILTER_NONE    0
-#define LZR_FILTER_X86     1
 #define LZR_BLOCK_HDR      9
+/* LZR_LEVEL_MIN/MAX, LZR_FILTER_*: public header (include/lzr.h) */
 /* Block type byte, frame version >= 7: bit 7 = skippable block (raw_len 0,
  * payload ignored), else bits 0-5 = type, bit 6 = reset point (decoder
  * state back to frame-start values; nothing before the block is used). */
 #define LZR_BT_SKIP        0x80u
 #define LZR_BT_RESET       0x40u
 #define LZR_BT_TYPE        0x3Fu
-#define LZR_LEVEL_MIN     -3
-#define LZR_LEVEL_MAX     11
 
 /* ---- streaming compressor ---- */
 typedef struct lzr_cctx lzr_cctx;

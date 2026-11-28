@@ -13,7 +13,7 @@
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include "lzr.h"
+#include "core.h"
 #include "crc32.h"
 
 static PyObject *LzrError, *LzrChecksumError;

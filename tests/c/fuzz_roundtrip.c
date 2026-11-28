@@ -8,7 +8,7 @@
  *      error (or the exact original) and never touch memory out of bounds.
  */
 #include <stdio.h>
-#include "../../src/lzrans/lzr.h"
+#include "../../src/lzrans/core.h"
 
 static uint64_t rng = 88172645463325252ull;
 static uint32_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (uint32_t)rng; }

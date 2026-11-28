@@ -40,16 +40,8 @@ static inline unsigned highbit32(uint32_t v) { return 31u - (unsigned)__builtin_
 #endif
 #define LZR_SLACK       32                     /* over-allocation for wildcopy   */
 
-/* ---- error codes ---- */
-enum {
-    LZR_OK = 0,
-    LZR_ERR_NOMEM = -1,
-    LZR_ERR_CORRUPT = -2,     /* malformed / truncated stream              */
-    LZR_ERR_CHECKSUM = -3,    /* CRC32 mismatch after decompression        */
-    LZR_ERR_UNSUPPORTED = -4, /* unknown version or flags (e.g. encrypted) */
-    LZR_ERR_PARAM = -5,       /* bad argument / API misuse                 */
-    LZR_ERR_MEMLIMIT = -6,    /* frame window above the decoder's limit    */
-};
+/* ---- error codes: LZR_OK, LZR_ERR_* (public header) ---- */
+#include "../../include/lzr.h"
 
 static inline uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline void wr32le(uint8_t *p, uint32_t v) {

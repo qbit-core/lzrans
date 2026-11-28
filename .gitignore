@@ -7,3 +7,4 @@ __pycache__/
 tests/c/fuzz_roundtrip
 *.whl
 tests/c/fuzz_tsan
+tests/c/test_api
