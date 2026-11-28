@@ -477,7 +477,12 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
             w_ = (uint32_t)(t_ & ((1u << ss_) - 1));                           \
             BRELOAD();                                                         \
         } else {                                                               \
-            v_ = BGET64(xs_); used += xs_;                                     \
+            /* corrupt tables can ask for up to 25 + 16 + 25 extra bits: read \
+             * the offset's (first in the stream) apart so no read is > 56 */ \
+            const unsigned xlm_ = xl_ + xm_;                                   \
+            v_ = BGET64(xo_) << xlm_; used += xo_;                             \
+            BRELOAD();                                                         \
+            v_ |= BGET64(xlm_); used += xlm_;                                  \
             BRELOAD();                                                         \
             w_ = BGET(ss_); used += ss_;                                       \
             BRELOAD();                                                         \

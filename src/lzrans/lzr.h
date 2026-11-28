@@ -1,5 +1,6 @@
 /*
  * lzr.h - public C API of the lzrans core (frame format v6, streaming;
+ * full specification: docs/FORMAT.md;
  * v5 frames, which have no type 6 blocks, still decode).
  *
  * Frame layout (little-endian):

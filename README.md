@@ -55,6 +55,9 @@ python bench/bench.py    # vs zlib, xz and zstd (pip install zstandard)
 
 ## Frame format v6 (little-endian)
 
+The full specification (1.0-draft, with golden test vectors and a
+reference decoder) is [docs/FORMAT.md](docs/FORMAT.md); this is a summary.
+
 Version 5 frames (no type 6 blocks) still decode.
 
 ```
