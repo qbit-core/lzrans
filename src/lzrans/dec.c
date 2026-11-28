@@ -42,6 +42,8 @@ struct lzr_dctx {
     code_info ct[VAL_CODES], mt[ML_CODES];
     tok_model tm;      /* block type 4 model, persists across blocks */
     huf_table huf;     /* block type 5 tables, kept for the repeat modes */
+    hufc_dtable hufc;  /* block type 6 literal tables (same)              */
+    int version;       /* frame version (type 6 blocks: 6 and later)      */
     fse_table fse[3];
     seq_dent sq[3][FSE_L];   /* per-block sequence decoding tables */
     lzr_x86 x86;
@@ -77,7 +79,7 @@ int lzr_frame_header(const uint8_t *src, size_t n, int *window_log, uint8_t *fla
 {
     if (memcmp(src, LZR_MAGIC, n < 4 ? n : 4) != 0) return LZR_ERR_CORRUPT;
     if (n < 8) return 0;                          /* need more input */
-    if (src[4] != LZR_VERSION) return LZR_ERR_UNSUPPORTED;
+    if (src[4] < LZR_VERSION_MIN || src[4] > LZR_VERSION) return LZR_ERR_UNSUPPORTED;
     if (flags) *flags = src[5];
     if (src[5] & ~LZR_KNOWN_FLAGS) return LZR_ERR_UNSUPPORTED;
     if (src[6] < LZR_WLOG_MIN || src[6] > LZR_WLOG_MAX || src[7]) return LZR_ERR_CORRUPT;
@@ -317,20 +319,68 @@ static __attribute__((noinline)) int decode_tokens(lzr_dctx *d, const uint8_t *i
 /* Block type 5 (see emit_seqs5 in enc.c): Huffman literals into d->lits,
  * then one loop that decodes each sequence from the tANS bit stream and
  * executes it at once. */
-static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+/* Block type 6 = type 5 with context literals (huf.h): decoded during
+ * the sequences, each with the table of the byte before it. lb/lpos: the
+ * literal stream (next byte, bits used of it), lctx: the cluster of the
+ * last output byte; n literals into o. */
+#define CTX_LITS(n, FAIL)                                                      \
+    do {                                                                       \
+        for (size_t j_ = 0; j_ < (n); j_++) {                                  \
+            uint16_t e_ = cdt[(size_t)lctx << HUF_MAXLEN | ((ld64le_(lb) >> lpos) & (HUF_TSIZE - 1))]; \
+            o[j_] = (uint8_t)e_;                                               \
+            lpos += (e_ >> 8) & 15;                                            \
+            lctx = e_ >> 12;                                                   \
+            lb += lpos >> 3; lpos &= 7;                                        \
+            if (__builtin_expect(lb > lbend, 0)) FAIL;                         \
+        }                                                                      \
+    } while (0)
+
+static inline uint64_t ld64le_(const uint8_t *p)
+{
+    uint64_t v;
+    memcpy(&v, p, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    v = __builtin_bswap64(v);
+#endif
+    return v;
+}
+
+static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw,
+                                                                    const int ctx)
 {
     if (avail < 8) return LZR_ERR_CORRUPT;
     size_t ns = rd32le(in), nlit = rd32le(in + 4), k = 8;
     if (nlit > raw || ns > MAX_SEQ || ns * LZR_ML_BASE + nlit > raw) return LZR_ERR_CORRUPT;
-    if (nlit) {
+    const uint8_t *lb = NULL, *lbend = NULL;
+    unsigned lpos = 0, lctx = 0;
+    const uint16_t *cdt = d->hufc.dt;
+    if (ctx) {
+        /* type 6 always has literals (else it would be type 5) */
+        if (!nlit) return LZR_ERR_CORRUPT;
+        size_t c = hufc_read(in + k, avail - k, &d->hufc);
+        if (!c || avail - k - c < 4) return LZR_ERR_CORRUPT;
+        k += c;
+        size_t sz = rd32le(in + k);
+        k += 4;
+        if (sz > avail - k) return LZR_ERR_CORRUPT;
+        lb = in + k;
+        lbend = lb + sz;
+        k += sz;
+        lctx = d->hufc.cmap[dst > d->hist ? dst[-1] : 0];
+    } else if (nlit) {
         size_t c = huf_decode(in + k, avail - k, d->lits, nlit, &d->huf);
         if (!c) return LZR_ERR_CORRUPT;
         k += c;
     }
     const uint8_t *lp = d->lits, *const lend = d->lits + nlit;
     uint8_t *o = dst, *const oend = dst + raw;
+    int berr = 0;
     if (!ns) {
         if (k != avail || nlit != raw) return LZR_ERR_CORRUPT;
+        if (ctx) {
+            CTX_LITS(nlit, return LZR_ERR_CORRUPT);
+            return lb + (lpos + 7) / 8 == lbend ? LZR_OK : LZR_ERR_CORRUPT;
+        }
         memcpy(o, lp, nlit);
         return LZR_OK;
     }
@@ -386,7 +436,6 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
     const uint8_t *bp = bstart + bsize - 8;
     uint64_t bc = fse_ld64(bp);
     unsigned used = (unsigned)__builtin_clzll(bc) + 1;
-    int berr = 0;
 #define BGET(nb) ((uint32_t)(((bc << (used & 63)) >> 1) >> (63 - (nb))))
 #define BGET64(nb) (((bc << (used & 63)) >> 1) >> (63 - (nb)))
 #define BRELOAD()                                                              \
@@ -450,12 +499,14 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
 #define EXEC_SEQ(LL, ML, DIST)                                                 \
     do {                                                                       \
         if ((LL) > (size_t)(lend - lp) || (LL) + (ML) > (size_t)(oend - o)) { berr = 1; goto done; } \
-        copy_lits(o, lp, LL);                                                  \
+        if (ctx) CTX_LITS(LL, { berr = 1; goto done; });                       \
+        else copy_lits(o, lp, LL);                                             \
         o += LL;                                                               \
         lp += LL;                                                              \
         if ((DIST) > (size_t)(o - hist) || (DIST) > wsize) { berr = 1; goto done; } \
         copy_match(o, DIST, ML);                                               \
         o += ML;                                                               \
+        if (ctx) lctx = d->hufc.cmap[o[-1]];                                   \
     } while (0)
 
     /* (Decoding a few sequences ahead with prefetching measured no faster
@@ -476,28 +527,41 @@ done:
     if (berr || (size_t)(bstart + bsize - (bp + 8)) * 8 + used != bsize * 8) return LZR_ERR_CORRUPT;
     size_t tail = (size_t)(lend - lp);
     if (tail != (size_t)(oend - o)) return LZR_ERR_CORRUPT;
+    if (ctx) {
+        CTX_LITS(tail, return LZR_ERR_CORRUPT);
+        /* the literal stream ends within its last byte */
+        return lb + (lpos + 7) / 8 == lbend ? LZR_OK : LZR_ERR_CORRUPT;
+    }
     memcpy(o, lp, tail);
     return LZR_OK;
 }
 
 static __attribute__((noinline)) int decode_block5_generic(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
-    return decode_block5_impl(d, in, avail, dst, raw);
+    return decode_block5_impl(d, in, avail, dst, raw, 0);
+}
+static __attribute__((noinline)) int decode_block6_generic(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_block5_impl(d, in, avail, dst, raw, 1);
 }
 
 #ifdef LZR_BMI2_DISPATCH
 static __attribute__((noinline)) LZR_TARGET_BMI2 int decode_block5_bmi2(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
 {
-    return decode_block5_impl(d, in, avail, dst, raw);
+    return decode_block5_impl(d, in, avail, dst, raw, 0);
+}
+static __attribute__((noinline)) LZR_TARGET_BMI2 int decode_block6_bmi2(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+{
+    return decode_block5_impl(d, in, avail, dst, raw, 1);
 }
 #endif
 
-static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw)
+static int decode_block5(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw, int ctx)
 {
 #ifdef LZR_BMI2_DISPATCH
-    if (LZR_HAS_BMI2()) return decode_block5_bmi2(d, in, avail, dst, raw);
+    if (LZR_HAS_BMI2()) return ctx ? decode_block6_bmi2(d, in, avail, dst, raw) : decode_block5_bmi2(d, in, avail, dst, raw);
 #endif
-    return decode_block5_generic(d, in, avail, dst, raw);
+    return ctx ? decode_block6_generic(d, in, avail, dst, raw) : decode_block5_generic(d, in, avail, dst, raw);
 }
 
 static int init_history(lzr_dctx *d, int wlog)
@@ -530,6 +594,7 @@ static int step(lzr_dctx *d, lzr_buf *out)
         uint8_t flags;
         int r = lzr_frame_header(p, avail, &wlog, &flags, &d->content_size);
         if (r <= 0) return r;
+        d->version = p[4];
         if (flags & LZR_FLAG_X86) d->direct = NULL;   /* history must hold filtered bytes */
         if (d->direct) d->wsize = (size_t)1 << wlog;
         else if (init_history(d, wlog)) return LZR_ERR_NOMEM;
@@ -542,7 +607,8 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (avail < LZR_BLOCK_HDR) return 0;
     uint8_t type = p[0];
     size_t raw = rd32le(p + 1), comp = rd32le(p + 5);
-    if (type > 5 || type == 1 || type == 3 || raw > LZR_BLOCK_SIZE || comp > MAX_COMP) return LZR_ERR_CORRUPT;
+    if (type > 6 || type == 1 || type == 3 || (type == 6 && d->version < 6) || raw > LZR_BLOCK_SIZE || comp > MAX_COMP)
+        return LZR_ERR_CORRUPT;
     if (type == 0 && comp != raw) return LZR_ERR_CORRUPT;
     if (type == 2 && (raw != 0 || comp != 4)) return LZR_ERR_CORRUPT;
     if (type >= 4 && raw == 0) return LZR_ERR_CORRUPT;
@@ -575,7 +641,7 @@ static int step(lzr_dctx *d, lzr_buf *out)
     if (type == 0) {
         memcpy(dst, payload, raw);
     } else {
-        int r = type == 4 ? decode_tokens(d, payload, comp, dst, raw) : decode_block5(d, payload, comp, dst, raw);
+        int r = type == 4 ? decode_tokens(d, payload, comp, dst, raw) : decode_block5(d, payload, comp, dst, raw, type == 6);
         if (r) return r;
     }
     d->op += raw;

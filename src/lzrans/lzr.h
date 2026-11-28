@@ -1,8 +1,9 @@
 /*
- * lzr.h - public C API of the lzrans core (frame format v5, streaming).
+ * lzr.h - public C API of the lzrans core (frame format v6, streaming;
+ * v5 frames, which have no type 6 blocks, still decode).
  *
  * Frame layout (little-endian):
- *   "LZRN" | version u8 (=5) | flags u8 | window_log u8 | reserved u8
+ *   "LZRN" | version u8 (=6) | flags u8 | window_log u8 | reserved u8
  *   [content_size u64]                       if flags & LZR_FLAG_SIZE
  *   block*                                   until an end block
  *
@@ -13,11 +14,17 @@
  *     type 4  token coding (level 11): one adaptive range-coded stream of
  *                          literal / match tokens (arc.h); its model, state
  *                          and the repeat offsets carry over between blocks
- *     type 5  fast (levels 1-8): nseq u32 | nlit u32 | literal section
+ *     type 5  fast (levels -3..10): nseq u32 | nlit u32 | literal section
  *                          (huf.h: 4 Huffman streams) | if nseq: ll/ml/of
  *                          table modes + one backward tANS bit stream of
  *                          states and extra bits (fse.h, dec.c). Tables and
  *                          repeat offsets carry over between blocks.
+ *     type 6  context literals (levels 9-10, frame version >= 6): as type
+ *                          5, but the literal section is a context literal
+ *                          section (huf.h): literals are coded with one of
+ *                          up to 8 Huffman tables chosen by the byte before
+ *                          them, and decoded while the sequences run. Its
+ *                          tables carry over between type 6 blocks.
  *   Match lengths are >= LZR_ML_BASE (2); the ml code holds length - 2.
  *   Types 1 and 3 (older formats) are rejected.
  *
@@ -30,7 +37,8 @@
 #include "common.h"
 
 #define LZR_MAGIC          "LZRN"
-#define LZR_VERSION        5
+#define LZR_VERSION        6
+#define LZR_VERSION_MIN    5   /* oldest frame version still decoded */
 #define LZR_FLAG_ENCRYPTED 0x01u   /* reserved: future AEAD envelope       */
 #define LZR_FLAG_SIZE      0x02u   /* header carries the content size       */
 #define LZR_FLAG_X86       0x04u   /* content passed the x86 filter (x86.h) */

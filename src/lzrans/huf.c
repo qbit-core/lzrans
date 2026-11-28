@@ -346,3 +346,206 @@ size_t huf_decode(const uint8_t *in, size_t avail, uint8_t *out, size_t n, huf_t
 #endif
     return huf_decode_generic(in, avail, out, n, t);
 }
+
+/* ---- context literals (block type 6) ------------------------------ */
+
+#include <math.h>
+
+#ifndef HUFC_SMOOTH
+#define HUFC_SMOOTH 1
+#endif
+
+void hufc_free(hufc_table *st)
+{
+    free(st->work);
+    st->work = NULL;
+}
+
+/* Bytes of a cluster table in the section: last symbol + nibbles. */
+static unsigned hufc_tab_bytes(const uint8_t *len)
+{
+    unsigned last = 0;
+    for (unsigned s = 0; s < 256; s++) if (len[s]) last = s;
+    return 1 + (last + 2) / 2;
+}
+
+size_t hufc_encode(uint8_t *out, const uint8_t *lits, const uint8_t *prev, size_t n, hufc_table *st)
+{
+    if (!n) return 0;
+    /* work: counts by (previous byte, literal), then the nonzero ones of
+     * each previous byte as (symbol, count) lists */
+    if (!st->work && !(st->work = (uint32_t *)malloc(HUFC_WORK * sizeof(uint32_t)))) return 0;
+    uint32_t *H = st->work, *ls = st->work + 65536, *lc = st->work + 2 * 65536;
+    memset(H, 0, 65536 * sizeof(uint32_t));
+    uint32_t pc[256] = {0}, tot[256] = {0};
+    for (size_t i = 0; i < n; i++) H[(unsigned)prev[i] << 8 | lits[i]]++;
+    uint32_t off[257];
+    unsigned np = 0;
+    off[0] = 0;
+    for (unsigned p = 0; p < 256; p++) {
+        uint32_t m = off[p];
+        for (unsigned s = 0; s < 256; s++) {
+            uint32_t v = H[p << 8 | s];
+            if (!v) continue;
+            ls[m] = s; lc[m] = v; m++;
+            pc[p] += v; tot[s] += v;
+        }
+        off[p + 1] = m;
+        if (pc[p]) np++;
+    }
+    /* one table (what type 5 would use, without its 4-stream sizes) */
+    uint8_t len1[256];
+    huf_lengths(tot, len1);
+    uint64_t cost1 = 8ull * hufc_tab_bytes(len1);
+    for (unsigned s = 0; s < 256; s++) cost1 += (uint64_t)tot[s] * len1[s];
+    if (np < 2) return 0;
+
+    /* candidates: K = 2, 4, 8 clusters by a few rounds of assigning each
+     * previous byte to the cluster whose statistics code it cheapest,
+     * starting from the top bits of the previous byte */
+    uint8_t best_map[256], best_len[HUFC_MAXK][256], best_k = 0;
+    uint64_t best = UINT64_MAX;
+    for (unsigned cand = 0; cand < 4; cand++) {
+        const unsigned kl = cand < 3 ? cand + 1 : 3, K = 1u << kl;
+        uint8_t a[256];
+        for (unsigned p = 0; p < 256; p++) a[p] = (uint8_t)(p >> (8 - kl));
+        if (cand == 3)   /* text: start from character classes */
+            for (unsigned p = 0; p < 256; p++)
+                a[p] = p == ' ' ? 0 : p >= 'a' && p <= 'z' ? 1 : p >= 'A' && p <= 'Z' ? 2 : p >= '0' && p <= '9' ? 3
+                     : p == '\n' || p == '\r' ? 4 : p >= 128 ? 5 : p < 32 ? 6 : 7;
+        static const unsigned ROUNDS = 4;
+        uint32_t C[HUFC_MAXK][256], N[HUFC_MAXK];
+        for (unsigned r = 0; r <= ROUNDS; r++) {
+            memset(C, 0, sizeof(C));
+            memset(N, 0, sizeof(N));
+            for (unsigned p = 0; p < 256; p++)
+                for (uint32_t m = off[p]; m < off[p + 1]; m++) C[a[p]][ls[m]] += lc[m];
+            for (unsigned k = 0; k < K; k++) for (unsigned s = 0; s < 256; s++) N[k] += C[k][s];
+            if (r == ROUNDS) break;
+            float L[HUFC_MAXK][256];
+            for (unsigned k = 0; k < K; k++) {
+                float den = (float)N[k] + 0.25f * 256;
+                for (unsigned s = 0; s < 256; s++) L[k][s] = -log2f(((float)C[k][s] + 0.25f) / den);
+            }
+            int moved = 0;
+            for (unsigned p = 0; p < 256; p++) {
+                if (!pc[p]) continue;
+                float bc = 0;
+                unsigned bk = a[p];
+                for (uint32_t m = off[p]; m < off[p + 1]; m++) bc += (float)lc[m] * L[bk][ls[m]];
+                for (unsigned k = 0; k < K; k++) {
+                    if (k == a[p]) continue;
+                    float c = 0;
+                    for (uint32_t m = off[p]; m < off[p + 1] && c < bc; m++) c += (float)lc[m] * L[k][ls[m]];
+                    if (c < bc) { bc = c; bk = k; }
+                }
+                if (bk != a[p]) { a[p] = (uint8_t)bk; moved = 1; }
+            }
+            if (!moved) r = ROUNDS - 1;
+        }
+        /* drop empty clusters, exact cost */
+        uint8_t ren[HUFC_MAXK], kk = 0, lens[HUFC_MAXK][256];
+        uint64_t cost = 8ull * (2 + 128);
+        for (unsigned k = 0; k < K; k++) {
+            if (!N[k]) { ren[k] = 0; continue; }
+            ren[k] = kk;
+            /* every symbol of the block gets a code in every cluster, so
+             * the tables can be repeated by the next blocks */
+            uint32_t Cs[256];
+            for (unsigned s = 0; s < 256; s++) Cs[s] = C[k][s] ? C[k][s] : (tot[s] ? HUFC_SMOOTH : 0);
+            huf_lengths(Cs, lens[kk]);
+            cost += 8ull * hufc_tab_bytes(lens[kk]);
+            for (unsigned s = 0; s < 256; s++) cost += (uint64_t)C[k][s] * lens[kk][s];
+            kk++;
+        }
+        if (cost < best) {
+            best = cost;
+            best_k = kk;
+            for (unsigned p = 0; p < 256; p++) best_map[p] = ren[a[p]];
+            memcpy(best_len, lens, sizeof(lens));
+        }
+    }
+    /* the tables the decoder holds */
+    int rep = 0;
+    if (st->valid) {
+        uint64_t cost = 8;
+        for (unsigned p = 0; p < 256 && cost != UINT64_MAX; p++) {
+            const uint8_t *l = st->len[st->cmap[p]];
+            for (uint32_t m = off[p]; m < off[p + 1]; m++) {
+                if (!l[ls[m]]) { cost = UINT64_MAX; break; }
+                cost += (uint64_t)lc[m] * l[ls[m]];
+            }
+        }
+        if (cost <= best) { best = cost; rep = 1; }
+    }
+    if (best >= cost1) return 0;
+
+    size_t k = 0;
+    if (rep) {
+        out[k++] = 1;
+    } else {
+        out[k++] = 0;
+        out[k++] = best_k;
+        for (unsigned p = 0; p < 256; p += 2) out[k++] = (uint8_t)(best_map[p] | best_map[p + 1] << 4);
+        for (unsigned c = 0; c < best_k; c++) {
+            unsigned last = 0;
+            for (unsigned s = 0; s < 256; s++) if (best_len[c][s]) last = s;
+            out[k++] = (uint8_t)last;
+            for (unsigned s = 0; s <= last; s += 2)
+                out[k++] = (uint8_t)(best_len[c][s] | (s + 1 <= last ? best_len[c][s + 1] << 4 : 0));
+            huf_table t;
+            memcpy(t.len, best_len[c], 256);
+            huf_codes(&t);
+            memcpy(st->len[c], t.len, 256);
+            memcpy(st->code[c], t.code, sizeof(t.code));
+        }
+        memcpy(st->cmap, best_map, 256);
+        st->k = best_k;
+        st->valid = 1;
+    }
+    size_t szpos = k;
+    k += 4;
+    hbw w = {0, 0, out + k};
+    for (size_t i = 0; i < n; i++) {
+        unsigned c = st->cmap[prev[i]];
+        hbw_put(&w, st->code[c][lits[i]], st->len[c][lits[i]]);
+    }
+    hbw_flush(&w);
+    size_t sz = (size_t)(w.p - (out + k));
+    wr32le(out + szpos, (uint32_t)sz);
+    return k + sz;
+}
+
+size_t hufc_read(const uint8_t *in, size_t avail, hufc_dtable *t)
+{
+    if (avail < 1) return 0;
+    if (in[0] == 1) return t->valid ? 1 : 0;
+    if (in[0] != 0 || avail < 2 + 128) return 0;
+    unsigned K = in[1];
+    if (!K || K > HUFC_MAXK) return 0;
+    t->valid = 0;
+    for (unsigned p = 0; p < 256; p++) {
+        unsigned c = (in[2 + p / 2] >> (4 * (p & 1))) & 15;
+        if (c >= K) return 0;
+        t->cmap[p] = (uint8_t)c;
+    }
+    size_t k = 2 + 128;
+    huf_table h;
+    for (unsigned c = 0; c < K; c++) {
+        if (k >= avail) return 0;
+        unsigned last = in[k];
+        size_t hb = (last + 2) / 2;
+        if (avail - k - 1 < hb) return 0;
+        memset(h.len, 0, sizeof(h.len));
+        for (unsigned s = 0; s <= last; s++) h.len[s] = (uint8_t)((in[k + 1 + s / 2] >> (4 * (s & 1))) & 15);
+        if (huf_build_dt(&h)) return 0;
+        k += 1 + hb;
+        uint16_t *dt = t->dt + ((size_t)c << HUF_MAXLEN);
+        for (unsigned j = 0; j < HUF_TSIZE; j++) {
+            unsigned e = h.dt[j];
+            dt[j] = (uint16_t)(e | (unsigned)t->cmap[e & 255] << 12);
+        }
+    }
+    t->valid = 1;
+    return k;
+}
