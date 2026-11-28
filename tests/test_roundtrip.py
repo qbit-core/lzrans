@@ -619,3 +619,69 @@ def test_offset_beyond_2_27():
     fr.out = bytearray(data)
     refdec.decode_seq_block(p, 22, fr, False)
     assert bytes(fr.out[n:]) == want[n:]
+
+
+# ---- pipelined parallel decompression (one segment: entropy stage on
+# worker threads, blocks executed in order by the calling thread)
+
+def _pipe_data(n=2 * MB + 4321, seed=11):
+    # text, a stored (incompressible) stretch, repeats far back
+    t = _text(n // 2, seed)
+    r = random.Random(seed).randbytes(300_000)
+    return (t[: n // 3] + r + t + t[: n // 4])[:n]
+
+
+@pytest.mark.parametrize("level", [-3, 0, 3, 6, 7, 8, 9, 10])
+def test_pipelined_decode_one_segment(level):
+    data = _pipe_data()
+    blob = lzrans.compress(data, level=level, segment=0)
+    assert lzrans.decompress(blob) == data
+    for t in (2, 3, 4, 8, 16):
+        assert lzrans.decompress(blob, threads=t) == data
+
+
+def test_pipelined_decode_across_reset_points():
+    # fewer segments than threads: the pipeline runs through the reset points
+    data = _seg_data()
+    for level in (5, 10):
+        blob = lzrans.compress(data, level=level, segment=MB)
+        assert len(_segment_offsets(blob)) == 3
+        assert lzrans.decompress(blob, threads=16) == data
+
+
+def _outcome(blob, threads):
+    try:
+        return ("ok", lzrans.decompress(blob, threads=threads))
+    except lzrans.ChecksumError:
+        return ("checksum", None)
+    except lzrans.LzransError as e:
+        return ("unsupported" if "unsupported" in str(e) else "error", None)
+
+
+@pytest.mark.parametrize("level", [4, 8, 10])
+def test_pipelined_decode_corruption_matches_serial(level):
+    # any damage gives the serial decoder's outcome (same error kind, or the
+    # same output when the damage goes unnoticed until the checksum)
+    data = _pipe_data(MB + 777, seed=level)
+    blob = lzrans.compress(data, level=level, segment=0)
+    rnd = random.Random(level)
+    for _ in range(150):
+        bad = bytearray(blob)
+        for _ in range(rnd.randint(1, 3)):
+            bad[rnd.randrange(16, len(bad))] ^= 1 << rnd.randrange(8)
+        bad = bytes(bad)
+        assert _outcome(bad, 4) == _outcome(bad, 1)
+    for cut in (1, 5, 13, 100, len(blob) // 2):
+        assert _outcome(blob[:-cut], 4) == _outcome(blob[:-cut], 1)
+
+
+def test_pipelined_decode_corruption_matches_serial_segments():
+    # segments side by side, each pipelined; damage in any of them
+    data = _seg_data()
+    blob = lzrans.compress(data, level=6, segment=MB)
+    rnd = random.Random(5)
+    for _ in range(100):
+        bad = bytearray(blob)
+        bad[rnd.randrange(16, len(bad))] ^= 1 << rnd.randrange(8)
+        bad = bytes(bad)
+        assert _outcome(bad, 8) == _outcome(bad, 1)

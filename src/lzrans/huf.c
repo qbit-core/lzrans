@@ -119,6 +119,22 @@ static int huf_build_dt(huf_table *t, int strict)
     return 0;
 }
 
+/* Mode 2 header of a literal section at in (mode byte first): build its
+ * table into t. Returns the header bytes (mode, last, nibbles), 0 if
+ * malformed. */
+size_t huf_read_table(const uint8_t *in, size_t avail, huf_table *t, int v7)
+{
+    if (avail < 2 || in[0] != 2) return 0;
+    unsigned last = in[1];
+    size_t hb = (last + 2) / 2;
+    if (avail - 2 < hb) return 0;
+    memset(t->len, 0, sizeof(t->len));
+    for (unsigned s = 0; s <= last; s++) t->len[s] = (uint8_t)((in[2 + s / 2] >> (4 * (s & 1))) & 15);
+    t->valid = 0;
+    if (huf_build_dt(t, v7)) return 0;
+    return 2 + hb;
+}
+
 /* ---- encoder ------------------------------------------------------ */
 
 typedef struct { uint64_t acc; unsigned n; uint8_t *p; } hbw;

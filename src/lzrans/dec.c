@@ -7,6 +7,8 @@
  * and copies its literal run and match with fixed-size chunks. Block type 4: one range
  * decoder loop. Output goes to a history buffer that keeps the last
  * 2^window_log bytes, or, in one-buffer mode, straight into the output.
+ * lzr_decompress_mt (end of the file) decodes one-shot input with threads:
+ * whole segments in parallel, or blocks through a pipeline.
  */
 #include "lzr.h"
 #include "codes.h"
@@ -18,6 +20,7 @@
 
 #define MAX_SEQ (LZR_BLOCK_SIZE / LZR_ML_BASE + 1)
 #define MAX_COMP (2 * LZR_BLOCK_SIZE + 65536)   /* sanity cap on comp_len */
+#define SEQ_CHUNK 256   /* sequences decoded ahead of their execution (type 5/6) */
 
 enum { ST_HEADER, ST_BLOCKS, ST_DONE };
 
@@ -387,6 +390,29 @@ static inline uint64_t ld64le_(const uint8_t *p)
     return v;
 }
 
+/* Sequence tables: the tANS state step plus the code's base value and
+ * extra-bit count in one entry. Offsets: value < 3 is a repeat index,
+ * else distance + 3. A single-symbol stream is a one-state table. */
+static void build_seq_tables(lzr_dctx *d, const int *rle, const unsigned *rsym, unsigned *tlog)
+{
+    for (int t = 0; t < 3; t++) {
+        const fse_table *T = &d->fse[t];
+        unsigned n = rle[t] ? 1 : FSE_L;
+        tlog[t] = rle[t] ? 0 : FSE_LOG;
+        for (unsigned u = 0; u < n; u++) {
+            unsigned sym = rle[t] ? rsym[t] : T->dt[u].sym;
+            seq_dent *e = &d->sq[t][u];
+            e->nb = rle[t] ? 0 : T->dt[u].nb;
+            /* states index the three tables as one array */
+            e->next = (uint16_t)((rle[t] ? 0 : T->dt[u].base) + t * FSE_L);
+            if (t == 0) { e->base = d->ct[sym].base; e->xb = d->ct[sym].bits; }
+            else if (t == 1) { e->base = d->mt[sym].base + LZR_ML_BASE; e->xb = d->mt[sym].bits; }
+            else if (sym < LZR_NUM_REPS) { e->base = sym; e->xb = 0; }
+            else { e->base = d->ct[sym - LZR_NUM_REPS].base + 1 + 3; e->xb = d->ct[sym - LZR_NUM_REPS].bits; }
+        }
+    }
+}
+
 static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d, const uint8_t *in, size_t avail, uint8_t *dst, size_t raw,
                                                                     const int ctx, const int exact)
 {
@@ -450,27 +476,9 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
             return LZR_ERR_CORRUPT;
         }
     }
-    /* Sequence tables: the tANS state step plus the code's base value and
-     * extra-bit count in one entry. Offsets: value < 3 is a repeat index,
-     * else distance + 3. A single-symbol stream is a one-state table. */
     seq_dent *tb[3] = {d->sq[0], d->sq[1], d->sq[2]};   /* contiguous */
     unsigned tlog[3];
-    for (int t = 0; t < 3; t++) {
-        const fse_table *T = &d->fse[t];
-        unsigned n = rle[t] ? 1 : FSE_L;
-        tlog[t] = rle[t] ? 0 : FSE_LOG;
-        for (unsigned u = 0; u < n; u++) {
-            unsigned sym = rle[t] ? rsym[t] : T->dt[u].sym;
-            seq_dent *e = &tb[t][u];
-            e->nb = rle[t] ? 0 : T->dt[u].nb;
-            /* states index the three tables as one array */
-            e->next = (uint16_t)((rle[t] ? 0 : T->dt[u].base) + t * FSE_L);
-            if (t == 0) { e->base = d->ct[sym].base; e->xb = d->ct[sym].bits; }
-            else if (t == 1) { e->base = d->mt[sym].base + LZR_ML_BASE; e->xb = d->mt[sym].bits; }
-            else if (sym < LZR_NUM_REPS) { e->base = sym; e->xb = 0; }
-            else { e->base = d->ct[sym - LZR_NUM_REPS].base + 1 + 3; e->xb = d->ct[sym - LZR_NUM_REPS].bits; }
-        }
-    }
+    build_seq_tables(d, rle, rsym, tlog);
 
     /* backward bit reader in locals (see fse.h) */
     const uint8_t *const bstart = in + k;
@@ -562,11 +570,34 @@ static inline __attribute__((always_inline)) int decode_block5_impl(lzr_dctx *d,
 
     /* (Decoding a few sequences ahead with prefetching measured no faster
      * here, even past the cache size, so the loop stays simple.) */
-    for (size_t i = 0; i < ns; i++) {
-        size_t ll, ml;
-        uint32_t dist;
-        DECODE_SEQ(ll, ml, dist);
-        EXEC_SEQ(ll, ml, dist);
+    /* Large windows (and type 6): decode SEQ_CHUNK sequences, then execute
+     * them. Without the bit-stream dependency chain between them, the
+     * copies of far matches (cache misses) overlap; and type 6 literal
+     * decoding no longer competes with the sequence decoding for
+     * registers. Measured 1.04-1.5x at windows >= 8 MB, slower below. */
+    if (ctx || wsize >= ((size_t)1 << 23)) {
+        struct { uint32_t ll, ml, dist; } cb[SEQ_CHUNK];   /* 3 KB */
+        for (size_t i = 0; i < ns; i += SEQ_CHUNK) {
+            const size_t m = ns - i < SEQ_CHUNK ? ns - i : SEQ_CHUNK;
+            for (size_t j = 0; j < m; j++) {
+                size_t ll, ml;
+                uint32_t dist;
+                DECODE_SEQ(ll, ml, dist);
+                cb[j].ll = (uint32_t)ll; cb[j].ml = (uint32_t)ml; cb[j].dist = dist;
+            }
+            for (size_t j = 0; j < m; j++) {
+                const size_t ll = cb[j].ll, ml = cb[j].ml;
+                const uint32_t dist = cb[j].dist;
+                EXEC_SEQ(ll, ml, dist);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < ns; i++) {
+            size_t ll, ml;
+            uint32_t dist;
+            DECODE_SEQ(ll, ml, dist);
+            EXEC_SEQ(ll, ml, dist);
+        }
     }
 done:
 #undef DECODE_SEQ
@@ -894,6 +925,738 @@ static void *pdec_thread(void *p)
     lzr_dctx_free(d);
     return NULL;
 }
+
+/* ---------------- pipelined one-shot decoding (one segment) ----------------
+ * Without reset points (or with fewer segments than threads) the blocks of
+ * a segment depend on each other only through the output (matches) and a
+ * little state: repeat offsets, the type 4 model, the type 6 literal
+ * tables (which also need the output: the byte before each literal), and
+ * the Huffman and tANS tables of types 5 and 6. The tables are given by
+ * block headers, so a cheap pass over the headers finds, for every block,
+ * where the tables it uses are described. With that, the entropy stage of
+ * types 5 and 6 (type 5 Huffman literals into an array, the tANS sequence
+ * stream into (literal length, match length, offset value) triples) runs
+ * on worker threads, several blocks ahead, while the calling thread
+ * executes the blocks in order: repeat offsets, literal runs (type 6:
+ * decoded here, from the byte before each), match copies, and type 0 / 4
+ * blocks whole. A worker also hashes executed blocks in order (one at a
+ * time). The format is unchanged and the output is the same; the frame is
+ * corrupt exactly when the serial decoder says so (a malformed header
+ * sends the frame to the serial decoder; an entropy error is reported when
+ * the calling thread reaches that block). */
+typedef struct { uint32_t ll, ml, ov; } pseq;
+
+typedef struct {
+    const uint8_t *pl;           /* payload (in place, or a padded copy)    */
+    uint32_t raw, comp;
+    uint8_t type, reset;
+    uint32_t lit_off, tab_off, bs_off;  /* types 5-6: literal section, table
+                                  * modes, sequence bit stream (offsets)     */
+    const uint8_t *huf_src;      /* type 5: mode 2 header of the Huffman
+                                  * table the block's mode 3 would use       */
+    const uint8_t *fse_src[3];   /* the counts of the frame's LL/ML/OF tables
+                                  * after this block's table modes           */
+    int state;                   /* 0 queued, 1 taken, 2 ready, < 0 error    */
+} pblk;
+
+typedef struct {                 /* one entropy decoder (worker or caller)  */
+    lzr_dctx *d;                 /* tables: huf, fse, sq (+ ct, mt)          */
+    const uint8_t *huf_key, *fse_key[3];
+    uintptr_t sq_key[3];
+    int sq_ok;
+} pent;
+
+typedef struct {
+    pblk *b;
+    int nb;
+    int nslot;
+    uint8_t **lits;              /* per slot: block i uses slot i % nslot   */
+    pseq **seqs;
+    uint8_t *obase;
+    uint64_t *coff;              /* content offset of each block            */
+    pthread_mutex_t mu;
+    pthread_cond_t cv_work, cv_main;
+    int ent_next, exec_done, hash_done, hashing, stop;
+    int nwait, main_wait;   /* workers / the caller waiting on cv_work / cv_main */
+    int exact_last;         /* the last block writes nothing past its end */
+    xxh64_state xs;
+} ppipe;
+
+/* Header pass for a type 5/6 payload: section offsets and table sources.
+ * Returns 0, or -1 if anything is malformed (the serial decoder then
+ * reports it). src[3]/huf: the frame's tables, updated. */
+static int pipe_pre(pblk *b, const uint8_t **huf, const uint8_t **fsrc)
+{
+    const uint8_t *in = b->pl;
+    size_t avail = b->comp, k = 8;
+    if (avail < 8) return -1;
+    size_t ns = rd32le(in), nlit = rd32le(in + 4);
+    b->lit_off = 8;
+    if (b->type == 6) {
+        if (k >= avail) return -1;
+        if (in[k] == 0) {
+            if (avail - k < 2 + 128) return -1;
+            unsigned K = in[k + 1];
+            if (!K || K > HUFC_MAXK) return -1;
+            k += 2 + 128;
+            for (unsigned c = 0; c < K; c++) {
+                if (k >= avail) return -1;
+                size_t hb = 1 + ((size_t)in[k] + 2) / 2;
+                if (avail - k < hb) return -1;
+                k += hb;
+            }
+        } else if (in[k] == 1) {
+            k += 1;
+        } else {
+            return -1;
+        }
+        if (avail - k < 4) return -1;
+        size_t sz = rd32le(in + k);
+        k += 4;
+        if (sz > avail - k) return -1;
+        k += sz;
+    } else if (nlit) {
+        if (k >= avail) return -1;
+        unsigned mode = in[k];
+        if (mode == 0) {
+            if (avail - k - 1 < nlit) return -1;
+            k += 1 + nlit;
+        } else if (mode == 1) {
+            if (avail - k < 2) return -1;
+            k += 2;
+        } else if (mode == 2 || mode == 3) {
+            if (mode == 2) {
+                if (avail - k < 2) return -1;
+                size_t hb = ((size_t)in[k + 1] + 2) / 2;
+                if (avail - k - 2 < hb) return -1;
+                *huf = in + k;
+                k += 2 + hb;
+            } else {
+                if (!*huf) return -1;
+                k += 1;
+            }
+            if (avail - k < 16) return -1;
+            uint64_t tot = (uint64_t)rd32le(in + k) + rd32le(in + k + 4) + rd32le(in + k + 8) + rd32le(in + k + 12);
+            k += 16;
+            if (tot > avail - k) return -1;
+            k += (size_t)tot;
+        } else {
+            return -1;
+        }
+    }
+    b->huf_src = *huf;
+    b->tab_off = (uint32_t)k;
+    if (ns) {
+        static const unsigned alpha[3] = {VAL_CODES, ML_CODES, OF_CODES};
+        for (int t = 0; t < 3; t++) {
+            if (k >= avail) return -1;
+            unsigned mode = in[k++];
+            if (mode == 0) {
+                uint16_t norm[FSE_MAXSYM];
+                size_t c = fse_read_norm(in + k, avail - k, norm, alpha[t]);
+                if (!c) return -1;
+                fsrc[t] = in + k;
+                k += c;
+            } else if (mode == 1) {
+                if (!fsrc[t]) return -1;
+            } else if (mode == 2) {
+                if (k >= avail) return -1;
+                k++;
+            } else {
+                return -1;
+            }
+        }
+    }
+    for (int t = 0; t < 3; t++) b->fse_src[t] = fsrc[t];
+    b->bs_off = (uint32_t)k;
+    return 0;
+}
+
+/* Entropy stage of a type 5/6 block: literals (type 5) into lits, the
+ * sequences into sq. */
+static inline __attribute__((always_inline)) int pipe_ent_impl(pent *w, const pblk *b, uint8_t *lits, pseq *sq_out)
+{
+    lzr_dctx *d = w->d;
+    const uint8_t *in = b->pl;
+    const size_t avail = b->comp, raw = b->raw;
+    const size_t ns = rd32le(in), nlit = rd32le(in + 4);
+    if (nlit > raw || ns > MAX_SEQ || ns * LZR_ML_BASE + nlit > raw) return LZR_ERR_CORRUPT;
+    if (b->type == 6) {
+        if (!nlit) return LZR_ERR_CORRUPT;
+    } else if (nlit) {
+        if (in[8] == 3 && w->huf_key != b->huf_src) {
+            w->huf_key = NULL;
+            if (!huf_read_table(b->huf_src, 2 + 128, &d->huf, 1)) return LZR_ERR_CORRUPT;
+            w->huf_key = b->huf_src;
+        }
+        if (in[8] == 2) w->huf_key = NULL;
+        size_t c = huf_decode(in + 8, avail - 8, lits, nlit, &d->huf, 1);
+        if (!c || 8 + c != b->tab_off) return LZR_ERR_CORRUPT;
+        if (in[8] == 2) w->huf_key = in + 8;
+    }
+    size_t k = b->tab_off;
+    if (!ns) return k == avail && nlit == raw ? LZR_OK : LZR_ERR_CORRUPT;
+
+    static const unsigned alpha[3] = {VAL_CODES, ML_CODES, OF_CODES};
+    unsigned rsym[3] = {0, 0, 0};
+    int rle[3];
+    uintptr_t key[3];
+    for (int t = 0; t < 3; t++) {
+        unsigned mode = in[k++];
+        rle[t] = mode == 2;
+        if (mode == 2) {
+            if (in[k] >= alpha[t]) return LZR_ERR_CORRUPT;
+            rsym[t] = in[k++];
+            key[t] = rsym[t] + 1;   /* not a pointer */
+            continue;
+        }
+        const uint8_t *src = b->fse_src[t];
+        key[t] = (uintptr_t)src;
+        if (w->fse_key[t] != src) {
+            fse_table *T = &d->fse[t];
+            w->fse_key[t] = NULL;
+            w->sq_ok = 0;
+            T->alphabet = alpha[t];
+            if (!fse_read_norm(src, 3 * FSE_MAXSYM, T->norm, alpha[t]) || fse_build(T)) return LZR_ERR_CORRUPT;
+            w->fse_key[t] = src;
+        }
+        if (mode == 0) {   /* its counts: up to the next mode byte (pipe_pre) */
+            uint16_t norm[FSE_MAXSYM];
+            k += fse_read_norm(in + k, avail - k, norm, alpha[t]);
+        }
+    }
+    unsigned tlog[3];
+    for (int t = 0; t < 3; t++) tlog[t] = rle[t] ? 0 : FSE_LOG;
+    if (!w->sq_ok || memcmp(key, w->sq_key, sizeof(key))) {
+        build_seq_tables(d, rle, rsym, tlog);
+        memcpy(w->sq_key, key, sizeof(key));
+        w->sq_ok = 1;
+    }
+    if (k != b->bs_off) return LZR_ERR_CORRUPT;
+
+    const uint8_t *const bstart = in + k;
+    const size_t bsize = avail - k;
+    if (!bsize || !bstart[bsize - 1]) return LZR_ERR_CORRUPT;
+    const uint8_t *bp = bstart + bsize - 8;
+    uint64_t bc = fse_ld64(bp);
+    unsigned used = (unsigned)__builtin_clzll(bc) + 1;
+    int berr = 0;
+#define BGET(nb) ((uint32_t)(((bc << (used & 63)) >> 1) >> (63 - (nb))))
+#define BGET64(nb) (((bc << (used & 63)) >> 1) >> (63 - (nb)))
+#define BRELOAD()                                                              \
+    do {                                                                       \
+        if (bp >= bstart + 8) { bp -= used >> 3; used &= 7; }                  \
+        else {                                                                 \
+            size_t nby_ = used >> 3, room_ = bp > bstart ? (size_t)(bp - bstart) : 0; \
+            if (nby_ > room_) nby_ = room_;                                    \
+            bp -= nby_; used -= (unsigned)nby_ * 8;                            \
+            if (used > 64) { berr = 1; used = 64; }                            \
+        }                                                                      \
+        bc = fse_ld64(bp);                                                     \
+    } while (0)
+    unsigned sll = BGET(tlog[0]); used += tlog[0];
+    unsigned sml = BGET(tlog[1]) + FSE_L; used += tlog[1];
+    unsigned sof = BGET(tlog[2]) + 2 * FSE_L; used += tlog[2];
+    BRELOAD();
+    const seq_dent *const sq = d->sq[0];
+    /* as DECODE_SEQ in decode_block5_impl, without the repeat offsets */
+    for (size_t i = 0; i < ns; i++) {
+        const seq_dent el_ = sq[sll], em_ = sq[sml], eo_ = sq[sof];
+        const unsigned xl_ = el_.xb, xm_ = em_.xb, xo_ = eo_.xb;
+        const unsigned no_ = eo_.nb, nm_ = em_.nb, nl_ = el_.nb;
+        const unsigned xs_ = xl_ + xm_ + xo_, ss_ = no_ + nm_ + nl_;
+        uint64_t v_;
+        uint32_t w_;
+        if (LZR_LIKELY(xs_ + ss_ <= 56)) {
+            uint64_t t_ = BGET64(xs_ + ss_); used += xs_ + ss_;
+            v_ = t_ >> ss_;
+            w_ = (uint32_t)(t_ & ((1u << ss_) - 1));
+            BRELOAD();
+        } else {
+            const unsigned xlm_ = xl_ + xm_;
+            v_ = BGET64(xo_) << xlm_; used += xo_;
+            BRELOAD();
+            v_ |= BGET64(xlm_); used += xlm_;
+            BRELOAD();
+            w_ = BGET(ss_); used += ss_;
+            BRELOAD();
+        }
+        sq_out[i].ll = el_.base + (uint32_t)(v_ & ((1u << xl_) - 1));
+        sq_out[i].ml = em_.base + (uint32_t)((v_ >> xl_) & ((1u << xm_) - 1));
+        sq_out[i].ov = eo_.base + (uint32_t)(v_ >> (xl_ + xm_));
+        sof = eo_.next + (w_ & ((1u << no_) - 1));
+        sml = em_.next + ((w_ >> no_) & ((1u << nm_) - 1));
+        sll = el_.next + (w_ >> (no_ + nm_));
+    }
+#undef BGET
+#undef BGET64
+#undef BRELOAD
+    if (berr || (size_t)(bstart + bsize - (bp + 8)) * 8 + used != bsize * 8) return LZR_ERR_CORRUPT;
+    return LZR_OK;
+}
+
+static __attribute__((noinline)) int pipe_ent_generic(pent *w, const pblk *b, uint8_t *lits, pseq *sq)
+{
+    return pipe_ent_impl(w, b, lits, sq);
+}
+#ifdef LZR_BMI2_DISPATCH
+static __attribute__((noinline)) LZR_TARGET_BMI2 int pipe_ent_bmi2(pent *w, const pblk *b, uint8_t *lits, pseq *sq)
+{
+    return pipe_ent_impl(w, b, lits, sq);
+}
+#endif
+
+static int pipe_ent(pent *w, const pblk *b, uint8_t *lits, pseq *sq)
+{
+    int r;
+#ifdef LZR_BMI2_DISPATCH
+    if (LZR_HAS_BMI2()) r = pipe_ent_bmi2(w, b, lits, sq);
+    else
+#endif
+    r = pipe_ent_generic(w, b, lits, sq);
+    if (r) {   /* forget the cached tables: they may be half built */
+        w->huf_key = NULL;
+        for (int t = 0; t < 3; t++) w->fse_key[t] = NULL;
+        w->sq_ok = 0;
+    }
+    return r;
+}
+
+/* Execute a type 5/6 block from its decoded sequences (the checks of
+ * decode_block5_impl's EXEC_SEQ and end). */
+static inline __attribute__((always_inline)) int pipe_exec_impl(lzr_dctx *d, const pblk *b, const uint8_t *lits, const pseq *sqs,
+                                                                uint8_t *dst, const int ctx, const int exact)
+{
+    const uint8_t *in = b->pl;
+    const size_t avail = b->comp, raw = b->raw;
+    const size_t ns = rd32le(in), nlit = rd32le(in + 4);
+    const uint8_t *lb = NULL, *lbend = NULL;
+    unsigned lpos = 0, lctx = 0;
+    const uint16_t *cdt = d->hufc.dt;
+    if (ctx) {
+        size_t k = b->lit_off;
+        size_t c = hufc_read(in + k, avail - k, &d->hufc, 1);
+        if (!c || avail - k - c < 4) return LZR_ERR_CORRUPT;
+        k += c;
+        size_t sz = rd32le(in + k);
+        k += 4;
+        if (sz > avail - k) return LZR_ERR_CORRUPT;
+        lb = in + k;
+        lbend = lb + sz;
+        lctx = d->hufc.cmap[dst > d->lo ? dst[-1] : 0];
+    }
+    const uint8_t *lp = lits, *const lend = lits + nlit;
+    uint8_t *o = dst, *const oend = dst + raw;
+    if (!ns) {
+        if (ctx) {
+            CTX_LITS(nlit, return LZR_ERR_CORRUPT);
+            return lb + (lpos + 7) / 8 == lbend ? LZR_OK : LZR_ERR_CORRUPT;
+        }
+        memcpy(o, lp, nlit);
+        return LZR_OK;
+    }
+    uint32_t rep0 = d->reps[0], rep1 = d->reps[1], rep2 = d->reps[2];
+    const uint8_t *hist = d->lo;
+    const size_t wsize = d->wsize;
+    int berr = 0;
+    for (size_t i = 0; i < ns; i++) {
+        const size_t ll = sqs[i].ll, ml = sqs[i].ml;
+        const uint32_t ov = sqs[i].ov;
+        uint32_t r_ = ov == 0 ? rep0 : ov == 1 ? rep1 : rep2;
+        const uint32_t dist = ov >= LZR_NUM_REPS ? ov - 3 : r_;
+        rep2 = ov >= 2 ? rep1 : rep2;
+        rep1 = ov >= 1 ? rep0 : rep1;
+        rep0 = dist;
+        if (ll > (size_t)(lend - lp) || ll + ml > (size_t)(oend - o)) { berr = 1; break; }
+        const int ex_ = exact && (size_t)(oend - o) < ll + ml + 32;   /* see decode_block5_exact */
+        if (ctx) CTX_LITS(ll, { berr = 1; break; });
+        else if (ex_) memcpy(o, lp, ll);
+        else copy_lits(o, lp, ll);
+        if (berr) break;
+        o += ll;
+        lp += ll;
+        if (dist > (size_t)(o - hist) || dist > wsize) { berr = 1; break; }
+        if (ex_) copy_match_exact(o, dist, ml);
+        else copy_match(o, dist, ml);
+        o += ml;
+        if (ctx) lctx = d->hufc.cmap[o[-1]];
+    }
+    d->reps[0] = rep0; d->reps[1] = rep1; d->reps[2] = rep2;
+    if (berr) return LZR_ERR_CORRUPT;
+    size_t tail = (size_t)(lend - lp);
+    if (tail != (size_t)(oend - o)) return LZR_ERR_CORRUPT;
+    if (ctx) {
+        CTX_LITS(tail, return LZR_ERR_CORRUPT);
+        return lb + (lpos + 7) / 8 == lbend ? LZR_OK : LZR_ERR_CORRUPT;
+    }
+    memcpy(o, lp, tail);
+    return LZR_OK;
+}
+
+static __attribute__((noinline)) int pipe_exec5(lzr_dctx *d, const pblk *b, const uint8_t *lits, const pseq *sq, uint8_t *dst)
+{
+    return pipe_exec_impl(d, b, lits, sq, dst, 0, 0);
+}
+static __attribute__((noinline)) int pipe_exec6(lzr_dctx *d, const pblk *b, const uint8_t *lits, const pseq *sq, uint8_t *dst)
+{
+    return pipe_exec_impl(d, b, lits, sq, dst, 1, 0);
+}
+/* writes nothing past the block: the last block of a group of segments */
+static __attribute__((noinline)) int pipe_exec5_exact(lzr_dctx *d, const pblk *b, const uint8_t *lits, const pseq *sq, uint8_t *dst)
+{
+    return pipe_exec_impl(d, b, lits, sq, dst, 0, 1);
+}
+static __attribute__((noinline)) int pipe_exec6_exact(lzr_dctx *d, const pblk *b, const uint8_t *lits, const pseq *sq, uint8_t *dst)
+{
+    return pipe_exec_impl(d, b, lits, sq, dst, 1, 1);
+}
+#ifdef LZR_BMI2_DISPATCH
+static __attribute__((noinline)) LZR_TARGET_BMI2 int pipe_exec6_bmi2(lzr_dctx *d, const pblk *b, const uint8_t *lits, const pseq *sq, uint8_t *dst)
+{
+    return pipe_exec_impl(d, b, lits, sq, dst, 1, 0);
+}
+#endif
+
+/* Execute block i (its entropy stage done) at its place in the output. */
+static int pipe_exec(lzr_dctx *d, ppipe *P, int i)
+{
+    const pblk *b = &P->b[i];
+    uint8_t *dst = P->obase + P->coff[i];
+    if (b->reset) reset_state(d);
+    d->lo = dst - (d->total_out - d->seg_start);
+    d->pbase = (unsigned)(d->total_out - d->seg_start) & (TOK_POS - 1);
+    int r = LZR_OK;
+    int s = i % P->nslot;
+    if (b->type == 0) memcpy(dst, b->pl, b->raw);
+    else if (P->exact_last && i == P->nb - 1)
+        r = b->type == 4 ? decode_tokens_exact(d, b->pl, b->comp, dst, b->raw)
+          : b->type == 5 ? pipe_exec5_exact(d, b, P->lits[s], P->seqs[s], dst) : pipe_exec6_exact(d, b, P->lits[s], P->seqs[s], dst);
+    else if (b->type == 4) r = decode_tokens_fast(d, b->pl, b->comp, dst, b->raw);
+    else if (b->type == 5) r = pipe_exec5(d, b, P->lits[s], P->seqs[s], dst);
+    else {
+#ifdef LZR_BMI2_DISPATCH
+        if (LZR_HAS_BMI2()) r = pipe_exec6_bmi2(d, b, P->lits[s], P->seqs[s], dst);
+        else
+#endif
+        r = pipe_exec6(d, b, P->lits[s], P->seqs[s], dst);
+    }
+    d->total_out += b->raw;
+    return r;
+}
+
+static void pipe_hash(ppipe *P, int a, int e)
+{
+    for (int i = a; i < e; i++) xxh64_update(&P->xs, P->obase + P->coff[i], P->b[i].raw);
+}
+
+/* Fault in the output pages of block i (its content is not yet written,
+ * so the bytes stored here do not matter): first writes to fresh pages
+ * are slow (the kernel zeroes them), and this way the workers take that
+ * cost instead of the thread that executes the blocks. */
+static void pipe_touch(ppipe *P, int i)
+{
+    /* (from 64 bytes in: the previous block's last copy may still write
+     * just past its end) */
+    uintptr_t a = (uintptr_t)(P->obase + P->coff[i]), e = a + P->b[i].raw;
+    for (a = (a + 64 + 4095) & ~(uintptr_t)4095; a < e; a += 4096) *(volatile uint8_t *)a = 0;
+}
+
+typedef struct { ppipe *P; pent w; } pworker;
+
+static void *pipe_thread(void *arg)
+{
+    pworker *W = (pworker *)arg;
+    ppipe *P = W->P;
+    pthread_mutex_lock(&P->mu);
+    while (!P->stop) {
+        if (!P->hashing && P->hash_done < P->exec_done) {   /* hash executed blocks, in order */
+            int a = P->hash_done, e = P->exec_done;
+            P->hashing = 1;
+            pthread_mutex_unlock(&P->mu);
+            pipe_hash(P, a, e);
+            pthread_mutex_lock(&P->mu);
+            P->hash_done = e;
+            P->hashing = 0;
+            if (P->main_wait) pthread_cond_signal(&P->cv_main);
+            continue;
+        }
+        while (P->ent_next < P->nb && P->b[P->ent_next].state) P->ent_next++;
+        int i = P->ent_next;
+        if (i < P->nb && i < P->exec_done + P->nslot && W->w.d) {
+            P->b[i].state = 1;
+            P->ent_next++;
+            pthread_mutex_unlock(&P->mu);
+            int s = i % P->nslot;
+            pipe_touch(P, i);
+            int r = pipe_ent(&W->w, &P->b[i], P->lits[s], P->seqs[s]);
+            pthread_mutex_lock(&P->mu);
+            P->b[i].state = r ? r : 2;
+            if (P->main_wait) pthread_cond_signal(&P->cv_main);
+            continue;
+        }
+        P->nwait++;
+        pthread_cond_wait(&P->cv_work, &P->mu);
+        P->nwait--;
+    }
+    pthread_mutex_unlock(&P->mu);
+    return NULL;
+}
+
+/* Decode blocks [pos, endpos) of src (all of the frame's data blocks:
+ * total content bytes) into obase with `threads` threads (the caller is
+ * one). Returns LZR_OK and the content hash in *hash, LZR_ERR_*, or 1 if
+ * the frame should go to the serial decoder (a malformed header). */
+static int pipe_decode(const uint8_t *src, size_t n, size_t pos, size_t endpos, int version, int wlog, int threads,
+                       uint8_t *obase, uint64_t coff0, uint64_t total, int exact_last, uint64_t *hash)
+{
+    /* blocks and their header information */
+    int nb = 0, cb = 0;
+    pblk *b = NULL;
+    uint64_t *coff = NULL;
+    uint8_t *pad = NULL;
+    size_t padpos = endpos;
+    int r = LZR_OK;
+    /* payloads closer than ARC_SLACK to the end of the input are read from
+     * a padded copy (the decoders read a little past a payload) */
+    for (size_t p = pos; p < endpos;) {
+        size_t comp = rd32le(src + p + 5);
+        if (p + LZR_BLOCK_HDR + comp + ARC_SLACK > n) { padpos = p; break; }
+        p += LZR_BLOCK_HDR + comp;
+    }
+    if (padpos < endpos) {
+        if (!(pad = (uint8_t *)malloc(endpos - padpos + ARC_SLACK))) return LZR_ERR_NOMEM;
+        memcpy(pad, src + padpos, endpos - padpos);
+        memset(pad + (endpos - padpos), 0, ARC_SLACK);
+    }
+    const uint8_t *huf = NULL, *fsrc[3] = {NULL, NULL, NULL};
+    uint64_t c = 0;
+    for (size_t p = pos; p < endpos;) {
+        uint8_t type = src[p];
+        size_t raw = rd32le(src + p + 1), comp = rd32le(src + p + 5);
+        const uint8_t *pl = (p >= padpos ? pad + (p - padpos) : src + p) + LZR_BLOCK_HDR;
+        p += LZR_BLOCK_HDR + comp;
+        if (type & LZR_BT_SKIP) continue;
+        if (nb == cb) {
+            int nc = cb ? 2 * cb : 256;
+            pblk *nbk = (pblk *)realloc(b, (size_t)nc * sizeof(pblk));
+            uint64_t *nco = nbk ? (uint64_t *)realloc(coff, (size_t)nc * sizeof(uint64_t)) : NULL;
+            if (nbk) b = nbk;
+            if (nco) coff = nco;
+            if (!nbk || !nco) { r = LZR_ERR_NOMEM; goto out; }
+            cb = nc;
+        }
+        pblk *k = &b[nb];
+        memset(k, 0, sizeof(*k));
+        k->pl = pl;
+        k->raw = (uint32_t)raw;
+        k->comp = (uint32_t)comp;
+        k->type = type & LZR_BT_TYPE;
+        k->reset = (type & LZR_BT_RESET) != 0;
+        coff[nb] = c;
+        c += raw;
+        /* the checks of step() */
+        if ((k->type == 0 && comp != raw) || (k->type >= 4 && (raw == 0 || comp > raw))) { r = 1; goto out; }
+        if (k->reset) { huf = NULL; fsrc[0] = fsrc[1] = fsrc[2] = NULL; }
+        if (k->type >= 5) {
+            if (pipe_pre(k, &huf, fsrc)) { r = 1; goto out; }
+        } else {
+            k->state = 2;   /* nothing for the workers */
+        }
+        nb++;
+    }
+    if (c != total) { r = 1; goto out; }
+
+    ppipe P;
+    memset(&P, 0, sizeof(P));
+    P.b = b;
+    P.nb = nb;
+    P.coff = coff;
+    P.obase = obase;
+    P.exact_last = exact_last;
+    if (!hash) P.hashing = 1;   /* no hashing (the caller hashes) */
+    int nw = threads - 1;
+    if (nw > 63) nw = 63;
+    P.nslot = 2 * threads + 2;
+    P.lits = (uint8_t **)calloc((size_t)P.nslot, sizeof(uint8_t *));
+    P.seqs = (pseq **)calloc((size_t)P.nslot, sizeof(pseq *));
+    if (!P.lits || !P.seqs) r = LZR_ERR_NOMEM;
+    for (int s = 0; s < P.nslot && !r; s++) {
+        P.lits[s] = (uint8_t *)malloc(LZR_BLOCK_SIZE + 64);
+        P.seqs[s] = (pseq *)malloc((MAX_SEQ + 1) * sizeof(pseq));
+        if (!P.lits[s] || !P.seqs[s]) r = LZR_ERR_NOMEM;
+    }
+    lzr_dctx *d = lzr_dctx_new();
+    pent me = {lzr_dctx_new(), NULL, {NULL, NULL, NULL}, {0, 0, 0}, 0};
+    pworker *W = (pworker *)calloc((size_t)(nw > 0 ? nw : 1), sizeof(pworker));
+    if (!d || !me.d || !W) r = r ? r : LZR_ERR_NOMEM;
+    pthread_t tid[64];
+    int started = 0;
+    if (!r) {
+        d->version = version;
+        d->wsize = (size_t)1 << wlog;
+        d->state = ST_BLOCKS;
+        d->total_out = coff0;   /* the content offset of obase */
+        reset_state(d);         /* seg_start = coff0: a segment starts here */
+        me.d->version = version;
+        xxh64_init(&P.xs);
+        pthread_mutex_init(&P.mu, NULL);
+        pthread_cond_init(&P.cv_work, NULL);
+        pthread_cond_init(&P.cv_main, NULL);
+        for (int t = 0; t < nw; t++) {
+            W[t].P = &P;
+            W[t].w.d = lzr_dctx_new();   /* NULL: the worker only hashes */
+            if (W[t].w.d) W[t].w.d->version = version;
+            if (pthread_create(&tid[started], NULL, pipe_thread, &W[t]) == 0) started++;
+            else { lzr_dctx_free(W[t].w.d); W[t].w.d = NULL; }
+        }
+        for (int i = 0; i < nb && !r; i++) {
+            pthread_mutex_lock(&P.mu);
+            while (P.b[i].state == 1) {
+                /* a worker has block i: decode a later queued one meanwhile */
+                while (P.ent_next < nb && P.b[P.ent_next].state) P.ent_next++;
+                int j = P.ent_next;
+                if (j < nb && j < P.exec_done + P.nslot) {
+                    P.b[j].state = 1;
+                    P.ent_next++;
+                    pthread_mutex_unlock(&P.mu);
+                    int s = j % P.nslot;
+                    pipe_touch(&P, j);
+                    int rj = pipe_ent(&me, &P.b[j], P.lits[s], P.seqs[s]);
+                    pthread_mutex_lock(&P.mu);
+                    P.b[j].state = rj ? rj : 2;
+                    continue;
+                }
+                P.main_wait = 1;
+                pthread_cond_wait(&P.cv_main, &P.mu);
+                P.main_wait = 0;
+            }
+            int st = P.b[i].state;
+            if (!st) P.b[i].state = 1;   /* nobody has it: decode it here */
+            pthread_mutex_unlock(&P.mu);
+            if (!st) {
+                int s = i % P.nslot;
+                st = pipe_ent(&me, &P.b[i], P.lits[s], P.seqs[s]);
+                st = st ? st : 2;
+            }
+            r = st < 0 ? st : pipe_exec(d, &P, i);
+            pthread_mutex_lock(&P.mu);
+            P.exec_done = i + 1;
+            /* wake a waiting worker: a slot is free, and maybe blocks to hash */
+            if (P.nwait) pthread_cond_signal(&P.cv_work);
+            pthread_mutex_unlock(&P.mu);
+        }
+        /* finish the hash here */
+        pthread_mutex_lock(&P.mu);
+        while (P.hashing && hash) { P.main_wait = 1; pthread_cond_wait(&P.cv_main, &P.mu); P.main_wait = 0; }
+        P.stop = 1;
+        int a = P.hash_done;
+        pthread_cond_broadcast(&P.cv_work);
+        pthread_mutex_unlock(&P.mu);
+        if (!r && hash) pipe_hash(&P, a, nb);
+        for (int t = 0; t < started; t++) pthread_join(tid[t], NULL);
+        for (int t = 0; t < started; t++) lzr_dctx_free(W[t].w.d);
+        pthread_mutex_destroy(&P.mu);
+        pthread_cond_destroy(&P.cv_work);
+        pthread_cond_destroy(&P.cv_main);
+        if (hash) *hash = xxh64_digest(&P.xs);
+    }
+    free(W);
+    lzr_dctx_free(me.d);
+    lzr_dctx_free(d);
+    for (int s = 0; s < P.nslot; s++) {
+        if (P.lits) free(P.lits[s]);
+        if (P.seqs) free(P.seqs[s]);
+    }
+    free(P.lits);
+    free(P.seqs);
+out:
+    free(b);
+    free(coff);
+    free(pad);
+    return r;
+}
+
+typedef struct {
+    const uint8_t *src;
+    size_t n, pos, end;
+    int version, wlog, threads, exact, r, done;
+    uint8_t *obase;
+    uint64_t coff, clen;
+    pthread_mutex_t *mu;
+    pthread_cond_t *cv;
+} pgroup;
+
+static void *pgroup_thread(void *p)
+{
+    pgroup *g = (pgroup *)p;
+    int r = pipe_decode(g->src, g->n, g->pos, g->end, g->version, g->wlog, g->threads, g->obase + g->coff, g->coff, g->clen,
+                        g->exact, NULL);
+    pthread_mutex_lock(g->mu);
+    g->r = r;
+    g->done = 1;
+    pthread_cond_signal(g->cv);
+    pthread_mutex_unlock(g->mu);
+    return NULL;
+}
+
+/* Pipelined decoding of a frame with nseg < threads segments into out
+ * (reserved here; out->len is not advanced). One segment: the calling
+ * thread runs the pipeline. Several: one pipeline per segment, side by
+ * side, the threads shared out; the calling thread hashes the segments in
+ * order. Returns LZR_OK, LZR_ERR_CHECKSUM, another LZR_ERR_*, or 1 for
+ * the serial decoder. */
+static int pipe_frame(const uint8_t *src, size_t n, const pseg *seg, int nseg, int version, int wlog, int threads,
+                      lzr_buf *out, uint64_t total, size_t endpos)
+{
+    int r = buf_reserve(out, (size_t)total + LZR_SLACK);
+    if (r) return r;
+    uint8_t *obase = out->p + out->len;
+    const uint32_t want = rd32le(src + endpos + LZR_BLOCK_HDR);
+    if (nseg == 1) {
+        uint64_t h = 0;
+        r = pipe_decode(src, n, seg[0].off, seg[0].off + seg[0].len, version, wlog, threads, obase, 0, total, 0, &h);
+        return r ? r : want == (uint32_t)h ? LZR_OK : LZR_ERR_CHECKSUM;
+    }
+    pgroup g[64];
+    pthread_t tid[64];
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_mutex_init(&mu, NULL);
+    pthread_cond_init(&cv, NULL);
+    int started = 0;
+    for (int i = 0; i < nseg; i++) {   /* nseg < threads <= 64 */
+        pgroup *q = &g[i];
+        memset(q, 0, sizeof(*q));
+        q->src = src; q->n = n;
+        q->pos = seg[i].off; q->end = seg[i].off + seg[i].len;
+        q->version = version; q->wlog = wlog;
+        q->threads = threads / nseg + (i < threads % nseg);
+        q->exact = i + 1 < nseg;
+        q->obase = obase; q->coff = seg[i].coff; q->clen = seg[i].clen;
+        q->mu = &mu; q->cv = &cv;
+        if (pthread_create(&tid[i], NULL, pgroup_thread, q) != 0) break;
+        started++;
+    }
+    for (int i = started; i < nseg; i++) pgroup_thread(&g[i]);   /* could not start a thread */
+    xxh64_state xs;
+    xxh64_init(&xs);
+    r = LZR_OK;
+    for (int i = 0; i < nseg; i++) {
+        pthread_mutex_lock(&mu);
+        while (!g[i].done) pthread_cond_wait(&cv, &mu);
+        pthread_mutex_unlock(&mu);
+        if (g[i].r) { r = g[i].r; break; }   /* the first failing segment in frame order */
+        xxh64_update(&xs, obase + seg[i].coff, (size_t)seg[i].clen);
+    }
+    for (int i = 0; i < started; i++) pthread_join(tid[i], NULL);
+    pthread_mutex_destroy(&mu);
+    pthread_cond_destroy(&cv);
+    if (r) {
+        for (int i = 0; i < nseg; i++) if (g[i].r == 1) return 1;   /* a malformed header anywhere: serial */
+        return r;
+    }
+    return want == (uint32_t)xxh64_digest(&xs) ? LZR_OK : LZR_ERR_CHECKSUM;
+}
 #endif
 
 static int decompress_serial(const uint8_t *src, size_t n, lzr_buf *out, int max_window_log, size_t *consumed)
@@ -920,7 +1683,7 @@ int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, i
     if (threads < 2 || hl <= 0 || src[4] < 7 || (flags & LZR_FLAG_X86)) return decompress_serial(src, n, out, max_window_log, consumed);
 
     pseg *seg = NULL;
-    int nseg = 0, cseg = 0, ok = 0;
+    int nseg = 0, cseg = 0, ok = 0, n56 = 0;
     size_t pos = (size_t)hl, endpos = 0;
     uint64_t total = 0;
     for (;;) {
@@ -939,6 +1702,7 @@ int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, i
             break;
         }
         if (t != 0 && t != 4 && t != 5 && t != 6) break;
+        n56 += t >= 5;
         if (!nseg || (type & LZR_BT_RESET)) {
             if (nseg == cseg) {
                 int nc = cseg ? 2 * cseg : 64;
@@ -955,7 +1719,7 @@ int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, i
         total += raw;
         pos += LZR_BLOCK_HDR + comp;
     }
-    if (!ok || nseg < 2 || (csize >= 0 && (uint64_t)csize != total) || total > (uint64_t)SIZE_MAX - 1024) {
+    if (!ok || !nseg || (csize >= 0 && (uint64_t)csize != total) || total > (uint64_t)SIZE_MAX - 1024) {
         free(seg);
         return decompress_serial(src, n, out, max_window_log, consumed);
     }
@@ -963,6 +1727,26 @@ int lzr_decompress_mt(const uint8_t *src, size_t n, lzr_buf *out, int threads, i
      * skipped by its decoder) */
     seg[nseg - 1].len = endpos - seg[nseg - 1].off;
     seg[nseg - 1].clen = total - seg[nseg - 1].coff;
+    /* With at least as many segments as threads, whole segments in
+     * parallel. With fewer, each segment through the pipeline (types 5-6)
+     * with its share of the threads, the segments side by side. */
+    {
+        if (threads > 64) threads = 64;
+        if (n56 >= 2 && nseg < threads) {
+            int r = pipe_frame(src, n, seg, nseg, src[4], wlog, threads, out, total, endpos);
+            free(seg);
+            if (r == 1) return decompress_serial(src, n, out, max_window_log, consumed);
+            if (r == LZR_OK || r == LZR_ERR_CHECKSUM) {
+                out->len += (size_t)total;
+                if (consumed) *consumed = endpos + LZR_BLOCK_HDR + 4;
+            }
+            return r == LZR_OK ? 1 : r;
+        }
+    }
+    if (nseg < 2) {
+        free(seg);
+        return decompress_serial(src, n, out, max_window_log, consumed);
+    }
 
     int r = buf_reserve(out, (size_t)total + LZR_SLACK);
     int *state = (int *)calloc((size_t)nseg, sizeof(int));
