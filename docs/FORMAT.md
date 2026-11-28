@@ -44,7 +44,7 @@ Constants used throughout:
 | Name | Value | Meaning |
 |---|---|---|
 | `BLOCK_MAX` | 2^18 = 262144 | largest `raw_len` of a block |
-| `WLOG_MIN`, `WLOG_MAX` | 18, 26 | range of `window_log` |
+| `WLOG_MIN`, `WLOG_MAX` | 18, 31 | range of `window_log` |
 | `ML_MIN` | 2 | smallest match length (type 5/6) |
 | `HUF_MAXLEN` | 11 | longest Huffman code |
 | `FSE_LOG` | 9 | tANS table log (512 states) |
@@ -59,7 +59,7 @@ offset size field
 0      4    magic        "LZRN" (4C 5A 52 4E)
 4      1    version      7 (5 and 6: legacy, Appendix C)
 5      1    flags
-6      1    window_log   18..26
+6      1    window_log   18..31
 7      1    reserved     0
 8      8    content_size u64, only if flags bit 1 is set
 ```
@@ -79,7 +79,9 @@ The header is 8 bytes long, or 16 if it carries `content_size`.
 
 A decoder MUST reject a frame as *unsupported* if any flag other than SIZE or X86 is set. That includes ENCRYPTED.
 
-**window_log.** The window size is `W = 2^window_log`. A match MUST NOT reach more than `W` bytes back (section 5.4). A decoder MUST reject `window_log` outside 18..26 as corrupt. Decoders need about `W + BLOCK_MAX` bytes of history (section 11). An encoder SHOULD use the smallest `window_log` that covers the content when the size is known.
+**window_log.** The window size is `W = 2^window_log`, from 256 KiB to 2 GiB. A match MUST NOT reach more than `W` bytes back (section 5.4). A decoder MUST reject `window_log` outside 18..31 as corrupt. Decoders need about `W + BLOCK_MAX` bytes of history (section 11). An encoder SHOULD use the smallest `window_log` that covers the content when the size is known.
+
+**Memory limit.** A decoder has a limit on the window it accepts, `max_window_log`. It MUST be at least 27 by default (128 MiB), the same default as zstd, and SHOULD be settable up to 31. A frame whose `window_log` is above the limit is rejected with the error kind *memory limit* (10.1) before any block is decoded. Such a frame is valid; the user can decode it with a higher limit. Encoders SHOULD NOT use `window_log > 27` unless the user asks for it (today's lzrans encoder uses at most 26; long-range modes may use more).
 
 **reserved.** MUST be 0. Otherwise the frame is corrupt.
 
@@ -288,7 +290,7 @@ The sequence section codes three symbol streams, each with its own table:
 |---|---|---|
 | LL (literal length) | 62 | codes 0..61 (6.5) |
 | ML (match length) | 58 | codes 0..57 (6.5) |
-| OF (offset) | 65 | codes 0..64 (6.5) |
+| OF (offset) | 73 | codes 0..72 (6.5) |
 
 #### 6.4.1 Normalized counts
 
@@ -359,7 +361,7 @@ value = base + read(nbits)
 | OF, code < 3 | | repeat offset index `code` (5.3) |
 | OF, code ≥ 3 | 4 (applied to `code - 3`) | distance = value + 1 |
 
-For example, distance 32 gives value 31, which is code 17 of the d=4 family (base 24, 3 extra bits = 7), so the OF code is 20. The alphabets are larger than valid blocks need. LL ≤ 2^18 needs codes up to 44, and distance ≤ 2^26 needs OF codes up to 62. Decoders MUST cope with the larger codes. A larger code always produces a value that fails a later check, so the block is corrupt.
+For example, distance 32 gives value 31, which is code 17 of the d=4 family (base 24, 3 extra bits = 7), so the OF code is 20. The OF alphabet reaches distance 2^31, the largest window: OF code 72 is value code 69, values 2^30 + 2^29 .. 2^31 - 1, with 29 extra bits. The LL alphabet is larger than valid blocks need (LL ≤ 2^18 needs codes up to 44). Decoders MUST cope with codes whose values fail a later check: the block is then corrupt. One sequence can need up to 25 + 16 + 29 extra bits.
 
 ### 6.6 Context literal section (type 6)
 
@@ -552,6 +554,7 @@ A frame has no other checksum: not for the header, not per block. Streaming deco
 | Kind | When |
 |---|---|
 | **unsupported** | version not 5, 6 or 7; a reserved flag set; block type 7-63 (version 7) |
+| **memory limit** | `window_log` above the decoder's `max_window_log` (3.1); the frame may be valid |
 | **corrupt** | anything else this document calls corrupt, including a truncated frame |
 | **checksum** | the end block's checksum does not match |
 
@@ -578,11 +581,11 @@ A frame ends after its end block. What follows is outside the frame. The lzrans 
 | content size | < 2^63 bytes |
 | block content | ≤ 2^18 bytes |
 | block payload | ≤ `raw_len` (types 4-6); ≤ 589824 bytes (any block) |
-| match distance | ≤ 2^window_log ≤ 64 MiB |
+| match distance | ≤ 2^window_log ≤ 2 GiB (default decoder limit 128 MiB) |
 | sequences per block | ≤ 131073 |
 | match length | type 5/6: ≤ 2^18; type 4 token: ≤ 273 |
 
-A decoder needs about `2^window_log + 2^18` bytes of history, plus one block of input. It can decode straight into the output buffer when the whole output is in memory, unless the X86 flag is set. Tables take under 64 KiB, and the type 4 model about 15 KiB.
+A decoder needs about `2^window_log + 2^18` bytes of history (the lzrans decoder allocates `2 * 2^window_log + 2^18` when it streams), plus one block of input. It can decode straight into the output buffer when the whole output is in memory, unless the X86 flag is set. Tables take under 64 KiB, and the type 4 model about 15 KiB.
 
 ## 12. Versioning and extension
 
@@ -641,6 +644,7 @@ Before 1.0, the draft of this document listed format problems found while writin
 | A10 | Version number of the frozen format. | **7**. Versions 5 and 6 stay readable. |
 | A11 | LL and OF alphabets larger than needed. A crafted block could make the C decoder read 66 bits at once. | **Kept**; decoder fixed, vector `bad-extra-bits-66`. |
 | A12 | Meaning of concatenated frames not defined. | **Open.** To be settled with the CLI (10.3). |
+| A13 | (Found by the long-range dedup study.) `window_log` limited to 26 and type 5/6 offsets to distances below 2^27, so long-range matching inside a frame would have needed a new format. | **Fixed** before release: `window_log` up to 31 with a decoder memory limit (default 27), OF alphabet 73 codes (distances up to 2^31). |
 
 ## Appendix B. Differences from zstd and LZMA (informative)
 
@@ -655,6 +659,7 @@ A 1.0 decoder reads versions 5 and 6 with these differences from version 7:
 * The type byte is the block type itself. Types 7-255 are *corrupt* (not unsupported, and not skippable), and there is no reset bit, so the whole frame is one segment.
 * Block type 6 is valid only in version 6. Version 5 has no other difference from version 6.
 * `comp_len` for types 4-6 may be larger than `raw_len` (up to `COMP_MAX`).
+* `window_log` is 18..26, and the OF alphabet has 65 codes (distances below 2^27).
 * Type 5 literal section, modes 2 and 3: only `size0`, `size1` and `size2` are stored (12 bytes). Stream 3 starts after stream 2 and ends at the byte where its last literal ends. The literal section ends there, and the section is corrupt if stream 3 would read past the payload.
 * Huffman codes may be incomplete. A decoder MUST behave as if every 11-bit pattern that matches no code decodes to symbol 0 and uses 11 bits. (Valid streams never contain one.)
 * Type 4 `pos` (7.2) is the position relative to the start of the **block**, modulo 4.

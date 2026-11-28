@@ -252,6 +252,11 @@ def build():
     V.append(("hand-type4-then-type5", frame([t4[0], (5, 20, p)], checksum_of=fr_content), "ok",
               "repeat offsets carry over from a type 4 block to a type 5 block", fr_content))
 
+    # a 2 GB window in the header (decoders need max_window_log 31 for it)
+    c = noise(100, 41)
+    V.append(("hand-wlog31", frame([(0, 100, c)], wlog=31, checksum_of=c), "ok",
+              "window_log 31 (needs a decoder memory limit of 31)", c))
+
     # ---- invalid frames
     good = lzrans.compress(words(5000, 17), level=6)
     hl = header_len(good)
@@ -270,7 +275,7 @@ def build():
     bad("bad-flag-encrypted", patch(5, good[5] | 1), "unsupported", "flag bit 0 (encryption, reserved)")
     bad("bad-flag-bit3", patch(5, good[5] | 8), "unsupported", "unknown flag bit 3")
     bad("bad-wlog17", patch(6, 17), "corrupt", "window_log below 18")
-    bad("bad-wlog27", patch(6, 27), "corrupt", "window_log above 26")
+    bad("bad-wlog32", patch(6, 32), "corrupt", "window_log above 31")
     bad("bad-reserved", patch(7, 1), "corrupt", "reserved header byte not zero")
     for t in (1, 3, 0x41, 0x43):
         bad("bad-block-type-0x%02x" % t, patch(hl, t), "corrupt", "block type byte 0x%02x" % t)
@@ -362,7 +367,7 @@ def _decode_nocheck(*blks):
 
 def c_decode(blob):
     try:
-        return "ok", lzrans.decompress(blob)
+        return "ok", lzrans.decompress(blob, max_window_log=31)
     except lzrans.ChecksumError:
         return "checksum", None
     except lzrans.LzransError as e:
@@ -415,6 +420,8 @@ def main():
             content = None
             print("kept frozen", name)
         entry = {"file": name + ".lzr", "expect": expect, "description": desc}
+        if len(blob) >= 8 and blob[6] > 27 and expect == "ok":
+            entry["max_window_log"] = blob[6]    # above the default decoder limit
         entry.update(check(name, blob, expect, content))
         allfeat |= set(entry.get("features", ()))
         open(path, "wb").write(blob)

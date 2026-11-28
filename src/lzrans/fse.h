@@ -18,7 +18,7 @@
 
 #define FSE_LOG 9
 #define FSE_L (1u << FSE_LOG)
-#define FSE_MAXSYM 72
+#define FSE_MAXSYM 73
 
 typedef struct { uint8_t sym, nb; uint16_t base; } fse_dent;
 

@@ -1175,6 +1175,19 @@
    ]
   },
   {
+   "file": "hand-wlog31.lzr",
+   "expect": "ok",
+   "description": "window_log 31 (needs a decoder memory limit of 31)",
+   "max_window_log": 31,
+   "size": 100,
+   "sha256": "66e7eea70d5bc8cef90b8490364f97dcd5c52ff4c36e3320c76cd8b12da2e359",
+   "features": [
+    "block0",
+    "version7",
+    "wlog31"
+   ]
+  },
+  {
    "file": "bad-magic.lzr",
    "expect": "corrupt",
    "description": "wrong magic"
@@ -1205,9 +1218,9 @@
    "description": "window_log below 18"
   },
   {
-   "file": "bad-wlog27.lzr",
+   "file": "bad-wlog32.lzr",
    "expect": "corrupt",
-   "description": "window_log above 26"
+   "description": "window_log above 31"
   },
   {
    "file": "bad-reserved.lzr",
