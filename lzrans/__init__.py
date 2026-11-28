@@ -1,9 +1,9 @@
 """lzrans - LZ77 (64 KB window) + 3-stream rANS compression with a C core.
 
 Public API:
-    compress(data, level=6, window_log=0) -> bytes
-    decompress(data) -> bytes
-    Compressor(level=6, window_log=0)   .compress(chunk) / .flush()
+    compress(data, level=6, window_log=0, threads=1, filter=None, segment=-1) -> bytes
+    decompress(data, threads=1) -> bytes   (threads: segments decoded in parallel)
+    Compressor(level=6, window_log=0, threads=1, filter=None, segment=-1)   .compress(chunk) / .flush()
     Decompressor()                      .decompress(chunk), .eof, .unused_data
     crc32(data, value=0) -> int
     frame_info(data) -> (content_size or None, window_log, flags)

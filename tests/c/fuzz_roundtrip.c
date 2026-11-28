@@ -100,6 +100,48 @@ int main(int argc, char **argv)
         free(comp.p);
         free(dec.p);
     }
+    /* segment mode (reset points + seek index) and the parallel decoder:
+     * same content as the serial decoder; damaged frames rejected */
+    size_t segn = 3 * (1u << 20) + 77;
+    uint8_t *big = malloc(segn);
+    for (int it = 0; it < iters / 20 + 2 && !fails; it++) {
+        size_t n = (1u << 20) + rnd() % (segn - (1u << 20));
+        int kind = rnd() % 7, level = (int)(rnd() % 15) - 3;
+        gen(big, n, kind);
+        lzr_cctx *c = lzr_cctx_new_seg(level, 0, (rnd() & 1) ? (int64_t)n : -1, (1u << 20) + rnd() % 300000);
+        lzr_buf comp = {0};
+        lzr_cctx_set_threads(c, 1 + (int)(rnd() % 4));
+        if (rnd() & 1) lzr_cctx_set_filter(c, LZR_FILTER_X86);
+        int r = lzr_cctx_write(c, big, n, &comp);
+        if (!r) r = lzr_cctx_end(c, &comp);
+        lzr_cctx_free(c);
+        for (int m = -1; m < 30 && !fails; m++) {
+            uint8_t *mut = malloc(comp.len);
+            memcpy(mut, comp.p, comp.len);
+            size_t mlen = comp.len;
+            if (m >= 0 && m % 5 == 0) mlen = rnd() % mlen;
+            else if (m >= 0) for (int f = 0; f < 1 + m % 3; f++) mut[rnd() % mlen] ^= (uint8_t)(1 + rnd() % 255);
+            lzr_buf o = {0}, o2 = {0};
+            size_t used = 0;
+            int r1 = lzr_decompress_mt(mut, mlen, &o, 2 + (int)(rnd() % 3), LZR_WLOG_DEC_DEFAULT, &used);
+            int r2 = decompress_chunked(mut, mlen, &o2);
+            if (m < 0 && (r || r1 != 1 || o.len != n || memcmp(o.p, big, n))) {
+                printf("SEGMENT ROUNDTRIP FAIL it=%d n=%zu kind=%d level=%d r=%d r1=%d\n", it, n, kind, level, r, r1);
+                fails++;
+            }
+            if (r1 == 1 && (o.len != n || memcmp(o.p, big, n))) { printf("SEGMENT SILENT CORRUPTION it=%d\n", it); fails++; }
+            if ((r1 == 1) != (r2 == 1 && used == mlen) && !(r1 == 1 && used < mlen)) {
+                printf("SEGMENT MISMATCH it=%d m=%d r1=%d r2=%d\n", it, m, r1, r2);
+                fails++;
+            }
+            if (r1 != 1) rejected++;
+            free(o.p);
+            free(o2.p);
+            free(mut);
+        }
+        free(comp.p);
+    }
+    free(big);
     free(src);
     printf("iters=%d fails=%ld corrupt_rejected=%ld\n", iters, fails, rejected);
     return fails != 0;

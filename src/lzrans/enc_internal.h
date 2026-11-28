@@ -81,6 +81,11 @@ struct lzr_cctx {
     struct lzr_batch *bt;  /* the open batch: jobs start as their input is
                             * buffered (threads), see batch_feed in enc.c  */
 
+    /* segment mode (lzr_cctx_new_seg): the content is cut into segments
+     * compressed by independent inner contexts and joined at reset points,
+     * with a seek index at the end; this context only frames them */
+    struct lzr_seg *sg;
+
     /* per-block scratch */
     uint32_t *seq_ll, *seq_ml, *seq_dist;  /* dist: 0..2 = rep idx, else dist + 2 */
     uint8_t *lits, *llc, *mlc, *ofc, *blk;

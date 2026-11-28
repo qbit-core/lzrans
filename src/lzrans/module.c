@@ -73,6 +73,19 @@ static int resolve_threads(int threads)
     return n < 1 ? 1 : (n > 4 ? 4 : (int)n);
 }
 
+/* segment: -1 = the level's default (lzr_default_segment), 0 = off,
+ * else the reset interval in bytes (>= 1 MiB). */
+static int resolve_segment(long long seg, int level, uint64_t *out)
+{
+    if (seg < 0) { *out = lzr_default_segment(level); return 0; }
+    if (seg > 0 && (uint64_t)seg < LZR_SEG_MIN) {
+        PyErr_SetString(PyExc_ValueError, "segment must be -1 (level default), 0 (off) or >= 1 MiB");
+        return -1;
+    }
+    *out = (uint64_t)seg;
+    return 0;
+}
+
 static int check_level(int level, int wlog)
 {
     if (level < LZR_LEVEL_MIN || level > LZR_LEVEL_MAX) {
@@ -99,19 +112,21 @@ static int parse_filter(PyObject *f)
 
 static PyObject *py_compress(PyObject *self, PyObject *args, PyObject *kw)
 {
-    static char *kwlist[] = {"data", "level", "window_log", "threads", "filter", NULL};
+    static char *kwlist[] = {"data", "level", "window_log", "threads", "filter", "segment", NULL};
     Py_buffer in;
     int level = 6, wlog = 0, threads = 1;
+    long long segarg = -1;
+    uint64_t seg = 0;
     PyObject *fobj = NULL;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|iiiO:compress", kwlist, &in, &level, &wlog, &threads, &fobj)) return NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|iiiOL:compress", kwlist, &in, &level, &wlog, &threads, &fobj, &segarg)) return NULL;
     int filter = parse_filter(fobj);
-    if (filter < 0 || check_level(level, wlog) || check_threads(threads)) { PyBuffer_Release(&in); return NULL; }
+    if (filter < 0 || check_level(level, wlog) || check_threads(threads) || resolve_segment(segarg, level, &seg)) { PyBuffer_Release(&in); return NULL; }
     threads = resolve_threads(threads);
 
     lzr_buf out = {0};
     int r;
     Py_BEGIN_ALLOW_THREADS
-    lzr_cctx *c = lzr_cctx_new(level, wlog, (int64_t)in.len);
+    lzr_cctx *c = lzr_cctx_new_seg(level, wlog, (int64_t)in.len, seg);
     if (!c) r = LZR_ERR_NOMEM;
     else {
         lzr_cctx_set_threads(c, threads);
@@ -130,15 +145,17 @@ static PyObject *py_compress(PyObject *self, PyObject *args, PyObject *kw)
 
 static PyObject *py_decompress(PyObject *self, PyObject *args, PyObject *kw)
 {
-    static char *kwlist[] = {"data", "max_window_log", NULL};
+    static char *kwlist[] = {"data", "threads", "max_window_log", NULL};
     Py_buffer in;
-    int maxw = LZR_WLOG_DEC_DEFAULT;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|i:decompress", kwlist, &in, &maxw)) return NULL;
+    int threads = 1, maxw = LZR_WLOG_DEC_DEFAULT;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "y*|ii:decompress", kwlist, &in, &threads, &maxw)) return NULL;
+    if (check_threads(threads)) { PyBuffer_Release(&in); return NULL; }
     if (maxw < LZR_WLOG_MIN || maxw > LZR_WLOG_FMT_MAX) {
         PyBuffer_Release(&in);
         PyErr_SetString(PyExc_ValueError, "max_window_log must be 18..31");
         return NULL;
     }
+    threads = resolve_threads(threads);
     lzr_buf out = {0};
     int r;
     size_t used = 0;
@@ -159,14 +176,7 @@ static PyObject *py_decompress(PyObject *self, PyObject *args, PyObject *kw)
         out.fixed = 1;
     }
     Py_BEGIN_ALLOW_THREADS
-    lzr_dctx *d = lzr_dctx_new();
-    if (!d) r = LZR_ERR_NOMEM;
-    else {
-        r = lzr_dctx_set_output(d, &out);
-        if (!r) r = lzr_dctx_set_max_window_log(d, maxw);
-        if (!r) r = lzr_dctx_write(d, (const uint8_t *)in.buf, (size_t)in.len, &out, &used);
-        lzr_dctx_free(d);
-    }
+    r = lzr_decompress_mt((const uint8_t *)in.buf, (size_t)in.len, &out, threads, maxw, &used);
     Py_END_ALLOW_THREADS
     Py_ssize_t inlen = in.len;
     PyBuffer_Release(&in);
@@ -221,15 +231,17 @@ typedef struct {
 
 static int Compressor_init(CompressorObject *self, PyObject *args, PyObject *kw)
 {
-    static char *kwlist[] = {"level", "window_log", "threads", "filter", NULL};
+    static char *kwlist[] = {"level", "window_log", "threads", "filter", "segment", NULL};
     int level = 6, wlog = 0, threads = 1;
+    long long segarg = -1;
+    uint64_t seg = 0;
     PyObject *fobj = NULL;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "|iiiO:Compressor", kwlist, &level, &wlog, &threads, &fobj)) return -1;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|iiiOL:Compressor", kwlist, &level, &wlog, &threads, &fobj, &segarg)) return -1;
     int filter = parse_filter(fobj);
-    if (filter < 0 || check_level(level, wlog) || check_threads(threads)) return -1;
+    if (filter < 0 || check_level(level, wlog) || check_threads(threads) || resolve_segment(segarg, level, &seg)) return -1;
     threads = resolve_threads(threads);
     if (self->c) { lzr_cctx_free(self->c); self->c = NULL; }
-    self->c = lzr_cctx_new(level, wlog, -1);
+    self->c = lzr_cctx_new_seg(level, wlog, -1, seg);
     if (!self->c) { PyErr_NoMemory(); return -1; }
     lzr_cctx_set_threads(self->c, threads);
     if (lzr_cctx_set_filter(self->c, filter)) { PyErr_NoMemory(); return -1; }
@@ -397,11 +409,15 @@ static PyTypeObject DecompressorType = {
 
 static PyMethodDef methods[] = {
     {"compress", (PyCFunction)(void (*)(void))py_compress, METH_VARARGS | METH_KEYWORDS,
-     "compress(data, level=6, window_log=0, threads=1, filter=None) -> bytes\n"
-     "threads: match-finder threads for levels 9-11 (0 = auto, up to 4). Output is identical for any value.\n"
+     "compress(data, level=6, window_log=0, threads=1, filter=None, segment=-1) -> bytes\n"
+     "threads: worker threads (0 = auto, up to 4). Levels 7-11 and segment mode: output is identical for any value.\n"
+     "segment: reset interval in bytes for parallel decompression (-1 = level default, 0 = none, >= 1 MiB).\n"
      "filter: None, or \"x86\" for x86/x86-64 machine code (executables, libraries)."},
     {"decompress", (PyCFunction)(void (*)(void))py_decompress, METH_VARARGS | METH_KEYWORDS,
-     "decompress(data, max_window_log=27) -> bytes. Frames declaring a larger window are refused."},
+     "decompress(data, threads=1, max_window_log=27) -> bytes\n"
+     "threads: segments decoded in parallel (0 = auto, up to 4). Frames written with segments\n"
+     "(compress(..., segment=...)) have reset points; others decode on one thread.\n"
+     "max_window_log: frames declaring a larger window are refused."},
     {"crc32", py_crc32, METH_VARARGS, "crc32(data, value=0) -> int (zlib-compatible)"},
     {"frame_info", py_frame_info, METH_O, "frame_info(data) -> (content_size or None, window_log, flags)"},
     {NULL, NULL, 0, NULL}};

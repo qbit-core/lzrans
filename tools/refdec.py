@@ -642,7 +642,7 @@ def blocks(data):
                 _need(raw == 0, "skippable block with raw_len != 0")
                 _need(pos + 9 + comp <= len(data), "truncated block")
                 pos += 9 + comp
-                yield ("skip", t, comp)
+                yield ("skip", t, comp, data[pos - comp:pos], pos - comp - 9)
                 continue
             reset, t = bool(t & 0x40), t & 0x3F
             if t > 6:
@@ -660,12 +660,44 @@ def blocks(data):
             return
 
 
+# ------------------------------------------------- 12.3 seek index
+def parse_seek_index(p):
+    """Payload of a skippable block 0x80 -> ([(frame_offset, content_offset)],
+    content_size), or None if it does not have the seek index layout."""
+    if len(p) < 32 or len(p) % 16 or p[-4:] != b"LZRX":
+        return None
+    total, n = struct.unpack_from("<QI", p, len(p) - 16)
+    if n < 1 or len(p) != 16 * n + 16:
+        return None
+    return [struct.unpack_from("<QQ", p, 16 * i) for i in range(n)], total
+
+
+def read_seek_index(data):
+    """Find the seek index from the end of a frame, as a reader seeking in a
+    file would (12.3): the end block is the last 13 bytes, the index block
+    ends right before it. Returns parse_seek_index's result or None. Does
+    not check the index against the frame (decode() does)."""
+    data = bytes(data)
+    if len(data) < 13 + 9 + 32:
+        return None
+    n, magic = struct.unpack_from("<I4s", data, len(data) - 13 - 8)
+    if magic != b"LZRX" or n < 1:
+        return None
+    pl = 16 * n + 16
+    h = len(data) - 13 - pl - 9
+    if h < 8 or data[h] != 0x80 or struct.unpack_from("<II", data, h + 1) != (0, pl):
+        return None
+    return parse_seek_index(data[h + 9:h + 9 + pl])
+
+
 def decode(data, allow_trailing=False, features=None):
     """Decode one frame. Returns the content; raises FormatError.
     features: optional set, filled with the format features met (for
     test-vector coverage)."""
     data = bytes(data)
     fr = None
+    segs = []        # (frame offset, content offset) of the first data block and each reset point
+    index = None     # (payload, header offset) of the last 0x80 block if nothing but the end block follows it
     for ev in blocks(data):
         if ev[0] == "header":
             _, ver, flags, wlog, size = ev
@@ -678,8 +710,13 @@ def decode(data, allow_trailing=False, features=None):
             continue
         if ev[0] == "skip":
             fr.feat.add("block.skippable")
+            index = (ev[3], ev[4]) if ev[1] == 0x80 else None
             continue
         _, t, raw, p, end, reset = ev
+        if t != 2:
+            index = None
+            if not segs or reset:
+                segs.append((end - len(p) - 9, len(fr.out)))
         if reset:                             # 5.5 reset point
             fr.feat.add("reset")
             fr.reps, fr.huf, fr.ctx, fr.fse, fr.tok = [1, 4, 8], None, None, [None, None, None], TokModel()
@@ -690,6 +727,10 @@ def decode(data, allow_trailing=False, features=None):
             content = x86_unfilter(fr.out) if fr.flags & 4 else bytes(fr.out)
             if struct.unpack("<I", p)[0] != xxh64(content) & 0xFFFFFFFF:
                 raise ChecksumError("checksum mismatch")
+            # 12.3: a valid seek index lists exactly these segments; an
+            # invalid one is ignored (never an error)
+            if index is not None and parse_seek_index(index[0]) == (segs, len(fr.out)):
+                fr.feat.add("seek_index")
             return content
         _need(fr.content_size is None or len(fr.out) + raw <= fr.content_size, "more content than announced")
         before = len(fr.out)

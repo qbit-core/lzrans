@@ -60,6 +60,32 @@ def test_c_decoder_streaming(e):
 
 
 @pytest.mark.parametrize("e", MANIFEST, ids=[e["file"] for e in MANIFEST])
+def test_c_decoder_parallel(e):
+    # decompress(threads=...) must give the same result and error kind
+    blob = _load(e)
+    maxw = e.get("max_window_log", 27)
+    if e["expect"] == "ok":
+        _check_content(e, lzrans.decompress(blob, threads=3, max_window_log=maxw))
+        return
+    exc = lzrans.ChecksumError if e["expect"] == "checksum" else lzrans.LzransError
+    with pytest.raises(exc) as ei:
+        lzrans.decompress(blob, threads=3, max_window_log=maxw)
+    if e["expect"] != "checksum":
+        assert not isinstance(ei.value, lzrans.ChecksumError)
+        assert ("unsupported" in str(ei.value)) == (e["expect"] == "unsupported")
+
+
+def test_seek_index_vectors():
+    feats = {e["file"]: set(e.get("features", ())) for e in MANIFEST}
+    for name in ("seg-l11-type4.lzr", "seg-l3-type5.lzr"):
+        assert {"reset", "seek_index"} <= feats[name], name
+        idx = refdec.read_seek_index(_load({"file": name}))
+        assert idx is not None and len(idx[0]) == 3, name
+    for name in ("seg-index-bad-offset.lzr", "seg-index-bad-notlast.lzr", "skippable-blocks.lzr"):
+        assert "seek_index" not in feats[name], name
+
+
+@pytest.mark.parametrize("e", MANIFEST, ids=[e["file"] for e in MANIFEST])
 def test_reference_decoder(e):
     blob = _load(e)
     exc = {"corrupt": refdec.FormatError, "unsupported": refdec.UnsupportedError,
@@ -80,7 +106,7 @@ def test_vectors_cover_the_format():
     for e in MANIFEST:
         (legacy if e["file"].startswith(("v5-", "v6-")) else feats).update(e.get("features", ()))
     assert {"version5", "version6", "block6", "t5.lit.mode2"} <= legacy
-    need = {"version7", "reset", "block.skippable", "flag.size", "flag.x86", "wlog18", "wlog26",
+    need = {"version7", "reset", "block.skippable", "seek_index", "flag.size", "flag.x86", "wlog18", "wlog26",
             "block0", "block4", "block5", "block6", "seq.none",
             "t5.lit.mode0", "t5.lit.mode1", "t5.lit.mode2", "t5.lit.mode3", "t6.ctx.mode0", "t6.ctx.mode1",
             "seq.of.new", "seq.of.rep0", "seq.of.rep1", "seq.of.rep2",

@@ -61,6 +61,16 @@ static size_t head_entries(const level_params *lp)
 static size_t rtag_size(const level_params *lp) { return lp->row ? (size_t)1 << lp->hlog : 64; }
 static size_t rhead_size(const level_params *lp) { return lp->row ? (size_t)1 << (lp->hlog - lp->row) : 64; }
 
+/* A window larger than the known input only wastes memory. */
+static unsigned fit_wlog(const level_params *lp, int64_t content_size)
+{
+    /* the tree finder needs >= 2 blocks of slack, see opt_init() */
+    unsigned min_wlog = lp->opt ? 20 : LZR_WLOG_MIN, w = lp->wlog;
+    if (w < min_wlog) w = min_wlog;
+    while (content_size >= 0 && w > min_wlog && ((uint64_t)1 << (w - 1)) >= (uint64_t)content_size) w--;
+    return w;
+}
+
 lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
 {
     if (level < LZR_LEVEL_MIN || level > LZR_LEVEL_MAX) return NULL;
@@ -84,14 +94,7 @@ lzr_cctx *lzr_cctx_new(int level, int window_log, int64_t content_size)
     if (getenv("LZR_LITE")) c->lp.lite = (uint8_t)atoi(getenv("LZR_LITE"));
     if (getenv("LZR_THREADS")) c->threads = atoi(getenv("LZR_THREADS"));
 #endif
-    /* A window larger than the known input only wastes memory. */
-    {
-        /* the tree finder needs >= 2 blocks of slack, see opt_init() */
-        unsigned min_wlog = c->lp.opt ? 20 : LZR_WLOG_MIN;
-        if (c->lp.wlog < min_wlog) c->lp.wlog = (uint8_t)min_wlog;
-        while (content_size >= 0 && c->lp.wlog > min_wlog && ((uint64_t)1 << (c->lp.wlog - 1)) >= (uint64_t)content_size)
-            c->lp.wlog--;
-    }
+    c->lp.wlog = (uint8_t)fit_wlog(&c->lp, content_size);
     if (c->lp.hlog > c->lp.wlog) c->lp.hlog = c->lp.wlog;
     c->wsize = (size_t)1 << c->lp.wlog;
     c->wmask = c->wsize - 1;
@@ -156,10 +159,14 @@ void lzr_cctx_set_threads(lzr_cctx *c, int threads)
 }
 
 static void batch_free(struct lzr_batch *b);
+static void seg_free(lzr_cctx *c);
+static int seg_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out);
+static int seg_end(lzr_cctx *c, lzr_buf *out);
 
 void lzr_cctx_free(lzr_cctx *c)
 {
     if (!c) return;
+    if (c->sg) { seg_free(c); return; }
     if (c->bt) batch_free(c->bt);   /* lets an open batch's helpers finish first */
     if (c->wk) {
         for (int t = 0; t < c->threads; t++) {
@@ -1493,6 +1500,7 @@ static int jobs_borrow(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out, 
 int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
 {
     if (c->finished) return LZR_ERR_PARAM;
+    if (c->sg) return seg_write(c, src, n, out);
     if (!c->header_done && jobs_setup(c)) return LZR_ERR_NOMEM;
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
     c->total_in += n;
@@ -1514,6 +1522,7 @@ int lzr_cctx_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
 int lzr_cctx_end(lzr_cctx *c, lzr_buf *out)
 {
     if (c->finished) return LZR_ERR_PARAM;
+    if (c->sg) return seg_end(c, out);
     if (!c->header_done && jobs_setup(c)) return LZR_ERR_NOMEM;
     if (!c->header_done && write_header(c, out)) return LZR_ERR_NOMEM;
     if (c->content_size >= 0 && (uint64_t)c->content_size != c->total_in) return LZR_ERR_PARAM;
@@ -1531,6 +1540,271 @@ int lzr_cctx_end(lzr_cctx *c, lzr_buf *out)
         int r = emit_block(c, c->pos, be, out);
         if (r) return r;
         c->pos = be;
+    }
+    uint8_t t[LZR_BLOCK_HDR + 4] = {2};
+    wr32le(t + 5, 4);
+    wr32le(t + LZR_BLOCK_HDR, (uint32_t)xxh64_digest(&c->xs));
+    c->finished = 1;
+    return buf_append(out, t, sizeof(t));
+}
+
+/* ---------------- segment mode: reset points + seek index ----------------
+ * The content (after the x86 filter, if any) is cut at fixed offsets into
+ * segments of sg->size bytes. Each is compressed by a fresh inner context
+ * as a frame of its own; its blocks are copied into this frame and its
+ * first block gets the reset bit (FORMAT.md 5.5). An inner frame starts in
+ * the frame-start state, which is what a reset point restores, so the
+ * blocks decode the same here. Segments do not depend on each other, so a
+ * batch of them is compressed by parallel threads, and the output is the
+ * same for any thread count. */
+typedef struct { uint64_t foff, coff; } seg_ent;
+
+struct lzr_seg {
+    int level, wlog_req;
+    uint64_t size;          /* segment size (reset interval)                 */
+    int batch;              /* segments buffered before compressing (threads) */
+    lzr_buf in;             /* pending content, < batch * size bytes         */
+    seg_ent *ent;           /* seek index: one entry per segment             */
+    size_t nent, cent;
+    uint64_t foff, coff;    /* frame bytes written so far, content cut so far */
+};
+
+typedef struct {
+    struct lzr_seg *sg;
+    const uint8_t *src;     /* the batch's content                          */
+    size_t len;             /* its length                                   */
+    int k, mf;              /* segments, match-finder threads per segment   */
+    lzr_buf *outs;          /* inner frames                                 */
+    int *errs;
+    int next;
+#if LZR_HAVE_THREADS
+    pthread_mutex_t mu;
+#endif
+} seg_job;
+
+static int seg_one(seg_job *j, int i)
+{
+    const struct lzr_seg *sg = j->sg;
+    size_t s0 = (size_t)i * sg->size, s1 = s0 + sg->size < j->len ? s0 + sg->size : j->len;
+    lzr_cctx *w = lzr_cctx_new(sg->level, sg->wlog_req, (int64_t)(s1 - s0));
+    if (!w) return LZR_ERR_NOMEM;
+    lzr_cctx_set_threads(w, j->mf);
+    lzr_buf *o = &j->outs[i];
+    o->len = 0;
+    int r = buf_reserve(o, (s1 - s0) / 2 + 64);
+    if (!r) r = lzr_cctx_write(w, j->src + s0, s1 - s0, o);
+    if (!r) r = lzr_cctx_end(w, o);
+    lzr_cctx_free(w);
+    return r;
+}
+
+static void *seg_thread(void *p)
+{
+    seg_job *j = (seg_job *)p;
+    for (;;) {
+        int i;
+#if LZR_HAVE_THREADS
+        pthread_mutex_lock(&j->mu);
+        i = j->next++;
+        pthread_mutex_unlock(&j->mu);
+#else
+        i = j->next++;
+#endif
+        if (i >= j->k) break;
+        j->errs[i] = seg_one(j, i);
+    }
+    return NULL;
+}
+
+/* Compress src[0..len) (whole segments, the last one may be short) and
+ * append the blocks to out. */
+static int seg_batch(lzr_cctx *c, const uint8_t *src, size_t len, lzr_buf *out)
+{
+    struct lzr_seg *sg = c->sg;
+    if (!len) return LZR_OK;
+    seg_job j;
+    memset(&j, 0, sizeof(j));
+    j.sg = sg;
+    j.src = src;
+    j.len = len;
+    j.k = (int)((len + sg->size - 1) / sg->size);
+    int nt = sg->batch < j.k ? sg->batch : j.k;
+    if (nt < 1) nt = 1;
+    j.mf = c->threads / nt > 1 ? c->threads / nt : 1;   /* spare threads go to the match finders */
+    j.outs = (lzr_buf *)calloc((size_t)j.k, sizeof(lzr_buf));
+    j.errs = (int *)calloc((size_t)j.k, sizeof(int));
+    if (!j.outs || !j.errs) { free(j.outs); free(j.errs); return LZR_ERR_NOMEM; }
+#if LZR_HAVE_THREADS
+    pthread_t tid[LZR_MAX_THREADS];
+    int started = 0;
+    pthread_mutex_init(&j.mu, NULL);
+    for (int t = 1; t < nt; t++)
+        if (pthread_create(&tid[started], NULL, seg_thread, &j) == 0) started++;
+    seg_thread(&j);
+    for (int t = 0; t < started; t++) pthread_join(tid[t], NULL);
+    pthread_mutex_destroy(&j.mu);
+#else
+    seg_thread(&j);
+#endif
+    int r = LZR_OK;
+    for (int i = 0; i < j.k && !r; i++) {
+        r = j.errs[i];
+        if (r) break;
+        lzr_buf *o = &j.outs[i];
+        int hl = lzr_frame_header(o->p, o->len, NULL, NULL, NULL);
+        size_t body = o->len - (size_t)hl - (LZR_BLOCK_HDR + 4);   /* without header and end block */
+        if (hl <= 0 || o->len < (size_t)hl + LZR_BLOCK_HDR + 4) { r = LZR_ERR_PARAM; break; }
+        if (sg->nent == sg->cent) {
+            size_t nc = sg->cent ? 2 * sg->cent : 16;
+            seg_ent *ne = (seg_ent *)realloc(sg->ent, nc * sizeof(seg_ent));
+            if (!ne) { r = LZR_ERR_NOMEM; break; }
+            sg->ent = ne;
+            sg->cent = nc;
+        }
+        sg->ent[sg->nent].foff = sg->foff;
+        sg->ent[sg->nent].coff = sg->coff;
+        if (sg->nent && body) o->p[hl] |= LZR_BT_RESET;   /* segment start = reset point */
+        sg->nent++;
+        r = buf_append(out, o->p + hl, body);
+        sg->foff += body;
+        size_t s0 = (size_t)i * sg->size;
+        sg->coff += (s0 + sg->size < len ? sg->size : len - s0);
+    }
+    for (int i = 0; i < j.k; i++) free(j.outs[i].p);
+    free(j.outs);
+    free(j.errs);
+    return r;
+}
+
+/* Levels 9-11 (32/64 MB windows, the slowest to decode): 48 MiB segments.
+ * Measured ratio cost vs one segment: Silesia +0.28..0.38%, enwik8
+ * +1.0..2.6% (long-range repeats); 32 MiB cost 2-3x more. Other levels
+ * decode fast enough on one thread: no segments unless asked for. */
+uint64_t lzr_default_segment(int level)
+{
+    return level >= 9 ? (uint64_t)48 << 20 : 0;
+}
+
+/* Memory of one inner context for a segment (big tables only). */
+static uint64_t seg_ctx_mem(const level_params *lp)
+{
+    uint64_t w = (uint64_t)1 << lp->wlog, h = (uint64_t)1 << lp->hlog;
+    uint64_t m = 2 * w + 4 * h;                       /* window buffer + heads */
+    if (lp->opt && !lp->row) m += 8 * w;              /* binary tree           */
+    else m += h;                                      /* row tags              */
+    return m;
+}
+#ifndef LZR_SEG_MEM_BUDGET
+#define LZR_SEG_MEM_BUDGET ((uint64_t)1 << 30)   /* inner contexts alive at once */
+#endif
+
+lzr_cctx *lzr_cctx_new_seg(int level, int window_log, int64_t content_size, uint64_t seg_size)
+{
+    if (!seg_size || (content_size >= 0 && (uint64_t)content_size <= seg_size)) return lzr_cctx_new(level, window_log, content_size);
+    if (level < LZR_LEVEL_MIN || level > LZR_LEVEL_MAX || seg_size < LZR_SEG_MIN || seg_size > ((uint64_t)1 << 40)) return NULL;
+    if (window_log && (window_log < LZR_WLOG_MIN || window_log > LZR_WLOG_MAX)) return NULL;
+    lzr_cctx *c = (lzr_cctx *)calloc(1, sizeof(*c));
+    struct lzr_seg *sg = (struct lzr_seg *)calloc(1, sizeof(*sg));
+    if (!c || !sg) { free(c); free(sg); return NULL; }
+    xxh64_init(&c->xs);
+    c->sg = sg;
+    c->threads = 1;
+    c->content_size = content_size;
+    c->lp = LEVELS[level - LZR_LEVEL_MIN];
+    if (window_log) c->lp.wlog = (uint8_t)window_log;
+    /* the window every inner frame fits in: the one for a whole segment */
+    c->lp.wlog = (uint8_t)fit_wlog(&c->lp, (int64_t)seg_size);
+    sg->level = level;
+    sg->wlog_req = window_log;
+    sg->size = seg_size;
+    return c;
+}
+
+static void seg_free(lzr_cctx *c)
+{
+    free(c->sg->in.p);
+    free(c->sg->ent);
+    free(c->sg);
+    free(c->x86tmp);
+    free(c);
+}
+
+/* Filtered content in: compress whenever a whole batch is available. */
+static int seg_raw(void *ctx, const uint8_t *src, size_t n)
+{
+    lzr_cctx *c = ((sink_ctx *)ctx)->c;
+    lzr_buf *out = ((sink_ctx *)ctx)->out;
+    struct lzr_seg *sg = c->sg;
+    if (!sg->batch) {   /* segments compressed at once: threads, within the memory budget */
+        uint64_t cap = LZR_SEG_MEM_BUDGET / seg_ctx_mem(&c->lp);
+        sg->batch = c->threads < 1 ? 1 : c->threads;
+        if ((uint64_t)sg->batch > cap) sg->batch = cap ? (int)cap : 1;
+    }
+    const size_t full = (size_t)sg->size * (size_t)sg->batch;
+    while (n) {
+        if (!sg->in.len && n >= full) {   /* straight from the caller's buffer */
+            int r = seg_batch(c, src, full, out);
+            if (r) return r;
+            src += full;
+            n -= full;
+            continue;
+        }
+        size_t take = full - sg->in.len < n ? full - sg->in.len : n;
+        if (buf_append(&sg->in, src, take)) return LZR_ERR_NOMEM;
+        src += take;
+        n -= take;
+        if (sg->in.len == full) {
+            int r = seg_batch(c, sg->in.p, full, out);
+            sg->in.len = 0;
+            if (r) return r;
+        }
+    }
+    return LZR_OK;
+}
+
+static int seg_write(lzr_cctx *c, const uint8_t *src, size_t n, lzr_buf *out)
+{
+    if (!c->header_done) {
+        size_t before = out->len;
+        if (write_header(c, out)) return LZR_ERR_NOMEM;
+        c->sg->foff = out->len - before;
+    }
+    if (!n) return LZR_OK;
+    c->total_in += n;
+    xxh64_update(&c->xs, src, n);
+    sink_ctx s = {c, out, 0};
+    return c->x86tmp ? x86_run(&c->x86, src, n, 0, c->x86tmp, seg_raw, &s) : seg_raw(&s, src, n);
+}
+
+/* Seek index payload (FORMAT.md 12.3): per segment u64 frame offset of its
+ * first block, u64 content offset; then u64 content size, u32 count, "LZRX". */
+static int seg_end(lzr_cctx *c, lzr_buf *out)
+{
+    struct lzr_seg *sg = c->sg;
+    int r = seg_write(c, NULL, 0, out);
+    if (r) return r;
+    if (c->content_size >= 0 && (uint64_t)c->content_size != c->total_in) return LZR_ERR_PARAM;
+    if (c->x86tmp) {
+        sink_ctx s = {c, out, 0};
+        if ((r = x86_finish(&c->x86, seg_raw, &s))) return r;
+    }
+    if ((r = seg_batch(c, sg->in.p, sg->in.len, out))) return r;
+    sg->in.len = 0;
+    if (sg->nent >= 2) {
+        size_t pl = 16 * sg->nent + 16;
+        uint8_t h[LZR_BLOCK_HDR] = {0x80};
+        wr32le(h + 5, (uint32_t)pl);
+        if (buf_reserve(out, LZR_BLOCK_HDR + pl)) return LZR_ERR_NOMEM;
+        buf_append(out, h, LZR_BLOCK_HDR);
+        uint8_t *q = out->p + out->len;
+        for (size_t i = 0; i < sg->nent; i++, q += 16) {
+            wr64le(q, sg->ent[i].foff);
+            wr64le(q + 8, sg->ent[i].coff);
+        }
+        wr64le(q, sg->coff);
+        wr32le(q + 8, (uint32_t)sg->nent);
+        memcpy(q + 12, "LZRX", 4);
+        out->len += pl;
     }
     uint8_t t[LZR_BLOCK_HDR + 4] = {2};
     wr32le(t + 5, 4);

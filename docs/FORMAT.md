@@ -205,7 +205,7 @@ A data block whose type byte has the reset bit set is a **reset point**. Before 
 * sets every piece of state in 5.2 back to its initial value (repeat offsets 1, 4, 8; no Huffman, context or tANS tables; a fresh type 4 model, state 0);
 * sets `seg`, the start of the current **segment**, to the current decoded-stream position. At the start of the frame, `seg` is 0.
 
-Inside a segment, nothing before `seg` is used: a match may not reach before it (5.4), and every "previous byte" or "match byte" before `seg` reads as 0 or is corrupt as stated where it is used (6.6, 7.2, 7.4). The type 4 position context counts from `seg` (7.2). So a decoder can decode a segment knowing only where it starts in the frame. Encoders do not have to emit reset points. A future seek index (a skippable block, 12.2) will list them.
+Inside a segment, nothing before `seg` is used: a match may not reach before it (5.4), and every "previous byte" or "match byte" before `seg` reads as 0 or is corrupt as stated where it is used (6.6, 7.2, 7.4). The type 4 position context counts from `seg` (7.2). So a decoder can decode a segment knowing only where it starts in the frame, and segments can be decoded in parallel. Encoders do not have to emit reset points. A frame with reset points should carry a seek index (12.3) that lists them.
 
 ## 6. Block types 5 and 6
 
@@ -599,10 +599,28 @@ The rules below let the format grow without changing what a 1.0 decoder accepts.
 
 | Type byte | Kind |
 |---|---|
-| 0x80 | seek index (reserved; format to be defined with the parallel decoder) |
+| 0x80 | seek index (12.3) |
 | 0x81-0xFF | unassigned |
 
 A decoder MUST NOT change the decoded content because of a skippable block it knows. It may use one, for example to find reset points.
+
+### 12.3 Seek index
+
+The seek index lists the segments of a frame (5.5), so that a reader can find them without scanning every block header, for example to start decoding in the middle of a file. It is a skippable block with type byte 0x80, placed immediately before the end block. Its `raw_len` is 0 and its payload is:
+
+```
+offset   size   field
+0        16*n   n entries: frame_offset u64, content_offset u64
+16*n     8      content_size  u64: length of the decoded stream
+16*n+8   4      n             u32: number of entries, >= 1
+16*n+12  4      magic         "LZRX" (4C 5A 52 58)
+```
+
+so `comp_len = 16*n + 16`. Entry `i` describes segment `i`: `frame_offset` is the offset from the first byte of the frame (the magic) to the header of the segment's first data block, and `content_offset` is the decoded-stream position where the segment starts. Entry 0 is the frame's first data block, with `content_offset` 0 (its reset bit may be set or not). The other entries are the reset points, all of them, in frame order.
+
+**Finding it from the end.** The end block is the last 13 bytes of the frame. The 8 bytes before it hold `n` and the magic. The index block header then starts `9 + 16*n + 16` bytes before the end block; its type byte is 0x80 and its `comp_len` is `16*n + 16`.
+
+**Validity.** An index is *valid* if it is the last block before the end block, has the layout above, lists exactly the segments of the frame as described, and `content_size` equals the length of the decoded stream. Encoders MUST NOT write a block of kind 0x80 that is not a valid index. Decoders never need the index: a decoder can find the reset points from the block headers. A decoder that uses it MUST check what it relies on (for example, that the block at `frame_offset` is a reset point), and MUST treat an invalid index as if it were absent. An invalid index never makes a frame corrupt. (The vector `skippable-blocks` has a 0x80 block that is not an index.)
 
 ## 13. Test vectors
 
@@ -610,6 +628,7 @@ A decoder MUST NOT change the decoded content because of a skippable block it kn
 
 * `enc-*`: written by the C encoder (all block types, every table mode, x86, window logs 18-26, streaming and one-shot headers).
 * `reset-splice-*`, `skippable-blocks`: two independent encoder frames joined at a reset point (types 4, 5 and 6), and skippable blocks between data blocks.
+* `seg-*`: segment-mode encoder output with reset points and a seek index (12.3); `seg-index-bad-*`: frames whose 0x80 block is not a valid index, which decoders must ignore.
 * `hand-*`: built byte by byte by `tools/make_vectors.py`, for cases the encoder never writes. These are the initial repeat offsets and their reset, single-symbol tables with an empty bit stream, literal-only blocks, an empty stored block, a hand-coded Huffman section, a stored block between type 5 blocks that share tables, and a type 5 block that uses repeat offsets left by a type 4 block.
 * `bad-*`: invalid frames, one fault each, with the error kind: header fields, type bytes (unknown types are *unsupported*), reset and skippable misuse, block limits, a wrong checksum or content size, truncation, trailing data, bit streams not consumed exactly, malformed tANS or Huffman tables (including incomplete codes and a wrong stream 3 size), oversized extra-bit reads, and malformed type 4 payloads.
 * `v5-*`, `v6-*`: frames of the legacy versions, frozen when the format was version 6.
@@ -619,7 +638,8 @@ A decoder MUST NOT change the decoded content because of a skippable block it kn
 ## 14. Encoder notes (non-normative)
 
 * A block is stored whenever its coded form would not be smaller than `raw_len`, which also keeps `comp_len <= raw_len` (3.2.2).
-* The encoder does not emit reset points or skippable blocks yet.
+* **Segment mode** (`compress(..., segment=S)`, `lzr_cctx_new_seg`): the decoded stream is cut every `S` bytes; each segment is compressed by a fresh encoder as a frame of its own, whose blocks are copied in with the reset bit set on the first one (not on the frame's first block). A seek index (12.3) follows the last segment when there are two or more. Because the segments are independent, the encoder compresses several at once with threads, and the output does not depend on the thread count. The window is the one for a whole segment. A content shorter than `S` gives exactly the frame written without segment mode.
+* The lzrans decoder (`decompress(..., threads=N)`) finds the reset points from the block headers and decodes segments in parallel; it does not need the seek index.
 * Blocks hold 256 KiB of input. The last block, and the halves made by cost-based block splitting (levels 7-10), are shorter.
 * Level 11 uses only types 4 and 0. Levels -3 to 8 use types 5 and 0. Levels 9 and 10 use types 5, 6 and 0, choosing type 6 for a block only when its literal section is at least 2% smaller.
 * With threads at levels -3 to 6, each 4 MiB job starts with fresh tables (mode 0) and does not count on the repeat offsets. The format is the same either way.
@@ -632,7 +652,7 @@ Before 1.0, the draft of this document listed format problems found while writin
 
 | # | Problem in version 6 | Decision in version 7 |
 |---|---|---|
-| A1 | No independent points: every block could depend on everything before it, which rules out parallel decoding and seeking. | **Fixed.** Reset bit in the type byte (5.5). Seek index reserved as skippable kind 0x80. |
+| A1 | No independent points: every block could depend on everything before it, which rules out parallel decoding and seeking. | **Fixed.** Reset bit in the type byte (5.5). Seek index reserved as skippable kind 0x80, defined after the freeze in 12.3 (additive: 1.0 decoders skip it). |
 | A2 | No extension mechanism: unknown block types were "corrupt", and no block could be skipped. | **Fixed.** Type byte layout, skippable blocks, *unsupported* for types 7-63, feature flags (3.2.1, 12). |
 | A3 | Length of literal stream 3 not stored, so literals had to be decoded before the sequences could be found. | **Fixed.** `size3` stored (6.3.3). |
 | A4 | Block size fixed at 256 KiB, with the ML alphabet tied to it. | **Kept** at 2^18. Larger blocks would need a new version. |
